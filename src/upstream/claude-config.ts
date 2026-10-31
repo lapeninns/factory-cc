@@ -85,7 +85,7 @@ export function parseClaudeProfileList(raw: string): Array<{ id: string; dir: st
   const entries = raw.split(",").map((entry) => entry.trim()).filter(Boolean).map((entry) => {
     const at = entry.indexOf("=");
     const id = entry.slice(0, at).trim(), dir = entry.slice(at + 1).trim();
-    if (at < 1 || !PROFILE_ID.test(id) || !isAbsolute(dir)) throw new Error("Claude profiles must be id=/absolute/dir pairs; ids use a-z, 0-9, _ and -.");
+    if (at < 1 || !PROFILE_ID.test(id) || ["pool", "personal"].includes(id) || !isAbsolute(dir)) throw new Error("Claude profiles must be id=/absolute/dir pairs; ids use a-z, 0-9, _ and -.");
     return { id, dir };
   });
   if (!entries.length) throw new Error("Claude profile list is empty.");

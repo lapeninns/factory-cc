@@ -277,6 +277,34 @@ describe("auth verification gate", () => {
       expect(wrong.inputs).toHaveLength(0);
     });
 
+    it("runs a session under its assigned account and reports a usage limit with its reset time", async () => {
+      const team = mkdtempSync(join(tmpdir(), "relay-pool-gate-"));
+      writeFileSync(join(team, "settings.json"), "{}");
+      const claudeProfiles = loadClaudeProfiles([{ id: "team1", dir: team }], { HOME: team });
+      rmSync(team, { recursive: true, force: true });
+      const models = [{ id: "pool/relay", model: "sonnet", displayName: "Claude Sonnet · pool", claudeProfile: "pool" }];
+      const pooled = (claudeAccount: string): RuntimeRequest => ({ ...request(), request: { ...request().request, model: "pool/relay" }, session: { ...session(), model: "pool/relay", claudeAccount } });
+
+      const sdk = new FakeSdk(async () => ({ subscriptionType: "team" }));
+      await create(sdk, "claude-config", { claudeConfig: configured(), claudeProfiles, models }).handle(pooled("team1"));
+      expect((sdk.calls[0]!.options.env as Record<string, string>).CLAUDE_CONFIG_DIR).toBe(team);
+      const personal = new FakeSdk(async () => ({ subscriptionType: "max" }));
+      await create(personal, "claude-config", { claudeConfig: configured(), claudeProfiles, models }).handle(pooled("personal"));
+      expect((personal.calls[0]!.options.env as Record<string, string>).CLAUDE_CONFIG_DIR).not.toBe(team);
+
+      const reset = Math.floor(Date.now() / 1000) + 7200;
+      const limited = new FakeSdk(async () => ({ subscriptionType: "team" }));
+      vi.spyOn(limited, "query").mockImplementation((args) => ({
+        accountInfo: async () => ({ subscriptionType: "team" }), close() {},
+        async *[Symbol.asyncIterator]() {
+          for await (const _input of args.prompt) yield { type: "assistant", error: "rate_limit", message: { content: [{ type: "text", text: `Claude AI usage limit reached|${reset}` }] } };
+        },
+      }));
+      const error = await create(limited, "claude-config", { claudeConfig: configured(), claudeProfiles, models }).handle(pooled("team1")).catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ status: 429, code: "rate_limit_error", extra: { usage_limit: true } });
+      expect((error as { extra: { retry_after: number } }).extra.retry_after).toBeGreaterThan(7100);
+    });
+
     it("redacts helper and replacement credentials from SDK startup errors", async () => {
       const config = configured({ apiKeyHelper: "helper --secret-value" });
       config.env.ANTHROPIC_AUTH_TOKEN = "offline-replacement-key";

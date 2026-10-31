@@ -342,3 +342,15 @@ it("adds per-account menu entries for extra Claude profiles, keeps them on resta
   expect(menu()).toEqual([["claude-opus-5-5", "Claude Code · Opus 5.5 (claude-opus-5-5)"]]);
   expect(readFileSync(paths.plist, "utf8")).not.toContain("BRIDGE_CLAUDE_PROFILES");
 });
+
+it("adds pool entries for a weighted account pool and refuses members that are not configured", async () => {
+  const { deps, paths, root } = fixture();
+  const team = join(root, "team-1"); mkdirSync(team); writeFileSync(join(team, "settings.json"), "{}");
+  await expect(desktop(["install", "--models", "claude-opus-5-5", "--claude-profiles", `team1=${team}`, "--claude-pool", "personal=10,team9=1"], deps)).rejects.toThrow("team9");
+  await desktop(["install", "--models", "claude-opus-5-5", "--claude-profiles", `team1=${team}`, "--claude-pool", "personal=10,team1=5"], deps);
+  const menu = JSON.parse(readFileSync(paths.settings, "utf8")).customModels.map((model: { model: string }) => model.model);
+  expect(menu).toEqual(["claude-opus-5-5", "team1/claude-opus-5-5", "pool/claude-opus-5-5"]);
+  expect(readFileSync(paths.plist, "utf8")).toContain("<key>BRIDGE_CLAUDE_POOL</key><string>personal=10,team1=5</string>");
+  await desktop(["restart", "--claude-pool", "none"], deps);
+  expect(JSON.parse(readFileSync(paths.settings, "utf8")).customModels.map((model: { model: string }) => model.model)).not.toContain("pool/claude-opus-5-5");
+});

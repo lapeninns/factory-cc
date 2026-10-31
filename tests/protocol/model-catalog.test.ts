@@ -75,6 +75,42 @@ describe("HTTP model selection", () => {
     expect(sameAccount.status).toBe(200);
     expect(sameAccount.session).toBe(first.session);
   });
+  it("assigns pool sessions an account and moves a limited conversation to another account on retry", async () => {
+    const result = await startTestBridge({ mode: "sdk", authMode: "subscription",
+      claudePool: [{ id: "personal", weight: 1 }, { id: "team1-pro", weight: 1 }, { id: "team5-std", weight: 1 }],
+      models: [...modelsFromIds(["sonnet"], "subscription"),
+        { id: "team1-pro/sonnet", model: "sonnet", displayName: "Claude Sonnet · team1-pro", claudeProfile: "team1-pro" },
+        { id: "pool/sonnet", model: "sonnet", displayName: "Claude Sonnet · pool", claudeProfile: "pool" }] });
+    apps.push(result.app);
+    const { app, token } = result;
+    const accounts = () => runtime.handle.mock.calls.map(([input]) => (input as RuntimeRequest).session.claudeAccount);
+
+    // Pool sessions rotate through accounts; a fixed entry keeps its own account.
+    await postMessages(app.url, token, request("pool/sonnet", "one"));
+    await postMessages(app.url, token, request("pool/sonnet", "two"));
+    await postMessages(app.url, token, request("team1-pro/sonnet", "three"));
+    expect(accounts()).toEqual(["personal", "team1-pro", undefined]);
+
+    // team1-pro hits its usage limit on a fixed-entry conversation.
+    runtime.handle.mockClear();
+    runtime.handle.mockRejectedValueOnce(new BridgeError(429, "rate_limit_error", "limited", { usage_limit: true, retry_after: 7200, retry_from_history: true }));
+    const limited = await postMessages(app.url, token, request("team1-pro/sonnet", "four"));
+    expect(limited.status).toBe(429);
+    // Another account is ready, so Droid is told to retry now rather than wait two hours.
+    expect(limited.json).toMatchObject({ error: { type: "rate_limit_error", retry_after: 1 } });
+    const moved = app.store.get(limited.session!)!.claudeAccount;
+    expect(moved).toBeDefined();
+    expect(moved).not.toBe("team1-pro");
+    const retried = await postMessages(app.url, token, request("team1-pro/sonnet", "four"));
+    expect(retried.status).toBe(200);
+    expect(retried.session).toBe(limited.session);
+    expect(runtime.handle.mock.calls.at(-1)![0]).toMatchObject({ recovery: "cold-import", session: { claudeAccount: moved } });
+
+    // While team1-pro cools down, new conversations on its fixed entry start elsewhere too.
+    await postMessages(app.url, token, request("team1-pro/sonnet", "five"));
+    expect(accounts().at(-1)).not.toBe("team1-pro");
+    expect(accounts().at(-1)).toBeDefined();
+  });
   it.each(["model_switch_busy", "model_switch_requires_persistence", "model_switch_unavailable"])("leaves the original conversation usable after %s", async (code) => {
     const { app, token } = await start();
     const first = await postMessages(app.url, token, request("sonnet"), headers);

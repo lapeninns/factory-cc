@@ -18,6 +18,7 @@ import { UsageLedger } from "./usage.js";
 import { INTERRUPT_GRACE_MS, TurnWatchdog } from "./turn-watchdog.js";
 import type { BridgeRuntime, RuntimeApprovalRequest, RuntimeControl, RuntimeEvent, RuntimeHostCall, RuntimeHostCompletion, RuntimeHostEnd, RuntimePermissionDecision, RuntimeRequest, RuntimeTurn, StreamSink } from "./types.js";
 import { redactClaudeConfigText, claudeConfigNeedsLogin, CLAUDE_LOGIN_REQUIRED } from "../upstream/claude-config.js";
+import { PERSONAL_ACCOUNT, POOL_PROFILE } from "../upstream/claude-pool.js";
 import { buildChildEnv, classifyAuth, maskEmail, type AuthClassification, type AuthObservation } from "../upstream/auth-env.js";
 import { publicSelection, sdkEnv, selectionFromConfig, type UpstreamSelection } from "../upstream/providers.js";
 import { resolveRequestModel } from "../models.js";
@@ -863,7 +864,7 @@ export class SdkRuntime implements BridgeRuntime {
     live.catalog = catalog;
     await catalog.update(droidTools);
     if (live.terminal) throw live.terminal;
-    const claudeConfig = this.claudeConfigFor(route);
+    const claudeConfig = this.claudeConfigFor(route, input.session);
     const env = this.config.authMode === "claude-config"
       ? buildChildEnv("claude-config", process.env, undefined, { bridgeListen: `${this.config.host}:${this.config.port}`, claudeConfig })
       : sdkEnv(selection, `${this.config.host}:${this.config.port}`, this.config.authMode);
@@ -1002,8 +1003,8 @@ export class SdkRuntime implements BridgeRuntime {
     live.accountSnapshot = observed;
     const email = maskEmail(stringField(info, "email"));
     const classification = classifyAuth(observed, live.initApiKeySource);
-    const profile = this.claudeProfileFor(live.modelRoute);
-    this.rememberAuth(mode, classification, observed, email, Date.now() - started, profile?.id);
+    const profile = this.claudeProfileFor(live.modelRoute, live.current?.session);
+    this.rememberAuth(mode, classification, observed, email, Date.now() - started, profile?.id ?? live.current?.session.claudeAccount);
     if (mode === "claude-config") {
       const claudeConfig = profile?.config ?? this.config.claudeConfig;
       if ((!claudeConfig || claudeConfigNeedsLogin(claudeConfig)) && classification.kind === "unknown") this.rejectAuth(live, mode, "unknown", CLAUDE_LOGIN_REQUIRED);
@@ -1034,15 +1035,18 @@ export class SdkRuntime implements BridgeRuntime {
     }).catch(() => undefined);
   }
 
-  private claudeProfileFor(route: ModelRoute | undefined) {
-    if (!route?.claudeProfile) return undefined;
-    const profile = this.config.claudeProfiles?.find((item) => item.id === route.claudeProfile);
-    if (!profile) throw new BridgeError(400, "unknown_model", `Claude profile ${route.claudeProfile} is not configured on this Bridge.`);
+  /** The session's assigned account wins (pool or limit failover); otherwise the entry's own account. */
+  private claudeProfileFor(route: ModelRoute | undefined, session: { claudeAccount?: string } | undefined) {
+    const account = session?.claudeAccount ?? route?.claudeProfile;
+    if (account === POOL_PROFILE) throw new BridgeError(500, "pool_unassigned", "This pool session has no Claude account assigned.");
+    if (!account || account === PERSONAL_ACCOUNT) return undefined;
+    const profile = this.config.claudeProfiles?.find((item) => item.id === account);
+    if (!profile) throw new BridgeError(400, "unknown_model", `Claude profile ${account} is not configured on this Bridge.`);
     return profile;
   }
 
-  private claudeConfigFor(route: ModelRoute | undefined) {
-    return this.claudeProfileFor(route)?.config ?? this.config.claudeConfig;
+  private claudeConfigFor(route: ModelRoute | undefined, session: { claudeAccount?: string } | undefined) {
+    return this.claudeProfileFor(route, session)?.config ?? this.config.claudeConfig;
   }
 
   private rememberAuth(mode: BridgeConfig["authMode"], classification: AuthClassification, observed: AuthObservation, email?: string, startupMs?: number, claudeProfile?: string): void {
@@ -1287,7 +1291,7 @@ export class SdkRuntime implements BridgeRuntime {
         } else live.upstreamBackoff = undefined;
         if (message.type === "assistant" && message.error) {
           const mapped = upstreamError(message.error === "rate_limit" ? "rate_limit_error" : extractText(message));
-          if (mapped) throw mapped;
+          if (mapped) throw message.error === "rate_limit" ? usageLimitError(mapped, extractText(message)) : mapped;
         }
         live.watchdog?.touch();
         live.sink?.activity?.();
@@ -1674,6 +1678,15 @@ interface AuthVerification {
   /** Masked. Never the raw address. */
   email?: string;
   at: string;
+}
+
+/** A subscription usage limit ("…limit reached|<reset epoch>") lasts hours, unlike a brief 429; keep its reset time. */
+function usageLimitError(error: BridgeError, text: string): BridgeError {
+  const reset = /\|(\d{10})\b/.exec(text);
+  const seconds = reset ? Number(reset[1]) - Math.floor(Date.now() / 1000) : undefined;
+  return new BridgeError(error.status, error.code, error.message, {
+    ...error.extra, usage_limit: true, ...(seconds !== undefined && seconds > 0 ? { retry_after: seconds } : {}),
+  });
 }
 
 function observationFrom(info: Record<string, unknown>): AuthObservation {

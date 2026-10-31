@@ -40,6 +40,7 @@ export class SessionStore {
     role: RoleTag;
     model: string;
     provider?: ModelProvider;
+    claudeAccount?: string;
     droidSessionId?: string;
     historyHash?: string;
     contextHash?: string;
@@ -56,6 +57,7 @@ export class SessionStore {
       state: "NEW",
       model: input.model,
       ...(input.provider ? { provider: input.provider } : {}),
+      ...(input.claudeAccount ? { claudeAccount: input.claudeAccount } : {}),
       historyHash: input.historyHash,
       contextHash: input.contextHash,
       ...(input.reasoning ? { reasoning: input.reasoning } : {}),

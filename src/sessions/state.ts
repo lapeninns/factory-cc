@@ -11,6 +11,8 @@ export interface SessionRecord {
   retryableRequestHash?: string;
   /** Runtime that owns sdkSessionId. Absent on Claude sessions created before Cursor coexisted. */
   provider?: ModelProvider;
+  /** Claude account running this session (`personal` or a profile id). Set by the pool or after a limit moved it; absent means the model entry's own account. */
+  claudeAccount?: string;
   /** Persist replay safety independently of process-local callback state. */
   hostEnded?: "resumable" | "terminal" | "interrupted";
   role: RoleTag;

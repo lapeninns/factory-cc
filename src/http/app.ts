@@ -26,7 +26,8 @@ import { statusPageHtml } from "./status-page.js";
 import { messageId } from "../protocol/messages.js";
 import { ControlBroker } from "../control/broker.js";
 import { controlPageHtml, controlPageHeaders } from "./control-page.js";
-import { configuredModels, providerFromModelId, resolveRequestModel, type ModelProvider } from "../models.js";
+import { configuredModels, providerFromModelId, resolveRequestModel, type BridgeModel, type ModelProvider } from "../models.js";
+import { ClaudePool, PERSONAL_ACCOUNT, POOL_PROFILE } from "../upstream/claude-pool.js";
 
 export interface BridgeApp {
   server: Server;
@@ -58,6 +59,13 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
   runtime.setControl?.(control);
   const records: RedactedRequestRecord[] = [];
   let authFailureCount = 0;
+  const claudePool = config.claudePool ? new ClaudePool(config.claudePool) : undefined;
+  /** Pool entries always take a pool account. Other Claude entries keep their own account unless it is sitting out a limit. */
+  const claudeAccountFor = (listed: BridgeModel | undefined): string | undefined => {
+    if (!claudePool || listed?.provider === "cursor") return undefined;
+    const own = listed?.claudeProfile ?? PERSONAL_ACCOUNT;
+    return own === POOL_PROFILE || claudePool.isCooling(own) ? claudePool.pick() : undefined;
+  };
   let indexTimer: ReturnType<typeof setTimeout> | undefined;
   let indexDirty = false;
   mkdirSync(config.logDir, { recursive: true });
@@ -389,10 +397,13 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       // Droid desktop has no conversation ID header or hooks to disambiguate.
       continueIdenticalTranscripts: config.desktopProfile,
     });
+    const claudeAccount = resolved.match ? undefined : claudeAccountFor(listed);
+    if (claudeAccount) logger.info("claude_account_assigned", { model: request.model, account: claudeAccount });
     const session = resolved.match
       ?? withSlot(() => store.create({
         role,
         model: request.model,
+        ...(claudeAccount ? { claudeAccount } : {}),
         ...(provider === "cursor" ? { provider } : {}),
         droidSessionId: explicitSessionId(headers, request),
         historyHash: historyPrefixHash(request),
@@ -574,12 +585,29 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         && !cancellationRequested && current && !current.cancelRequested && current.hostEnded === undefined
         && (current.state === "GENERATING" || current.state === "RESUMING")
         && (previous.historyMessageHashes ?? []).every((hash, index) => incomingHashes[index] === hash);
+      // A limited account sits out its cooldown; the conversation continues on another account.
+      const limitedAccount = claudePool && error instanceof BridgeError && error.code === "rate_limit_error" && current && provider !== "cursor"
+        ? current.claudeAccount ?? listed?.claudeProfile ?? PERSONAL_ACCOUNT : undefined;
+      if (limitedAccount && limitedAccount !== POOL_PROFILE) {
+        const retryAfter = typeof (error as BridgeError).extra.retry_after === "number" ? (error as BridgeError).extra.retry_after as number : undefined;
+        const seconds = Math.max(60, retryAfter ?? ((error as BridgeError).extra.usage_limit ? 3600 : 60));
+        claudePool!.cool(limitedAccount, seconds);
+        logger.warn("claude_account_cooling", { sessionId, account: limitedAccount, seconds, usageLimit: (error as BridgeError).extra.usage_limit === true });
+      }
       if (retryableUpstream) {
         await runtime.cancel(sessionId, "upstream-backoff").catch(() => logger.error("runtime_cancel_failed", { sessionId, reason: "upstream-backoff" }));
         if (!current.cancelRequested && current.hostEnded === undefined && activeRequests.get(sessionId) === owner
             && (current.state === "GENERATING" || current.state === "RESUMING")) {
-          store.update(sessionId, { pendingToolIds: [], sdkSessionId: undefined, retryableRequestHash: requestFingerprint });
+          // The retry imports this conversation's history, so it can start on a different account.
+          const next = limitedAccount ? claudeAccountFor(listed) : undefined;
+          const nextAccount = next && !claudePool!.isCooling(next) ? next : undefined;
+          store.update(sessionId, { pendingToolIds: [], sdkSessionId: undefined, retryableRequestHash: requestFingerprint, ...(nextAccount ? { claudeAccount: nextAccount } : {}) });
           store.setState(sessionId, "IDLE");
+          if (nextAccount) {
+            logger.info("claude_account_failover", { sessionId, from: limitedAccount, to: nextAccount });
+            // Another account is ready now: ask Droid to retry at once instead of waiting out this account's limit.
+            error = new BridgeError(429, "rate_limit_error", `Claude account ${limitedAccount} hit its limit; retry continues on ${nextAccount}.`, { retry_after: 1, retry_from_history: true });
+          }
         }
       } else if (recoverableSwitch || rejectedInput) {
         if (!cancellationRequested && current && !current.cancelRequested && current.hostEnded === undefined

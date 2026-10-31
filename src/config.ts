@@ -6,6 +6,7 @@ import { resolve } from "node:path";
 import type { BridgeMode } from "./types.js";
 import { parseAuthMode, type AuthMode } from "./upstream/auth-env.js";
 import { canonicalWorkspacePath } from "./workspace.js";
+import { parseClaudePool, POOL_PROFILE, type PoolMember } from "./upstream/claude-pool.js";
 import { claudeProfileModels, modelsFromIds, parseModelIds, validateModels, type BridgeModel } from "./models.js";
 
 export interface BridgeConfig {
@@ -50,6 +51,8 @@ export interface BridgeConfig {
   claudeConfig?: ClaudeConfig;
   /** Extra accounts from BRIDGE_CLAUDE_PROFILES; each adds `<id>/<model>` menu entries. claude-config only. */
   claudeProfiles?: ClaudeProfile[];
+  /** Accounts and weights from BRIDGE_CLAUDE_POOL: adds `pool/<model>` entries and moves limited sessions to another account. */
+  claudePool?: PoolMember[];
   permissionMode: "bypass" | "ask";
   upstreamBaseUrl?: string;
   upstreamModel?: string;
@@ -121,7 +124,7 @@ function mergeModelCatalog(base: BridgeModel[] | undefined, cursor: BridgeModel[
   return validateModels([...(base ?? []).filter((model) => model.provider !== "cursor"), ...cursor]);
 }
 
-function withProfiles(base: BridgeModel[] | undefined, profiles: ClaudeProfile[] | undefined): BridgeModel[] | undefined {
+function withProfiles(base: BridgeModel[] | undefined, profiles: Array<{ id: string }>): BridgeModel[] | undefined {
   return base && profiles?.length ? validateModels([...base, ...claudeProfileModels(base, profiles)]) : base;
 }
 
@@ -144,6 +147,9 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
   const claudeProfiles = overrides.claudeProfiles ?? (profileList
     ? loadClaudeProfiles(parseClaudeProfileList(profileList), process.env, `${overrides.host ?? env("BRIDGE_HOST", "127.0.0.1")}:${overrides.port ?? intEnv("BRIDGE_PORT", 18787)}`)
     : undefined);
+  const poolList = env("BRIDGE_CLAUDE_POOL");
+  if (poolList && authMode !== "claude-config" && !overrides.claudePool) throw new Error("BRIDGE_CLAUDE_POOL requires BRIDGE_AUTH=claude-config.");
+  const claudePool = overrides.claudePool ?? (poolList ? parseClaudePool(poolList, (claudeProfiles ?? []).map((profile) => profile.id)) : undefined);
   const dataDir = resolve(overrides.dataDir ?? env("BRIDGE_DATA_DIR", resolve(process.cwd(), "tmp/bridge-data"))!);
   ensurePrivateDir(dataDir);
   const logDir = resolve(dataDir, "logs");
@@ -216,13 +222,15 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
     persistSessions: overrides.persistSessions ?? env("BRIDGE_PERSIST", "1") !== "0",
     logBodies: overrides.logBodies ?? env("BRIDGE_LOG_BODIES") === "1",
     authMode,
+    ...(claudePool ? { claudePool } : {}),
     permissionMode,
     upstreamBaseUrl: overrides.upstreamBaseUrl ?? env("BRIDGE_UPSTREAM_BASE_URL"),
     upstreamModel: overrides.upstreamModel ?? env("BRIDGE_UPSTREAM_MODEL"),
     upstreamTokenEnv: overrides.upstreamTokenEnv ?? env("BRIDGE_UPSTREAM_TOKEN_ENV"),
     models: overrides.models !== undefined ? validateModels(overrides.models)
       : mergeModelCatalog(
-        withProfiles(env("BRIDGE_MODELS") ? modelsFromIds(parseModelIds(env("BRIDGE_MODELS")!), authMode) : claudeConfig ? claudeConfigModels(claudeConfig).models : undefined, claudeProfiles),
+        withProfiles(env("BRIDGE_MODELS") ? modelsFromIds(parseModelIds(env("BRIDGE_MODELS")!), authMode) : claudeConfig ? claudeConfigModels(claudeConfig).models : undefined,
+          [...(claudeProfiles ?? []), ...(claudePool ? [{ id: POOL_PROFILE }] : [])]),
         readCursorMenu(env("BRIDGE_CURSOR_MODELS_FILE")),
       ),
   };
