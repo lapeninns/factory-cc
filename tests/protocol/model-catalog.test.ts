@@ -53,6 +53,28 @@ describe("HTTP model selection", () => {
     expect(app.store.get(first.session!)).toMatchObject({ model: "haiku", sdkSessionId: "same-native-session", state: "IDLE" });
     expect(runtime.handle.mock.calls.map(([input]) => input.request.model)).toEqual(["sonnet", "haiku"]);
   });
+  it("keeps a conversation within one account profile and never carries it to another account", async () => {
+    const result = await startTestBridge({ mode: "sdk", authMode: "subscription", models: [
+      ...modelsFromIds(["sonnet", "haiku"], "subscription"),
+      { id: "team1/sonnet", model: "sonnet", displayName: "Claude Sonnet · team1", claudeProfile: "team1" },
+      { id: "team1/haiku", model: "haiku", displayName: "Claude Haiku · team1", claudeProfile: "team1" },
+    ] });
+    apps.push(result.app);
+    const { app, token } = result;
+    // Droid desktop sends no session header; continuity comes from the replayed history.
+    const opening = { role: "user", content: "remember this" }, reply = { role: "assistant", content: [{ type: "text", text: "remembered" }] };
+    const next = (model: string) => ({ model, max_tokens: 32, messages: [opening, reply, { role: "user", content: "recall it" }] });
+    const first = await postMessages(app.url, token, request("team1/sonnet"));
+    // An explicit session id cannot force the switch either.
+    const forced = await postMessages(app.url, token, next("sonnet"), { "x-bridge-session": first.session! });
+    expect([first.status, forced.status]).toEqual([200, 409]);
+    const otherAccount = await postMessages(app.url, token, next("haiku"));
+    expect(otherAccount.status).toBe(200);
+    expect(otherAccount.session).not.toBe(first.session);
+    const sameAccount = await postMessages(app.url, token, next("team1/haiku"));
+    expect(sameAccount.status).toBe(200);
+    expect(sameAccount.session).toBe(first.session);
+  });
   it.each(["model_switch_busy", "model_switch_requires_persistence", "model_switch_unavailable"])("leaves the original conversation usable after %s", async (code) => {
     const { app, token } = await start();
     const first = await postMessages(app.url, token, request("sonnet"), headers);

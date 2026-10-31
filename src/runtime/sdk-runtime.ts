@@ -863,8 +863,9 @@ export class SdkRuntime implements BridgeRuntime {
     live.catalog = catalog;
     await catalog.update(droidTools);
     if (live.terminal) throw live.terminal;
+    const claudeConfig = this.claudeConfigFor(route);
     const env = this.config.authMode === "claude-config"
-      ? buildChildEnv("claude-config", process.env, undefined, { bridgeListen: `${this.config.host}:${this.config.port}`, claudeConfig: this.config.claudeConfig })
+      ? buildChildEnv("claude-config", process.env, undefined, { bridgeListen: `${this.config.host}:${this.config.port}`, claudeConfig })
       : sdkEnv(selection, `${this.config.host}:${this.config.port}`, this.config.authMode);
     // Project skills may run the local generator through native Bash. Bind its
     // client connection to this Bridge, not stale values in the parent shell.
@@ -913,7 +914,7 @@ export class SdkRuntime implements BridgeRuntime {
       options.settingSources = [];
       options.strictMcpConfig = true;
     }
-    if (this.config.authMode === "claude-config" && this.config.claudeConfig?.helper) options.settings = { apiKeyHelper: this.config.claudeConfig.helper };
+    if (this.config.authMode === "claude-config" && claudeConfig?.helper) options.settings = { apiKeyHelper: claudeConfig.helper };
     if (this.config.authMode === "anthropic-api") {
       const helper = process.env.BRIDGE_API_KEY_HELPER?.trim();
       if (helper) {
@@ -1001,9 +1002,16 @@ export class SdkRuntime implements BridgeRuntime {
     live.accountSnapshot = observed;
     const email = maskEmail(stringField(info, "email"));
     const classification = classifyAuth(observed, live.initApiKeySource);
-    this.rememberAuth(mode, classification, observed, email, Date.now() - started);
+    const profile = this.claudeProfileFor(live.modelRoute);
+    this.rememberAuth(mode, classification, observed, email, Date.now() - started, profile?.id);
     if (mode === "claude-config") {
-      if ((!this.config.claudeConfig || claudeConfigNeedsLogin(this.config.claudeConfig)) && classification.kind === "unknown") this.rejectAuth(live, mode, "unknown", CLAUDE_LOGIN_REQUIRED);
+      const claudeConfig = profile?.config ?? this.config.claudeConfig;
+      if ((!claudeConfig || claudeConfigNeedsLogin(claudeConfig)) && classification.kind === "unknown") this.rejectAuth(live, mode, "unknown", CLAUDE_LOGIN_REQUIRED);
+      // A profile must answer as the account recorded in its own directory, never fall back to the default login.
+      const reported = stringField(info, "email")?.toLowerCase();
+      if (profile?.email && reported !== profile.email) {
+        this.rejectAuth(live, mode, classification.kind, `Claude profile ${profile.id} reported a different account (${maskEmail(reported) ?? "none"}) than its directory records (${maskEmail(profile.email)}). Refusing to send a prompt.`);
+      }
       return;
     }
     if (classification.kind !== mode) {
@@ -1026,7 +1034,18 @@ export class SdkRuntime implements BridgeRuntime {
     }).catch(() => undefined);
   }
 
-  private rememberAuth(mode: BridgeConfig["authMode"], classification: AuthClassification, observed: AuthObservation, email?: string, startupMs?: number): void {
+  private claudeProfileFor(route: ModelRoute | undefined) {
+    if (!route?.claudeProfile) return undefined;
+    const profile = this.config.claudeProfiles?.find((item) => item.id === route.claudeProfile);
+    if (!profile) throw new BridgeError(400, "unknown_model", `Claude profile ${route.claudeProfile} is not configured on this Bridge.`);
+    return profile;
+  }
+
+  private claudeConfigFor(route: ModelRoute | undefined) {
+    return this.claudeProfileFor(route)?.config ?? this.config.claudeConfig;
+  }
+
+  private rememberAuth(mode: BridgeConfig["authMode"], classification: AuthClassification, observed: AuthObservation, email?: string, startupMs?: number, claudeProfile?: string): void {
     const record: AuthVerification = {
       mode, kind: classification.kind, reason: classification.reason,
       subscriptionType: observed.subscriptionType, apiKeySource: observed.apiKeySource, tokenSource: observed.tokenSource,
@@ -1035,7 +1054,7 @@ export class SdkRuntime implements BridgeRuntime {
     this.authVerification = record;
     const gated = mode === "subscription" || mode === "anthropic-api";
     const ok = mode === "claude-config" ? Boolean(this.config.claudeConfig && !claudeConfigNeedsLogin(this.config.claudeConfig)) || classification.kind !== "unknown" : gated ? classification.kind === mode : true;
-    this.logger.info("auth_verified", { ...record, email: undefined, ok, ...startupMs !== undefined && { startupMs } });
+    this.logger.info("auth_verified", { ...record, email: undefined, ok, ...startupMs !== undefined && { startupMs }, ...claudeProfile && { claudeProfile } });
   }
 
   private rejectAuth(live: LiveSdk, mode: BridgeConfig["authMode"], kind: AuthClassification["kind"], message: string): never {
@@ -1472,7 +1491,7 @@ export class SdkRuntime implements BridgeRuntime {
 
   private sdkError(error: unknown): BridgeError {
     const converted = upstreamError(error) ?? asBridgeError(error);
-    const message = redactValue(redactClaudeConfigText(this.config.claudeConfig, converted.message));
+    const message = redactValue((this.config.claudeProfiles ?? []).reduce((text, profile) => redactClaudeConfigText(profile.config, text), redactClaudeConfigText(this.config.claudeConfig, converted.message)));
     return message === converted.message ? converted : new BridgeError(converted.status, converted.code, message, converted.extra);
   }
 

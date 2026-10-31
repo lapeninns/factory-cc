@@ -158,3 +158,34 @@ it("fails desktop startup when its selected profile settings are missing", () =>
   vi.stubEnv("CLAUDE_CONFIG_DIR", f.dir);
   expect(() => loadConfig({ authMode: "claude-config", desktopProfile: true, dataDir: join(f.root, "bridge-data") })).toThrow("settings are unreadable");
 });
+
+it("adds one entry per extra account profile and refuses a profile it cannot read", () => {
+  const f = fixture({});
+  const team = join(f.root, "team-a"); mkdirSync(team);
+  writeFileSync(join(team, "settings.json"), JSON.stringify({ env: { ANTHROPIC_DEFAULT_OPUS_MODEL: "team-opus" } }));
+  writeFileSync(join(team, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "Ops@Example.com" } }));
+  for (const name of Object.keys(process.env)) if (name.startsWith("ANTHROPIC_") || name.startsWith("CLAUDE_CODE_")) vi.stubEnv(name, undefined);
+  vi.stubEnv("HOME", f.root); vi.stubEnv("CLAUDE_CONFIG_DIR", f.dir);
+  vi.stubEnv("BRIDGE_AUTH", "claude-config"); vi.stubEnv("BRIDGE_MODELS", "claude-opus-5-5,claude-haiku-5-5");
+  vi.stubEnv("BRIDGE_CLAUDE_PROFILES", `team1=${team}`);
+  const config = loadConfig({ dataDir: join(f.root, "data") });
+  expect(config.models?.map(({ id, model, claudeProfile }) => ({ id, model, claudeProfile }))).toEqual([
+    { id: "claude-opus-5-5", model: "claude-opus-5-5", claudeProfile: undefined },
+    { id: "claude-haiku-5-5", model: "claude-haiku-5-5", claudeProfile: undefined },
+    { id: "team1/claude-opus-5-5", model: "claude-opus-5-5", claudeProfile: "team1" },
+    { id: "team1/claude-haiku-5-5", model: "claude-haiku-5-5", claudeProfile: "team1" },
+  ]);
+  const [profile] = config.claudeProfiles!;
+  expect(profile).toMatchObject({ id: "team1", dir: team, email: "ops@example.com" });
+  // The profile's own settings and directory, not the default profile's.
+  expect(buildChildEnv("claude-config", {}, undefined, { claudeConfig: profile!.config })).toMatchObject({ CLAUDE_CONFIG_DIR: team, ANTHROPIC_DEFAULT_OPUS_MODEL: "team-opus" });
+  expect(buildChildEnv("claude-config", {}, undefined, { claudeConfig: config.claudeConfig }).ANTHROPIC_DEFAULT_OPUS_MODEL).toBeUndefined();
+  expect(JSON.stringify(config)).not.toContain("claudeProfiles");
+
+  vi.stubEnv("BRIDGE_CLAUDE_PROFILES", `team1=${join(f.root, "missing")}`);
+  expect(() => loadConfig({ dataDir: join(f.root, "data") })).toThrow("Claude profile team1: Claude Code settings are unreadable");
+  for (const bad of ["team1=relative/dir", `Team=${team}`, `a=${team},a=${f.dir}`, `a=${team},b=${team}`]) {
+    vi.stubEnv("BRIDGE_CLAUDE_PROFILES", bad);
+    expect(() => loadConfig({ dataDir: join(f.root, "data") })).toThrow(/Claude profile/);
+  }
+});

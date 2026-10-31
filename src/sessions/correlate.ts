@@ -56,7 +56,7 @@ export function sessionProvider(session: Pick<SessionRecord, "provider" | "model
  * existing sessions still match. Cursor adds provider, and a model switch
  * substitutes only the model: the request's provider stays in the hash.
  */
-export function sessionContextHash(headers: Headers, request: MessagesRequest, cwd?: string, provider: ModelProvider = "claude"): string {
+export function sessionContextHash(headers: Headers, request: MessagesRequest, cwd?: string, provider: ModelProvider = "claude", claudeProfile?: string): string {
   const workspace = cwd ?? resolveRequestCwd(headers, request);
   const reasoning = droidReasoningLevel(request);
   return hash({
@@ -68,6 +68,8 @@ export function sessionContextHash(headers: Headers, request: MessagesRequest, c
     thinking: reasoning ? undefined : request.thinking,
     ...(reasoning ? { reasoning } : {}),
     ...(provider === "cursor" ? { provider } : {}),
+    // A native transcript lives in its account's config directory, so accounts never share a session.
+    ...(claudeProfile ? { claudeProfile } : {}),
   });
 }
 
@@ -75,17 +77,17 @@ export function resolveSession(
   sessions: SessionRecord[],
   headers: Headers,
   request: MessagesRequest,
-  options: { cwd?: string; hostSessionId?: string; allowModelSwitch?: boolean; continueIdenticalTranscripts?: boolean; provider?: ModelProvider } = {},
+  options: { cwd?: string; hostSessionId?: string; allowModelSwitch?: boolean; continueIdenticalTranscripts?: boolean; provider?: ModelProvider; claudeProfile?: string } = {},
 ): { match?: SessionRecord; reason: string } {
   const explicit = explicitSessionId(headers, request);
   const requestProvider = options.provider ?? providerFromModelId(request.model);
-  const contextHash = sessionContextHash(headers, request, options.cwd, requestProvider);
+  const contextHash = sessionContextHash(headers, request, options.cwd, requestProvider, options.claudeProfile);
   const switchingModel = (session: SessionRecord): boolean => options.allowModelSwitch === true && session.model !== request.model;
   // Keep the persisted fingerprint format: old checkpoints include their model.
   // Substitute only that field when checking a requested switch, so role,
   // workspace, thinking and provider remain part of session identity.
   const compatibleContextHash = (session: SessionRecord): string => switchingModel(session)
-    ? sessionContextHash(headers, { ...request, model: session.model }, options.cwd, requestProvider)
+    ? sessionContextHash(headers, { ...request, model: session.model }, options.cwd, requestProvider, options.claudeProfile)
     : contextHash;
   const assertSelectedContext = (session: SessionRecord, authenticatedThinkingChange = false): void => {
     if (!authenticatedThinkingChange) assertContext(session, compatibleContextHash(session), headers, request);
@@ -157,8 +159,8 @@ export function resolveSession(
     const current = droidReasoningLevel(request);
     if ((session.reasoning ?? undefined) === current) return false;
     const previous = session.reasoning
-      ? sessionContextHash(headers, requestAtReasoningLevel(request, session.reasoning), options.cwd, requestProvider)
-      : sessionContextHash(headers, requestWithoutReasoningLevel(request), options.cwd, requestProvider);
+      ? sessionContextHash(headers, requestAtReasoningLevel(request, session.reasoning), options.cwd, requestProvider, options.claudeProfile)
+      : sessionContextHash(headers, requestWithoutReasoningLevel(request), options.cwd, requestProvider, options.claudeProfile);
     return session.contextHash === previous;
   };
   const historyContextMatches = (session: SessionRecord): boolean => session.contextHash === compatibleContextHash(session)

@@ -1,4 +1,4 @@
-import { assertClaudeCredential, readClaudeConfig, claudeConfigModels, type ClaudeConfig } from "./upstream/claude-config.js";
+import { assertClaudeCredential, readClaudeConfig, claudeConfigModels, loadClaudeProfiles, parseClaudeProfileList, type ClaudeConfig, type ClaudeProfile } from "./upstream/claude-config.js";
 import { randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync } from "node:fs";
 import { isIPv6 } from "node:net";
@@ -6,7 +6,7 @@ import { resolve } from "node:path";
 import type { BridgeMode } from "./types.js";
 import { parseAuthMode, type AuthMode } from "./upstream/auth-env.js";
 import { canonicalWorkspacePath } from "./workspace.js";
-import { modelsFromIds, parseModelIds, validateModels, type BridgeModel } from "./models.js";
+import { claudeProfileModels, modelsFromIds, parseModelIds, validateModels, type BridgeModel } from "./models.js";
 
 export interface BridgeConfig {
   desktopProfile?: boolean;
@@ -48,6 +48,8 @@ export interface BridgeConfig {
   logBodies: boolean;
   authMode: AuthMode;
   claudeConfig?: ClaudeConfig;
+  /** Extra accounts from BRIDGE_CLAUDE_PROFILES; each adds `<id>/<model>` menu entries. claude-config only. */
+  claudeProfiles?: ClaudeProfile[];
   permissionMode: "bypass" | "ask";
   upstreamBaseUrl?: string;
   upstreamModel?: string;
@@ -119,6 +121,10 @@ function mergeModelCatalog(base: BridgeModel[] | undefined, cursor: BridgeModel[
   return validateModels([...(base ?? []).filter((model) => model.provider !== "cursor"), ...cursor]);
 }
 
+function withProfiles(base: BridgeModel[] | undefined, profiles: ClaudeProfile[] | undefined): BridgeModel[] | undefined {
+  return base && profiles?.length ? validateModels([...base, ...claudeProfileModels(base, profiles)]) : base;
+}
+
 function tokenEnv(name: string): string | undefined {
   const file = env(`${name}_FILE`);
   if (file && env(name)) throw new Error(`${name} and ${name}_FILE cannot both be set.`);
@@ -133,6 +139,11 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
   const desktopProfile = overrides.desktopProfile ?? env("BRIDGE_DESKTOP") === "1";
   const claudeConfig = authMode === "claude-config" ? overrides.claudeConfig ?? readClaudeConfig(process.env, `${overrides.host ?? env("BRIDGE_HOST", "127.0.0.1")}:${overrides.port ?? intEnv("BRIDGE_PORT", 18787)}`, { requireSettings: desktopProfile && Boolean(process.env.CLAUDE_CONFIG_DIR) }) : undefined;
   if (claudeConfig) assertClaudeCredential(claudeConfig);
+  const profileList = env("BRIDGE_CLAUDE_PROFILES");
+  if (profileList && authMode !== "claude-config" && !overrides.claudeProfiles) throw new Error("BRIDGE_CLAUDE_PROFILES requires BRIDGE_AUTH=claude-config.");
+  const claudeProfiles = overrides.claudeProfiles ?? (profileList
+    ? loadClaudeProfiles(parseClaudeProfileList(profileList), process.env, `${overrides.host ?? env("BRIDGE_HOST", "127.0.0.1")}:${overrides.port ?? intEnv("BRIDGE_PORT", 18787)}`)
+    : undefined);
   const dataDir = resolve(overrides.dataDir ?? env("BRIDGE_DATA_DIR", resolve(process.cwd(), "tmp/bridge-data"))!);
   ensurePrivateDir(dataDir);
   const logDir = resolve(dataDir, "logs");
@@ -211,7 +222,7 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
     upstreamTokenEnv: overrides.upstreamTokenEnv ?? env("BRIDGE_UPSTREAM_TOKEN_ENV"),
     models: overrides.models !== undefined ? validateModels(overrides.models)
       : mergeModelCatalog(
-        env("BRIDGE_MODELS") ? modelsFromIds(parseModelIds(env("BRIDGE_MODELS")!), authMode) : claudeConfig ? claudeConfigModels(claudeConfig).models : undefined,
+        withProfiles(env("BRIDGE_MODELS") ? modelsFromIds(parseModelIds(env("BRIDGE_MODELS")!), authMode) : claudeConfig ? claudeConfigModels(claudeConfig).models : undefined, claudeProfiles),
         readCursorMenu(env("BRIDGE_CURSOR_MODELS_FILE")),
       ),
   };
@@ -223,5 +234,6 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
     if (value === undefined || !Number.isSafeInteger(value) || value < minimum) throw new Error(`${name} must be an integer >= ${minimum}.`);
   }
   if (claudeConfig) Object.defineProperty(config, "claudeConfig", { value: claudeConfig });
+  if (claudeProfiles?.length) Object.defineProperty(config, "claudeProfiles", { value: claudeProfiles });
   return config;
 }

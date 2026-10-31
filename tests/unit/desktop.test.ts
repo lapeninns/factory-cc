@@ -321,3 +321,24 @@ it("refuses a missing pinned Claude profile before replacing the running service
   expect(files.map(path => readFileSync(path, "utf8"))).toEqual(before);
   expect(run.mock.calls.some(([, args]) => args[0] === "bootout")).toBe(false);
 });
+
+it("adds per-account menu entries for extra Claude profiles, keeps them on restart and removes them with none", async () => {
+  const { deps, paths, root } = fixture();
+  const team = join(root, "team-1"); mkdirSync(team); writeFileSync(join(team, "settings.json"), "{}");
+  await desktop(["install", "--models", "claude-opus-5-5", "--claude-profiles", `team1=${team}`], deps);
+  const menu = () => JSON.parse(readFileSync(paths.settings, "utf8")).customModels.map((model: { model: string; displayName: string }) => [model.model, model.displayName]);
+  expect(menu()).toEqual([
+    ["claude-opus-5-5", "Claude Code · Opus 5.5 (claude-opus-5-5)"],
+    ["team1/claude-opus-5-5", "Claude Code · team1 · Opus 5.5 (claude-opus-5-5)"],
+  ]);
+  expect(readFileSync(paths.plist, "utf8")).toContain(`<key>BRIDGE_CLAUDE_PROFILES</key><string>team1=${realpathSync(team)}</string>`);
+  await desktop(["restart"], deps);
+  expect(menu()).toHaveLength(2);
+  expect(await desktop(["status"], deps)).toMatchObject({ claudeProfiles: [{ id: "team1", dir: realpathSync(team) }] });
+  // A profile that is no longer readable stops the restart instead of silently dropping its entries.
+  rmSync(join(team, "settings.json"));
+  await expect(desktop(["restart"], deps)).rejects.toThrow("Claude profile team1");
+  await desktop(["restart", "--claude-profiles", "none"], deps);
+  expect(menu()).toEqual([["claude-opus-5-5", "Claude Code · Opus 5.5 (claude-opus-5-5)"]]);
+  expect(readFileSync(paths.plist, "utf8")).not.toContain("BRIDGE_CLAUDE_PROFILES");
+});

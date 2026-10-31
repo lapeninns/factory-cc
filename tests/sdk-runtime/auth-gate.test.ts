@@ -6,7 +6,7 @@ import { loadConfig } from "../../src/config.js";
 import { SdkRuntime, type SdkHandle, type SdkUserInput } from "../../src/runtime/sdk-runtime.js";
 import type { RuntimeRequest } from "../../src/runtime/types.js";
 import type { SessionRecord } from "../../src/sessions/state.js";
-import { readClaudeConfig } from "../../src/upstream/claude-config.js";
+import { loadClaudeProfiles, readClaudeConfig } from "../../src/upstream/claude-config.js";
 import { forbiddenNamesIn, type AuthMode } from "../../src/upstream/auth-env.js";
 import { startTestBridge } from "../helpers/server.js";
 
@@ -248,6 +248,33 @@ describe("auth verification gate", () => {
       await create(sdk, "claude-config", { claudeConfig: config }).handle(request());
       expect(sdk.inputs).toHaveLength(1);
       expect(logger.info).toHaveBeenCalledWith("auth_verified", expect.objectContaining({ mode: "claude-config", kind: "unknown", ok: true }));
+    });
+
+    it("runs a profile entry under that profile's directory and refuses a different account", async () => {
+      const team = mkdtempSync(join(tmpdir(), "relay-profile-gate-"));
+      writeFileSync(join(team, "settings.json"), "{}");
+      writeFileSync(join(team, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "team1@example.com" } }));
+      const claudeProfiles = loadClaudeProfiles([{ id: "team1", dir: team }], { HOME: team });
+      rmSync(team, { recursive: true, force: true });
+      const models = [{ id: "relay", model: "sonnet", displayName: "Claude Sonnet" }, { id: "team1/relay", model: "sonnet", displayName: "Claude Sonnet · team1", claudeProfile: "team1" }];
+      const profiled = (): RuntimeRequest => ({ ...request(), request: { ...request().request, model: "team1/relay" }, session: { ...session(), model: "team1/relay" } });
+
+      const ok = new FakeSdk(async () => ({ subscriptionType: "team", email: "Team1@Example.com" }));
+      await create(ok, "claude-config", { claudeConfig: configured(), claudeProfiles, models }).handle(profiled());
+      expect(ok.inputs).toHaveLength(1);
+      expect((ok.calls[0]!.options.env as Record<string, string>).CLAUDE_CONFIG_DIR).toBe(team);
+      expect(logger.info).toHaveBeenCalledWith("auth_verified", expect.objectContaining({ claudeProfile: "team1", ok: true }));
+
+      // The default entry keeps the default login: no profile directory.
+      const plain = new FakeSdk(async () => ({ subscriptionType: "max", email: "me@example.com" }));
+      await create(plain, "claude-config", { claudeConfig: configured(), claudeProfiles, models }).handle(request());
+      expect((plain.calls[0]!.options.env as Record<string, string>).CLAUDE_CONFIG_DIR).not.toBe(team);
+
+      // e.g. the directory did not reach Claude Code and it answered as the default account.
+      const wrong = new FakeSdk(async () => ({ subscriptionType: "max", email: "me@example.com" }));
+      await expect(create(wrong, "claude-config", { claudeConfig: configured(), claudeProfiles, models }).handle(profiled()))
+        .rejects.toMatchObject({ status: 401, code: "auth_mode_mismatch", message: expect.stringContaining("Claude profile team1 reported a different account") });
+      expect(wrong.inputs).toHaveLength(0);
     });
 
     it("redacts helper and replacement credentials from SDK startup errors", async () => {

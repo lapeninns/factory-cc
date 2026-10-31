@@ -377,7 +377,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     // Before this conversation takes a slot, free the one it replaces.
     releaseCompacted(request);
     const summarized = summarizedSession(request);
-    const contextHash = sessionContextHash(headers, request, cwd, provider);
+    const contextHash = sessionContextHash(headers, request, cwd, provider, listed?.claudeProfile);
     const incomingHashes = historyMessageHashes(request.messages);
     const requestFingerprint = createHash("sha256").update(JSON.stringify({ request, role, cwd, provider, contextHash, host: control.hostSessionId(prepared.binding) ?? null })).digest("hex");
     const explicit = explicitSessionId(headers, request);
@@ -385,7 +385,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       && session.retryableRequestHash === requestFingerprint && (!explicit || session.bridgeSessionId === explicit || session.droidSessionId === explicit));
     if (retries.length > 1) throw new BridgeError(409, "ambiguous_session", "Multiple failed requests match; supply X-Bridge-Session");
     const resolved = retries[0] ? { match: retries[0], reason: "upstream-retry" } : resolveSession(store.list(), headers, request, {
-      cwd, hostSessionId: control.hostSessionId(prepared.binding), allowModelSwitch: config.models !== undefined, provider,
+      cwd, hostSessionId: control.hostSessionId(prepared.binding), allowModelSwitch: config.models !== undefined, provider, claudeProfile: listed?.claudeProfile,
       // Droid desktop has no conversation ID header or hooks to disambiguate.
       continueIdenticalTranscripts: config.desktopProfile,
     });
