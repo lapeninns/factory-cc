@@ -46,10 +46,13 @@ export interface WorkerRunContext {
   options: Options;
   message(value: Record<string, unknown>): void;
 }
+export type WorkerRepositoryPolicy = "allowlist" | "owned-git";
 export interface APIWorkerServiceOptions {
   stateRoot: string;
   workspaceRoot: string;
   allowedRepositories: string[];
+  /** Private operator policy. Request inputs cannot expand repository access. */
+  repositoryPolicy?: WorkerRepositoryPolicy;
   provider: { kind: "anthropic" | "openrouter" } | { kind: "subscription"; profile: SubscriptionProfile; mappingPath?: string; executable?: string };
   maxConcurrent?: number;
   maxBudgetUsd?: number;
@@ -99,6 +102,7 @@ export class APIWorkerService {
   private readonly root: string;
   private readonly workspaces: string;
   private readonly repositories: Set<string>;
+  private readonly repositoryPolicy: WorkerRepositoryPolicy;
   private readonly workers = new Map<string, LiveWorker>();
   private readonly active = new Set<string>();
   private readonly creating = new Set<Promise<unknown>>();
@@ -107,6 +111,11 @@ export class APIWorkerService {
   private closed = false;
 
   constructor(private readonly options: APIWorkerServiceOptions) {
+    this.repositoryPolicy = options.repositoryPolicy === undefined ? "allowlist" : options.repositoryPolicy;
+    if (!["allowlist", "owned-git"].includes(this.repositoryPolicy)
+        || (this.repositoryPolicy === "owned-git" && options.provider.kind !== "subscription")) {
+      throw new Error("Owned Git repository access requires an explicit subscription worker policy.");
+    }
     this.capacity = options.maxConcurrent ?? 2;
     if (!Number.isSafeInteger(this.capacity) || this.capacity < 1 || this.capacity > 2) throw new Error("Worker concurrency must be one or two.");
     if (options.provider.kind !== "subscription" && (!Number.isFinite(options.maxBudgetUsd) || options.maxBudgetUsd! <= 0)) throw new Error("An explicit positive estimated budget is required.");
@@ -114,10 +123,13 @@ export class APIWorkerService {
     if (!Number.isSafeInteger(options.maxMs) || options.maxMs < 1000 || options.maxMs > 2 * 60 * 60_000) throw new Error("Worker deadline must be from one second to two hours.");
     if (!Number.isSafeInteger(options.maxTurns ?? 32) || (options.maxTurns ?? 32) < 1 || (options.maxTurns ?? 32) > 500) throw new Error("Worker turn limit must be an integer from 1 to 500.");
     if (!["anthropic", "openrouter", "subscription"].includes(options.provider.kind)) throw new Error("An explicit authentication route is required.");
-    if (!options.allowedRepositories.length) throw new Error("An explicit repository allowlist is required.");
+    if (!Array.isArray(options.allowedRepositories) || options.allowedRepositories.some(path => typeof path !== "string" || !isAbsolute(path))
+        || (this.repositoryPolicy === "allowlist" && !options.allowedRepositories.length)) throw new Error("An explicit repository allowlist is required.");
     this.root = privateDirectory(options.stateRoot);
     this.workspaces = privateDirectory(options.workspaceRoot);
-    this.repositories = new Set(options.allowedRepositories.map(canonicalRepository));
+    // An owned-Git policy does not depend on previously registered paths still
+    // existing. Each requested repository is verified before it is used.
+    this.repositories = new Set(this.repositoryPolicy === "allowlist" ? options.allowedRepositories.map(path => canonicalRepository(path)) : []);
     for (const record of readWorkers(this.root)) {
       if (!TERMINAL.has(record.state)) {
         record.state = "unknown";
@@ -144,14 +156,28 @@ export class APIWorkerService {
   private async startImpl(input: { repository: string; task: string; workflow: WorkerWorkflow }): Promise<WorkerView> {
     if (typeof input.task !== "string" || !input.task.trim() || input.task.length > 100_000) throw new Error("A bounded nonempty worker task is required.");
     if (!["implement", "investigate", "release-prepare"].includes(input.workflow)) throw new Error("Unknown worker workflow.");
-    const repository = canonicalRepository(input.repository);
-    if (!this.repositories.has(repository)) throw new Error("Repository is not in the worker allowlist.");
-    await this.prepareRuntime();
+    const repository = canonicalRepository(input.repository, this.repositoryPolicy === "owned-git");
+    if (this.repositoryPolicy === "allowlist" && !this.repositories.has(repository)) throw new Error("Repository is not in the worker allowlist.");
+    if (this.repositoryPolicy === "allowlist") await this.prepareRuntime();
+    if (this.repositoryPolicy === "owned-git") {
+      const marker = lstatSync(join(repository, ".git"));
+      if ((!marker.isDirectory() && !marker.isFile()) || marker.isSymbolicLink() || marker.uid !== process.getuid?.()) {
+        throw new Error("Owned Git repository metadata is required.");
+      }
+      if (await git(repository, ["rev-parse", "--is-bare-repository"]) !== "false") throw new Error("Use a non-bare Git repository.");
+      const gitDir = realpathSync(await git(repository, ["rev-parse", "--absolute-git-dir"]));
+      const gitInfo = lstatSync(gitDir);
+      if (!gitInfo.isDirectory() || gitInfo.uid !== process.getuid?.()) throw new Error("Owned Git repository metadata is required.");
+    }
     const sourceRoot = await git(repository, ["rev-parse", "--show-toplevel"]);
-    if (realpathSync(sourceRoot) !== repository) throw new Error("Use the allowlisted repository root.");
+    if (realpathSync(sourceRoot) !== repository) throw new Error("Use the repository root.");
     const sourceCommit = await git(repository, ["rev-parse", "--verify", "HEAD^{commit}"]);
     if (!/^[a-f0-9]{40,64}$/.test(sourceCommit)) throw new Error("An exact committed source revision is required.");
     const sourceDirty = Boolean(await git(repository, ["status", "--porcelain", "--untracked-files=normal"]));
+    if (this.repositoryPolicy === "owned-git") {
+      await this.prepareRuntime();
+      canonicalRepository(repository, true);
+    }
     if (this.closed) throw new Error("Worker service is closed.");
     const id = "worker-" + randomUUID(), worktree = join(this.workspaces, id), branch = "factory-workers/" + id;
     await git(repository, ["worktree", "add", "-b", branch, worktree, sourceCommit]);
@@ -560,9 +586,10 @@ export function workerBackoff(error: unknown): WorkerRecord["backoff"] {
 
 function now(): string { return new Date().toISOString(); }
 function object(value: unknown): Record<string, unknown> | undefined { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined; }
-function canonicalRepository(path: string): string {
+function canonicalRepository(path: string, requireCanonical = false): string {
   if (!isAbsolute(path)) throw new Error("Repository paths must be absolute.");
   const canonical = realpathSync(path), info = lstatSync(canonical);
+  if (requireCanonical && canonical !== resolve(path)) throw new Error("Use the canonical repository path without symlinks.");
   if (!info.isDirectory() || info.uid !== process.getuid?.()) throw new Error("Repository must be owned by this user.");
   return canonical;
 }

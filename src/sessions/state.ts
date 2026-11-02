@@ -15,6 +15,8 @@ export interface SessionRecord {
   claudeAccount?: string;
   /** Monotonic native lease generation for an explicitly enabled controller pool. */
   nativeGeneration?: number;
+  /** Operator-selected workspace capability associated with the native generation. */
+  controllerWorkspacePolicy?: "controller-readonly" | "controller-host";
   /** Persist replay safety independently of process-local callback state. */
   hostEnded?: "resumable" | "terminal" | "interrupted";
   role: RoleTag;

@@ -906,6 +906,14 @@ export class SdkRuntime implements BridgeRuntime {
           if (live.retiredCandidates.has(call.id)) throw new BridgeError(409, "sdk_tool_rejected", "The native SDK already completed this tool invocation");
           if (!controllerHostToolAllowed(this.config, original)) throw new BridgeError(403, "controller_tool_denied", "The read-only Factory controller cannot invoke this tool.");
           if (!live.catalog?.has(original)) throw new BridgeError(409, "tool_not_advertised", `Droid no longer advertises ${original}`);
+          if (this.config.controllerHostTools && controllerHostAction(original)) {
+            // Preserve the exact reviewed action even if a caller retains and
+            // mutates its input object while the human question is pending.
+            const approvedInput = structuredClone(call.input);
+            const approved = await this.requestControllerHostActionApproval(live, original, approvedInput, mcpName ?? names.toMcp(original));
+            if (!approved) return { content: [{ type: "text", text: "This Factory host action was not approved. No operation was sent to the host." }], isError: true };
+            call.input = approvedInput;
+          }
           // Sent to Droid with an earlier Task of its message; Droid already ran it alongside.
           const prefetched = live.prefetched.delete(call.id);
           if (!prefetched) {
@@ -989,7 +997,9 @@ export class SdkRuntime implements BridgeRuntime {
       allowDangerouslySkipPermissions: !this.config.desktopProfile && this.config.permissionMode !== "ask", abortController: abort,
       systemPrompt: { ...buildPresetSystemPrompt(this.config.desktopProfile, this.config.nativeWorkflows),
         append: buildPresetSystemPrompt(this.config.desktopProfile, this.config.nativeWorkflows).append + desktopJobPolicy(this.config)
-          + (this.config.controllerReadOnly ? "\nThis Factory controller is read-only. Inspect with the allowed read tools, discover only allowed tools with ToolSearch, and ask the user with AskUser. Delegate all implementation to the configured supervised worker tools. Never use Execute, Create, Edit, Task, SpawnAgent, unrelated MCP tools or native side effects." : "") },
+          + (this.config.controllerHostTools
+            ? "\nThis Factory controller supports ordinary folders and repositories. Use the allowed host read tools for inspection. General filesystem operations may use Factory Execute, Create or Edit only through the exact-action human approval; never bypass it with native tools. Delegate code implementation to the configured supervised workers in isolated worktrees. Never use Task, SpawnAgent, unrelated MCP tools or native side effects. Keep the user's requested scope and permissions; a folder task does not authorize deletion or production changes."
+            : this.config.controllerReadOnly ? "\nThis Factory controller is read-only. Inspect with the allowed read tools, discover only allowed tools with ToolSearch, and ask the user with AskUser. Delegate all implementation to the configured supervised worker tools. Never use Execute, Create, Edit, Task, SpawnAgent, unrelated MCP tools or native side effects." : "") },
       canUseTool: async (name: string, toolInput: Record<string, unknown>, context?: NativePermissionContext) => live.queryEpoch === epoch
         ? this.canUseTool(live, name, toolInput, context)
         : { behavior: "deny", message: "This native query has been retired." },
@@ -1303,6 +1313,39 @@ export class SdkRuntime implements BridgeRuntime {
     return this.requestDesktopActionApproval(live, question, signal);
   }
 
+  /** Host filesystem actions use the same native AskUser handshake as workers.
+   * Native Claude tools remain disabled: only the exact reviewed Factory call
+   * can be published after approval, in the same live query and workspace. */
+  private async requestControllerHostActionApproval(live: LiveSdk, original: string, input: unknown, mcpName: string): Promise<boolean> {
+    if (!this.config.controllerHostTools || !controllerHostAction(original) || !live.current || !this.control) return false;
+    const epoch = live.queryEpoch, control = this.control, cwd = resolveCwd(live.current, this.config);
+    const approval = new AbortController();
+    const timer = setTimeout(() => approval.abort(), this.config.approvalTimeoutMs);
+    timer.unref();
+    live.approvals.add(approval); this.notifyApprovals(live);
+    const current = (): boolean => !approval.signal.aborted && !live.terminal && !live.hostEnding && !live.turnHandoff
+      && live.queryEpoch === epoch && this.control === control && !!live.current
+      && resolveCwd(live.current, this.config) === cwd
+      && (control.factoryPermissionMode?.(live.current.session.bridgeSessionId) ?? live.current.factoryPermissionMode) !== "spec"
+      && !this.toolAccessDenial(live, `mcp__droid__${mcpName}`, control.factoryPermissionMode?.(live.current.session.bridgeSessionId));
+    let allowed = false;
+    try {
+      if (!current()) return false;
+      const request = live.current!.request.tools === undefined
+        ? { ...live.current!.request, tools: live.catalog?.definitions() } : live.current!.request;
+      const question = desktopActionQuestion(request, `Allow this one Factory host action ${original} in ${JSON.stringify(cwd)}?`, input);
+      if (!question) return false;
+      const answer = await this.requestDesktopActionApproval(live, question, approval.signal);
+      allowed = answer.behavior === "allow" && current() && !!live.catalog?.accepts(original, input);
+      return allowed;
+    } catch {
+      return false;
+    } finally {
+      live.events.push({ at: now(), type: "controller_host_action_decision", data: { toolName: original, decision: allowed ? "allow" : "deny" } });
+      clearTimeout(timer); live.approvals.delete(approval); this.notifyApprovals(live); approval.abort();
+    }
+  }
+
   private requestDesktopActionApproval(live: LiveSdk, question: DesktopWorkflowQuestion, signal: AbortSignal): Promise<RuntimePermissionDecision> {
     if (!live.current || live.pending.size || [...live.desktopApprovals.values()].some((item) => item.resolve)) {
       return Promise.resolve({ behavior: "deny", message: "Finish pending Factory tools before requesting action approval." });
@@ -1474,6 +1517,9 @@ export class SdkRuntime implements BridgeRuntime {
     if (this.config.controllerReadOnly) {
       const original = name?.startsWith("mcp__droid__") ? live.names?.toOriginal(name.slice("mcp__droid__".length)) : name;
       if (!original || !controllerHostToolAllowed(this.config, original)) return "BRIDGE_CONTROLLER_READ_ONLY: This tool is outside the controller's read-only and supervised-worker allowlist.";
+      if (controllerHostAction(original) && (factoryPermissionMode ?? live.current?.factoryPermissionMode) === "spec") {
+        return "BRIDGE_FACTORY_SPEC_READ_ONLY: Leave Factory spec mode before authorizing a host filesystem action.";
+      }
     }
     return toolAccessDenial(live, name, factoryPermissionMode);
   }
@@ -1892,15 +1938,18 @@ function mcpContent(content: string | ContentBlock[]): Record<string, unknown>[]
 
 function queryPolicy(input: RuntimeRequest, config: BridgeConfig): string {
   return JSON.stringify({ ...(config.models === undefined ? { model: input.request.model } : {}), role: input.role, cwd: resolveCwd(input, config), permission: config.permissionMode,
-    controllerReadOnly: config.controllerReadOnly === true, ...(config.controllerReadOnly ? { workerMcpPrefix: config.workerMcpPrefix } : {}),
+    controllerReadOnly: config.controllerReadOnly === true, controllerHostTools: config.controllerHostTools === true,
+    ...(config.controllerReadOnly ? { workerMcpPrefix: config.workerMcpPrefix } : {}),
     ...(config.controllerPool ? { subscriptionAccount: input.session.claudeAccount, nativeGeneration: input.session.nativeGeneration } : {}) });
 }
 function controllerHostToolAllowed(config: BridgeConfig, name: string): boolean {
   if (!config.controllerReadOnly) return true;
   if (["Read", "LS", "Grep", "Glob", "ToolSearch", "AskUser"].includes(name)) return true;
+  if (config.controllerHostTools && controllerHostAction(name)) return true;
   const prefix = config.workerMcpPrefix;
   return !!prefix && ["factory_worker_start", "factory_worker_status", "factory_worker_wait", "factory_worker_list", "factory_worker_cancel"].some((tool) => name === prefix + tool);
 }
+function controllerHostAction(name: string): boolean { return ["Execute", "Create", "Edit"].includes(name); }
 function toolAccessDenial(live: LiveSdk, name: string | undefined, factoryPermissionMode?: string): string | undefined {
   const request = live.current?.request;
   if (!hostAllowsAnyTools(request)) return "BRIDGE_HOST_TOOL_ACCESS_NONE: This host request permits no tools. Answer using the supplied conversation only.";

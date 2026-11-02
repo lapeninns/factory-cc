@@ -22,4 +22,15 @@ describe('subscription-only worker entry point',()=>{
     const path=config({provider:'anthropic',subscriptionProfile:undefined,apiKeyFile:'/missing-api-secret',maxBudgetUsd:1});
     await expect(runFactoryWorkers(['--config',path,'--check'],{subscriptionOnly:true})).rejects.toThrow(/subscription authentication only/);
   });
+  it('requires an explicit owned-git policy to accept an empty registration list',()=>{
+    expect(()=>readWorkerServerConfig(config({allowedRepositories:[]}))).toThrow(/allowlist/);
+    expect(readWorkerServerConfig(config({repositoryPolicy:'owned-git',allowedRepositories:[]}))).toMatchObject({repositoryPolicy:'owned-git',allowedRepositories:[]});
+    expect(readWorkerServerConfig(config({repositoryPolicy:'owned-git',allowedRepositories:['/missing/previous-repository']})).repositoryPolicy).toBe('owned-git');
+  });
+  it.each(['anywhere','',true,null])('rejects invalid private repository policy %j',repositoryPolicy=>{
+    expect(()=>readWorkerServerConfig(config({repositoryPolicy}))).toThrow(/repository policy/);
+  });
+  it.each(['anthropic','openrouter'])('does not grant owned-git access to an API route: %s',provider=>{
+    expect(()=>readWorkerServerConfig(config({provider,repositoryPolicy:'owned-git',subscriptionProfile:undefined,apiKeyFile:'/missing-api-secret',maxBudgetUsd:1}))).toThrow(/subscription authentication/);
+  });
 });

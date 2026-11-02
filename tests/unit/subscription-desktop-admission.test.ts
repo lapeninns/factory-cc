@@ -45,6 +45,32 @@ afterEach(() => {
 });
 
 describe("fixed subscription Desktop admission", () => {
+  it("requires explicit immutable host-tools opt-in on the pooled controller", () => {
+    expect(controllerPool().controllerHostTools).toBe(false);
+    const value = controllerPool({ controllerHostTools: true });
+    expect(value.controllerHostTools).toBe(true);
+    expect(() => Object.defineProperty(value, "controllerHostTools", { value: false })).toThrow();
+    expect(() => controllerPool({ controllerHostTools: "true" as never })).toThrow(/boolean/);
+    expect(() => controllerPool({ controllerHostTools: true, controllerPool: false, subscriptionAccounts: undefined })).toThrow(/host tools require/);
+    vi.stubEnv("BRIDGE_CONTROLLER_HOST_TOOLS", "1");
+    expect(controllerPool().controllerHostTools).toBe(false);
+  });
+
+  it("chooses the host workspace policy only from immutable operator configuration", async () => {
+    const value = controllerPool({ controllerHostTools: true });
+    const runtime = { kind: "fake", close: vi.fn(async () => {}) } as unknown as BridgeRuntime;
+    const app = createBridgeApp(value, createLogger(value.logDir), join(value.sandboxDir, "canary"), runtime);
+    try {
+      const input = { session: { claudeAccount: "team3", nativeGeneration: 2 }, factorySession: {
+        sessionId: "factory-host", cwd: "/fixture/folder", desktopLifecycle: true, workspacePolicy: "forged",
+      } } as unknown as RuntimeRequest;
+      expect(captured.options!.getBinding(input)).toMatchObject({ cwd: "/fixture/folder", subscriptionProfile: "team3",
+        workspacePolicy: "controller-host", nativeGeneration: 2 });
+    } finally {
+      await app.close().catch(error => { if ((error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") throw error; });
+    }
+  });
+
   it("refuses a read-only controller paired with another seat's worker namespace", () => {
     expect(() => config({ controllerReadOnly: true, workerControlFile: "/fixture/control.json", workerMcpPrefix: "factory-workers-team8___" })).toThrow(/own fixed seat/);
     expect(() => config({ controllerReadOnly: true, workerControlFile: "/fixture/control.json", workerMcpPrefix: "factory-workers-pool___" })).toThrow(/own fixed seat/);

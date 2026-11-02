@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DesktopJobsRuntime, SUBSCRIPTION_PROFILES, acquireDesktopJobLease, updateDesktopJobRecord, type DesktopJobAcquire, type DesktopJobBinding, type DesktopJobLease, type DesktopJobsOptions } from "../../src/runtime/desktop-jobs.js";
-import type { BridgeRuntime, RuntimeRequest, RuntimeTurn } from "../../src/runtime/types.js";
+import { DesktopJobsRuntime, SUBSCRIPTION_PROFILES, acquireDesktopJobLease, updateDesktopJobRecord, validateDesktopJobBinding, type DesktopJobAcquire, type DesktopJobBinding, type DesktopJobLease, type DesktopJobsOptions } from "../../src/runtime/desktop-jobs.js";
+import type { BridgeRuntime, RuntimeHostCall, RuntimeRequest, RuntimeTurn } from "../../src/runtime/types.js";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); vi.useRealTimers(); });
@@ -36,7 +36,7 @@ function setup() {
   const update = vi.fn(async () => undefined);
   const inner = { kind: "sdk" as const, handle: vi.fn(async () => turn()), cancel: vi.fn(async () => undefined),
     deliverResults: vi.fn(async () => ["accepted" as const]), setControl: vi.fn(),
-    interrupt: vi.fn(async () => true), pendingHostCalls: vi.fn(() => []),
+    interrupt: vi.fn(async () => true), pendingHostCalls: vi.fn((): RuntimeHostCall[] => []),
     completeHostTool: vi.fn(async () => "accepted" as const),
     endHostSession: vi.fn(async () => ({ resumable: true, sdkSessionId: "sdk-checkpoint" })),
     describe: vi.fn(() => ({ native: true })), close: vi.fn(async () => undefined),
@@ -150,6 +150,143 @@ describe("Factory model-phase supervision", () => {
   });
 });
 
+describe("explicit host-directory controllers", () => {
+  function hostFixture() {
+    const value = setup();
+    rmSync(join(value.cwd, ".git"));
+    value.binding.subscriptionProfile = "team1";
+    value.binding.workspacePolicy = "controller-host";
+    value.binding.nativeGeneration = 0;
+    const input = request(); input.role = "orchestrator"; input.session.role = "orchestrator";
+    return { ...value, input };
+  }
+  function hostTurn(id = "host-1", name = "Execute"): RuntimeTurn {
+    const value = turn([id]);
+    value.response.content = [{ type: "tool_use", id, name, input: { command: "df -h" } }];
+    return value;
+  }
+  function withResult(input: RuntimeRequest, id = "host-1"): RuntimeRequest {
+    return { ...input, request: { ...input.request, messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "done" }] }] } };
+  }
+
+  it("admits ordinary owned folders only under the explicit host policy and retains generation binding", async () => {
+    const fixture = hostFixture();
+    expect(validateDesktopJobBinding(fixture.binding).cwd).toBe(fixture.cwd);
+    await fixture.runtime.handle(fixture.input);
+    expect(fixture.acquire).toHaveBeenCalledWith(expect.objectContaining({ bridgeSessionId: "bridge-1:g0", workspacePolicy: "controller-host", subscriptionProfile: "team1" }), expect.any(AbortSignal));
+    expect(() => validateDesktopJobBinding({ ...fixture.binding, workspacePolicy: "controller-readonly" })).toThrow(expect.objectContaining({ status: 422, code: "desktop_job_workspace" }));
+    expect(() => validateDesktopJobBinding({ ...fixture.binding, cwd: "relative" })).toThrow(expect.objectContaining({ status: 400 }));
+  });
+
+  it("rejects redirected folders and worker or unknown roles before admission", async () => {
+    const fixture = hostFixture(), link = join(fixture.root, "redirect"); symlinkSync(fixture.cwd, link);
+    expect(() => validateDesktopJobBinding({ ...fixture.binding, cwd: link })).toThrow(expect.objectContaining({ status: 422 }));
+    if (process.getuid?.() !== 0) expect(() => validateDesktopJobBinding({ ...fixture.binding, cwd: "/" }))
+      .toThrow(expect.objectContaining({ status: 422 }));
+    for (const role of ["worker", "validator", "unknown"] as const) {
+      await expect(fixture.runtime.handle({ ...fixture.input, role })).rejects.toMatchObject({ status: 400, code: "desktop_workspace_policy" });
+    }
+    expect(fixture.acquire).not.toHaveBeenCalled(); expect(fixture.inner.handle).not.toHaveBeenCalled();
+  });
+
+  it.each(["Execute", "Create", "Edit"])("holds the shared lease across %s until its matching result is consumed", async name => {
+    const fixture = hostFixture(); fixture.inner.handle.mockResolvedValueOnce(hostTurn("host-1", name));
+    await fixture.runtime.handle(fixture.input);
+    expect(fixture.releases).not.toHaveBeenCalled();
+    expect(fixture.runtime.describe()).toMatchObject({ desktopJobs: { heldHostActions: 1 } });
+    await expect(fixture.runtime.handle(fixture.input)).rejects.toMatchObject({ status: 409, code: "desktop_host_action_pending" });
+    await expect(fixture.runtime.handle(withResult(fixture.input, "other-call"))).rejects.toMatchObject({ code: "desktop_host_action_pending" });
+    expect(fixture.releases).not.toHaveBeenCalled();
+    await fixture.runtime.handle(withResult(fixture.input));
+    expect(fixture.acquire).toHaveBeenCalledOnce();
+    expect(fixture.releases).toHaveBeenCalledOnce();
+    expect(fixture.releases).toHaveBeenCalledWith(expect.objectContaining({ state: "idle", usage: { input_tokens: 10, output_tokens: 4, cache_creation_input_tokens: 6 } }));
+  });
+
+  it("accepts a trusted host completion receipt without replaying a historical result", async () => {
+    const fixture = hostFixture(); fixture.inner.handle.mockResolvedValueOnce(hostTurn());
+    await fixture.runtime.handle(fixture.input);
+    await fixture.runtime.completeHostTool!("bridge-1", { toolUseId: "host-1", toolName: "Execute", input: { command: "df -h" }, content: "done" });
+    await fixture.runtime.handle(fixture.input);
+    expect(fixture.acquire).toHaveBeenCalledOnce(); expect(fixture.releases).toHaveBeenCalledOnce();
+  });
+
+  it("protects held host records from session retention even when the inner runtime no longer lists them", async () => {
+    const fixture = hostFixture(); fixture.input.session.bridgeSessionId = "bridge-held";
+    fixture.inner.handle.mockResolvedValueOnce(hostTurn());
+    await fixture.runtime.handle(fixture.input);
+    expect(fixture.runtime.protectedSessionIds?.()).toEqual(["bridge-1", "bridge-held"]);
+    await expect(fixture.runtime.cancel("bridge-held", "cancel")).rejects.toMatchObject({ code: "desktop_host_cleanup_unknown" });
+    expect(fixture.runtime.protectedSessionIds?.()).toEqual(["bridge-1", "bridge-held"]);
+  });
+
+  it("holds the same lease across consecutive host actions until the final result", async () => {
+    const fixture = hostFixture();
+    fixture.inner.handle.mockResolvedValueOnce(hostTurn("host-a")).mockResolvedValueOnce(hostTurn("host-b"));
+    await fixture.runtime.handle(fixture.input);
+    expect(fixture.releases).not.toHaveBeenCalled();
+    await fixture.runtime.handle(withResult(fixture.input, "host-a"));
+    expect(fixture.acquire).toHaveBeenCalledOnce();
+    expect(fixture.releases).not.toHaveBeenCalled();
+    expect(fixture.runtime.describe()).toMatchObject({ desktopJobs: { heldHostActions: 1 } });
+    await fixture.runtime.handle(withResult(fixture.input, "host-b"));
+    expect(fixture.acquire).toHaveBeenCalledOnce(); expect(fixture.releases).toHaveBeenCalledOnce();
+    expect(fixture.runtime.describe()).toMatchObject({ desktopJobs: { heldHostActions: 0 } });
+  });
+
+  it("does not mistake an unrelated historical result for completion of a current command", async () => {
+    const fixture = hostFixture(); fixture.inner.handle.mockResolvedValueOnce(hostTurn());
+    await fixture.runtime.handle(fixture.input);
+    const historical = withResult(fixture.input, "old-unrelated-call");
+    historical.request.messages.push({ role: "user", content: "new unrelated turn" });
+    await expect(fixture.runtime.handle(historical)).rejects.toMatchObject({ code: "desktop_host_action_pending" });
+    expect(fixture.releases).not.toHaveBeenCalled();
+  });
+
+  it("accepts a current command result before a newer steering message", async () => {
+    const fixture = hostFixture(); fixture.inner.handle.mockResolvedValueOnce(hostTurn());
+    await fixture.runtime.handle(fixture.input);
+    const steered = withResult(fixture.input);
+    steered.request.messages.push({ role: "assistant", content: "Tool completed." }, { role: "user", content: "Continue." });
+    await fixture.runtime.handle(steered);
+    expect(fixture.acquire).toHaveBeenCalledOnce(); expect(fixture.releases).toHaveBeenCalledOnce();
+  });
+
+  it.each(["cancel", "close", "end"])("keeps unresolved host execution unknown after %s instead of claiming cleanup", async operation => {
+    const fixture = hostFixture(); fixture.inner.handle.mockResolvedValueOnce(hostTurn());
+    fixture.inner.endHostSession.mockResolvedValue({ resumable: false, sdkSessionId: "checkpoint" });
+    await fixture.runtime.handle(fixture.input);
+    if (operation === "cancel") await expect(fixture.runtime.cancel("bridge-1", "test")).rejects.toMatchObject({ code: "desktop_host_cleanup_unknown" });
+    else if (operation === "close") await expect(fixture.runtime.close()).rejects.toMatchObject({ code: "desktop_jobs_cleanup" });
+    else await fixture.runtime.endHostSession!("bridge-1", "end");
+    expect(fixture.releases).toHaveBeenCalledWith(expect.objectContaining({ state: "unknown", cleanupVerified: false }));
+    expect(fixture.update).not.toHaveBeenCalled();
+    if (operation !== "close") await expect(fixture.runtime.handle(withResult(fixture.input))).rejects.toMatchObject({ code: "desktop_host_cleanup_unknown" });
+  });
+
+  it("keeps normal host Read and AskUser turns parked without reserving side-effect capacity", async () => {
+    const fixture = hostFixture(); fixture.inner.handle.mockResolvedValueOnce(hostTurn("read", "Read"));
+    await fixture.runtime.handle(fixture.input);
+    expect(fixture.releases).toHaveBeenCalledWith(expect.objectContaining({ state: "waiting_host" }));
+    expect(fixture.runtime.describe()).toMatchObject({ desktopJobs: { heldHostActions: 0 } });
+  });
+
+  it("does not claim a published command stopped when cancellation races the active model phase", async () => {
+    const fixture = hostFixture(), output = deferred<RuntimeTurn>();
+    fixture.inner.handle.mockImplementationOnce(() => output.promise);
+    fixture.inner.pendingHostCalls.mockReturnValue([{ toolUseId: "host-1", toolName: "Execute", input: { command: "df -h" } }]);
+    const running = fixture.runtime.handle(fixture.input);
+    await Promise.resolve(); await Promise.resolve();
+    const cancelled = fixture.runtime.cancel("bridge-1", "stop");
+    const rejected = expect(cancelled).rejects.toMatchObject({ code: "desktop_host_cleanup_unknown" });
+    await Promise.resolve(); await Promise.resolve();
+    output.resolve(hostTurn());
+    await running; await rejected;
+    expect(fixture.releases).toHaveBeenCalledWith(expect.objectContaining({ state: "unknown", cleanupVerified: false }));
+    expect(fixture.update).not.toHaveBeenCalled();
+  });
+});
+
 function fakeHelper(script: string) {
   const fixture = workspace();
   mkdirSync(join(fixture.root, "native_runtime")); writeFileSync(join(fixture.root, "native_runtime/__init__.py"), "");
@@ -161,6 +298,11 @@ function fakeHelper(script: string) {
 }
 
 describe("private shared-lease subprocess protocol", () => {
+  it.each(["invalid_workspace", "invalid_binding"])("returns permanent helper %s errors without retryable status or raw details", async code => {
+    const fixture = fakeHelper(`import json\nprint(json.dumps({'ok':False,'error':'factory_lease_refused','code':${JSON.stringify(code)}}),flush=True)\n`);
+    await expect(acquireDesktopJobLease(fixture.options, fixture.acquire, new AbortController().signal))
+      .rejects.toMatchObject({ status: code === "invalid_workspace" ? 422 : 400 });
+  });
   it.each(SUBSCRIPTION_PROFILES)("forwards only fixed %s and allowlisted metadata", async (profile) => {
     const fixture = fakeHelper(`import json,sys\na=json.loads(sys.stdin.readline())\nassert set(a)=={'op','factorySessionId','bridgeSessionId','cwd','role','subscriptionProfile'}\nassert a['subscriptionProfile']==${JSON.stringify(profile)}\nprint(json.dumps({'ok':True,'event':'ready','jobId':'job-fixture'}),flush=True)\nr=json.loads(sys.stdin.readline())\nassert r['op']=='release'\nprint(json.dumps({'ok':True,'event':'released','jobId':'job-fixture'}),flush=True)\n`);
     const request = { ...fixture.acquire, subscriptionProfile: profile, secret: "must-not-cross-protocol" };

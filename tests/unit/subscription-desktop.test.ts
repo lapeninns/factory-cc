@@ -48,6 +48,21 @@ function pooledArgs() {
 }
 
 describe("subscription Desktop launcher", () => {
+  it("requires both pools for --host-tools and rejects duplicate opt-in", () => {
+    expect(() => parseSubscriptionDesktop([...args, "--host-tools"])).toThrow(/requires? --controller-pool/);
+    expect(() => parseSubscriptionDesktop([...pooledArgs(), "--host-tools"])).toThrow(/requires? --controller-pool/);
+    expect(parseSubscriptionDesktop([...pooledArgs(), "--controller-pool", "--host-tools"]).hostTools).toBe(true);
+    expect(() => parseSubscriptionDesktop([...pooledArgs(), "--controller-pool", "--host-tools", "--host-tools"])).toThrow(/Duplicate host-tools/);
+  });
+
+  it("refuses changing an existing pooled marker into host-tools mode", async () => {
+    ownedState();
+    writeFileSync(join(data, "subscription-desktop.json"), JSON.stringify({ profile: "team1", project,
+      workerPool: true, controllerPool: true, workerMcpPrefix: "factory-workers-pool___", workerControlFile: join(root, "worker-control.json") }), { mode: 0o600 });
+    await expect(runSubscriptionDesktop([...pooledArgs(), "--controller-pool", "--host-tools", "--check"])).rejects.toThrow(/another worker connection or pool policy/);
+    expect(prepareSubscription).not.toHaveBeenCalled();
+  });
+
   it.each(["team1", "team2", "team3", "team4", "team5", "team6", "team7", "team8"])("accepts the fixed %s connection", profile => {
     const selected = args.map(value => value === "team1" ? profile : value === "factory-workers-team1___" ? `factory-workers-${profile}___` : value);
     expect(parseSubscriptionDesktop(selected).profile).toBe(profile);

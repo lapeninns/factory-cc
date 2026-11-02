@@ -1,13 +1,14 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { lstatSync, realpathSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { BridgeError, type Usage } from "../types.js";
+import { collectToolResults } from "../protocol/content.js";
 import type { BridgeRuntime, RetiredSession, RuntimeControl, RuntimeHostEnd, RuntimeRequest, RuntimeTurn, StreamSink } from "./types.js";
 
 /** Values supplied by the authenticated host controller, never request metadata. */
 export const SUBSCRIPTION_PROFILES = ["team1", "team2", "team3", "team4", "team5", "team6", "team7", "team8"] as const;
 export type SubscriptionProfile = typeof SUBSCRIPTION_PROFILES[number];
-export type DesktopWorkspacePolicy = "controller-readonly";
+export type DesktopWorkspacePolicy = "controller-readonly" | "controller-host";
 export interface DesktopJobBinding { sessionId: string; cwd: string; launchId?: string; subscriptionProfile?: SubscriptionProfile; workspacePolicy?: DesktopWorkspacePolicy; nativeGeneration?: number }
 export type DesktopJobState = "waiting_host" | "idle" | "completed" | "failed" | "cancelled" | "unknown";
 export interface DesktopJobRelease {
@@ -49,30 +50,51 @@ interface ActivePhase {
   outcome?: DesktopJobState;
   done?: Promise<RuntimeTurn>;
   cleanup?: Promise<boolean>;
+  heldHost?: HeldHostPhase;
+  acknowledgedHostIds?: Set<string>;
+  unresolvedHostIds?: Set<string>;
 }
+
+interface HeldHostPhase {
+  request: DesktopJobAcquire;
+  lease: DesktopJobLease;
+  pending: Set<string>;
+  usage?: Usage;
+  sdkSessionId?: string;
+  uncertain?: boolean;
+}
+const HOST_ACTIONS = new Set(["Execute", "Create", "Edit"]);
 
 function failure(code: string, message: string): BridgeError { return new BridgeError(503, code, message); }
 
 export function validateDesktopJobBinding(binding: DesktopJobBinding | undefined): DesktopJobBinding {
-  if (!binding || !binding.sessionId || binding.sessionId.length > 256 || !isAbsolute(binding.cwd)) {
-    throw failure("desktop_job_binding", "This model requires an authenticated Factory session and its assigned worktree.");
+  if (!binding || typeof binding.sessionId !== "string" || !binding.sessionId || binding.sessionId.length > 256
+      || typeof binding.cwd !== "string" || !isAbsolute(binding.cwd)) {
+    throw new BridgeError(400, "desktop_job_binding", "This model requires an authenticated Factory session and its assigned absolute workspace.");
   }
   validateSubscriptionProfile(binding.subscriptionProfile);
   validateWorkspacePolicy(binding.workspacePolicy, binding.subscriptionProfile);
   if (binding.nativeGeneration !== undefined && (!Number.isSafeInteger(binding.nativeGeneration) || binding.nativeGeneration < 0
-      || binding.nativeGeneration > 1_000_000 || binding.workspacePolicy !== "controller-readonly")) {
-    throw failure("desktop_job_generation", "Invalid native controller generation.");
+      || binding.nativeGeneration > 1_000_000 || !["controller-readonly", "controller-host"].includes(binding.workspacePolicy ?? ""))) {
+    throw new BridgeError(400, "desktop_job_generation", "Invalid native controller generation.");
   }
   try {
     const cwd = realpathSync(binding.cwd);
     const directory = lstatSync(cwd);
+    if (!directory.isDirectory() || directory.uid !== process.getuid?.()) throw new Error();
+    if (binding.workspacePolicy === "controller-host") {
+      if (cwd !== resolve(binding.cwd)) throw new Error();
+      return { ...binding, cwd };
+    }
     const git = lstatSync(join(cwd, ".git"));
     const markerAllowed = git.isFile() || (binding.workspacePolicy === "controller-readonly" && git.isDirectory());
-    if (!directory.isDirectory() || directory.uid !== process.getuid?.() || !markerAllowed || git.isSymbolicLink()
+    if (!markerAllowed || git.isSymbolicLink()
         || git.uid !== process.getuid?.()) throw new Error();
     return { ...binding, cwd };
   } catch {
-    throw failure("desktop_job_workspace", "Open this Factory session in a dedicated Git worktree before using the supervised model.");
+    throw new BridgeError(422, "desktop_job_workspace", binding.workspacePolicy === "controller-host"
+      ? "Choose an existing, canonical workspace directory owned by this user."
+      : "Choose a Git project root for a read-only controller, or a dedicated Git worktree for a supervised worker.");
   }
 }
 
@@ -84,6 +106,7 @@ export function validateDesktopJobBinding(binding: DesktopJobBinding | undefined
 export class DesktopJobsRuntime implements BridgeRuntime {
   private readonly active = new Map<string, ActivePhase>();
   private readonly known = new Map<string, DesktopJobAcquire>();
+  private readonly heldHost = new Map<string, HeldHostPhase>();
   private readonly faults: string[] = [];
   private closed = false;
   readonly interrupt?: BridgeRuntime["interrupt"];
@@ -106,21 +129,30 @@ export class DesktopJobsRuntime implements BridgeRuntime {
     if (inner.pendingHostCalls) this.pendingHostCalls = (id) => inner.pendingHostCalls!(id);
     if (inner.completeHostTool) this.completeHostTool = async (id, completion) => {
       const result = await inner.completeHostTool!(id, completion);
+      if (result === "accepted") this.heldHost.get(id)?.pending.delete(completion.toolUseId);
       if (completion.terminal) {
         await this.active.get(id)?.done?.catch(() => undefined);
-        await this.update(id, { state: "completed", cleanupVerified: false });
+        const held = this.heldHost.get(id);
+        if (held) await this.finishHeldHost(id, held, held.pending.size ? "unknown" : "completed");
+        else await this.update(id, { state: "completed", cleanupVerified: false });
       }
       return result;
     };
     if (inner.endHostSession) this.endHostSession = async (id, reason): Promise<RuntimeHostEnd> => {
+      this.markUnresolvedHostAction(id);
       const result = await inner.endHostSession!(id, reason);
       await this.active.get(id)?.done?.catch(() => undefined);
-      if (!result.resumable) await this.update(id, { state: "completed", sdkSessionId: result.sdkSessionId, cleanupVerified: true });
+      if (!result.resumable) {
+        const held = this.heldHost.get(id);
+        if (held) await this.finishHeldHost(id, held, held.pending.size ? "unknown" : "completed");
+        else await this.update(id, { state: "completed", sdkSessionId: result.sdkSessionId, cleanupVerified: true });
+      }
       return result;
     };
-    if (inner.protectedSessionIds) this.protectedSessionIds = () => inner.protectedSessionIds!();
+    this.protectedSessionIds = () => [...new Set([...(inner.protectedSessionIds?.() ?? []), ...this.heldHost.keys()])];
     if (inner.isSessionUsable) this.isSessionUsable = (id) => inner.isSessionUsable!(id);
     if (inner.forget) this.forget = async (session: RetiredSession) => {
+      if (this.heldHost.has(session.bridgeSessionId)) return;
       await inner.forget!(session);
       this.known.delete(session.bridgeSessionId);
     };
@@ -150,8 +182,16 @@ export class DesktopJobsRuntime implements BridgeRuntime {
                   || known.subscriptionProfile !== request.subscriptionProfile || known.workspacePolicy !== request.workspacePolicy)) {
       return Promise.reject(new BridgeError(409, "desktop_job_identity", "This native session is already bound to another Factory session or worktree."));
     }
+    const held = this.heldHost.get(id);
+    const acknowledged = held ? new Set(collectToolResults(input.request.messages)
+      .map(item => item.tool_use_id).filter(callId => held.pending.has(callId))) : undefined;
+    if (held?.uncertain) return Promise.reject(failure("desktop_host_cleanup_unknown", "A prior host action has not been verified complete; its workspace remains reserved."));
+    if (held?.pending.size && !acknowledged?.size) {
+      return Promise.reject(new BridgeError(409, "desktop_host_action_pending", "Wait for the outstanding host action result before continuing this Workstream."));
+    }
     this.known.set(id, request);
-    const phase: ActivePhase = { controller: new AbortController(), request };
+    const phase: ActivePhase = { controller: new AbortController(), request,
+      ...(held ? { lease: held.lease, heldHost: held, acknowledgedHostIds: acknowledged } : {}) };
     this.active.set(id, phase);
     phase.done = this.execute(input, sink, phase);
     return phase.done;
@@ -162,17 +202,49 @@ export class DesktopJobsRuntime implements BridgeRuntime {
     const heartbeat = setInterval(() => sink?.activity?.(), 1_000);
     heartbeat.unref();
     try {
-      phase.lease = await (this.options.acquireLease ?? ((request, signal) => acquireDesktopJobLease(this.options, request, signal)))(phase.request, phase.controller.signal);
+      phase.lease ??= await (this.options.acquireLease ?? ((request, signal) => acquireDesktopJobLease(this.options, request, signal)))(phase.request, phase.controller.signal);
       if (phase.controller.signal.aborted) throw failure("desktop_job_cancelled", "The queued Factory job was cancelled.");
       clearInterval(heartbeat);
       const turn = await this.inner.handle(input, sink);
       const cancelledCleanly = phase.cleanup ? await phase.cleanup : undefined;
+      if (phase.unresolvedHostIds?.size) {
+        await this.finishHeldHost(id, phase.heldHost ?? { request: phase.request, lease: phase.lease,
+          pending: phase.unresolvedHostIds, usage: turn.response.usage, sdkSessionId: turn.sdkSessionId }, "unknown");
+        return turn;
+      }
+      if (phase.request.workspacePolicy === "controller-host" && !phase.outcome) {
+        const held: HeldHostPhase = phase.heldHost ?? { request: phase.request, lease: phase.lease, pending: new Set() };
+        for (const callId of phase.acknowledgedHostIds ?? []) held.pending.delete(callId);
+        for (const block of turn.response.content) {
+          if (block.type === "tool_use" && typeof block.name === "string" && HOST_ACTIONS.has(block.name)
+              && typeof block.id === "string" && turn.pendingToolIds.includes(block.id)) held.pending.add(block.id);
+        }
+        held.usage = addUsage(held.usage, turn.response.usage);
+        held.sdkSessionId = turn.sdkSessionId ?? held.sdkSessionId;
+        if (held.pending.size) {
+          this.heldHost.set(id, held);
+          return turn;
+        }
+        this.heldHost.delete(id);
+        await phase.lease.release({ state: turn.pendingToolIds.length ? "waiting_host" : "idle",
+          usage: held.usage, sdkSessionId: held.sdkSessionId, cleanupVerified: false });
+        return turn;
+      }
       await phase.lease.release({ state: cancelledCleanly === false ? "unknown" : phase.outcome ?? (turn.pendingToolIds.length ? "waiting_host" : "idle"),
         usage: turn.response.usage, sdkSessionId: turn.sdkSessionId, cleanupVerified: cancelledCleanly === true });
       return turn;
     } catch (error) {
       let cleanupVerified = !phase.lease;
       if (phase.lease) {
+        const held = phase.heldHost ?? this.heldHost.get(id) ?? (phase.unresolvedHostIds?.size
+          ? { request: phase.request, lease: phase.lease, pending: phase.unresolvedHostIds } : undefined);
+        if (held?.pending.size) {
+          // Cancelling Claude is not proof that an already-published Factory
+          // command stopped. Keep the shared capacity and overlap reservation.
+          await this.inner.cancel(id, "desktop-host-phase-failed").catch(() => undefined);
+          await this.finishHeldHost(id, held, "unknown");
+          throw error;
+        }
         try {
           if (phase.cleanup) cleanupVerified = await phase.cleanup;
           else { await this.inner.cancel(id, "desktop-job-phase-failed"); cleanupVerified = true; }
@@ -195,18 +267,31 @@ export class DesktopJobsRuntime implements BridgeRuntime {
   }
 
   async cancel(sessionId: string, reason: string): Promise<void> {
+    const held = this.heldHost.get(sessionId);
+    if (held && !this.active.has(sessionId)) {
+      await this.inner.cancel(sessionId, reason);
+      await this.finishHeldHost(sessionId, held, held.pending.size ? "unknown" : "cancelled");
+      if (held.pending.size) throw failure("desktop_host_cleanup_unknown", "The host action may still be running; its workspace remains reserved.");
+      return;
+    }
     const phase = this.active.get(sessionId);
     let cleanupError: unknown;
-    const cleanup = Promise.resolve().then(() => this.inner.cancel(sessionId, reason)).then(() => true, (error: unknown) => { cleanupError = error; return false; });
+    const cleanup = Promise.resolve().then(() => {
+      this.markUnresolvedHostAction(sessionId);
+      return this.inner.cancel(sessionId, reason);
+    }).then(() => true, (error: unknown) => { cleanupError = error; return false; });
     if (phase) { phase.outcome = "cancelled"; phase.cleanup = cleanup; phase.controller.abort(); }
     const cleanupVerified = await cleanup;
     if (phase?.done) await phase.done.catch(() => undefined);
+    if (this.heldHost.get(sessionId)?.uncertain) {
+      throw failure("desktop_host_cleanup_unknown", "The host action may still be running; its workspace remains reserved.");
+    }
     await this.update(sessionId, { state: cleanupVerified ? "cancelled" : "unknown", cleanupVerified });
     if (!cleanupVerified) throw cleanupError;
   }
 
   async prepareColdRetry(sessionId: string): Promise<void> {
-    if (this.active.has(sessionId) || !this.inner.prepareColdRetry) {
+    if (this.active.has(sessionId) || this.heldHost.has(sessionId) || !this.inner.prepareColdRetry) {
       throw failure("desktop_retry_unsafe", "The native generation cannot be safely retired for retry.");
     }
     // The native runtime owns the cold-import safety decision and process proof.
@@ -222,21 +307,56 @@ export class DesktopJobsRuntime implements BridgeRuntime {
     await (this.options.updateRecord ?? ((item, outcome) => updateDesktopJobRecord(this.options, item, outcome)))(request, result);
   }
 
+  private async finishHeldHost(id: string, held: HeldHostPhase, state: "unknown" | "completed" | "cancelled"): Promise<void> {
+    const wasUncertain = held.uncertain === true;
+    if (state === "unknown") {
+      held.uncertain = true;
+      this.heldHost.set(id, held);
+    }
+    const result = { state, usage: held.usage, sdkSessionId: held.sdkSessionId, cleanupVerified: state !== "unknown" };
+    if (wasUncertain && state !== "unknown") await this.update(id, result);
+    else await held.lease.release(result);
+    if (state === "unknown") {
+      held.uncertain = true;
+      this.heldHost.set(id, held);
+      this.faults.push("host_action_cleanup_unproven");
+    } else this.heldHost.delete(id);
+  }
+
+  private markUnresolvedHostAction(id: string): void {
+    const phase = this.active.get(id);
+    if (phase?.request.workspacePolicy !== "controller-host" || !phase.lease) return;
+    const pending = (this.inner.pendingHostCalls?.(id) ?? []).filter(call => HOST_ACTIONS.has(call.toolName));
+    if (pending.length) {
+      phase.unresolvedHostIds = new Set(pending.map(call => call.toolUseId));
+      phase.outcome = "unknown";
+    }
+  }
+
   describe(): Record<string, unknown> {
     return { ...this.inner.describe?.(), desktopJobs: { activePhases: this.active.size,
       maxRunning: this.options.maxRunning ?? 2, faults: this.faults.slice(-32),
+      heldHostActions: this.heldHost.size,
       scope: "active model phases; parked native sessions remain managed by the inner runtime" } };
   }
 
   async close(): Promise<void> {
     this.closed = true;
-    const active = [...this.active.keys()];
+    const active = [...new Set([...this.active.keys(), ...this.heldHost.keys()])];
     const outcomes = await Promise.allSettled(active.map((id) => this.cancel(id, "desktop-supervisor-closed")));
     await this.inner.close?.();
     const inactive = [...this.known.keys()].filter((id) => !active.includes(id));
     outcomes.push(...await Promise.allSettled(inactive.map((id) => this.update(id, { state: "cancelled", cleanupVerified: true }))));
     if (outcomes.some((item) => item.status === "rejected")) throw failure("desktop_jobs_cleanup", "Some supervised Factory phases could not be closed cleanly.");
   }
+}
+
+function addUsage(previous: Usage | undefined, current: Usage): Usage {
+  const value: Usage = { input_tokens: 0, output_tokens: 0 };
+  for (const key of ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"] as const) {
+    if (previous?.[key] !== undefined || current[key] !== undefined) value[key] = (previous?.[key] ?? 0) + (current[key] ?? 0);
+  }
+  return value;
 }
 
 type WireMessage = Record<string, unknown>;
@@ -300,6 +420,14 @@ class LeaseChannel {
       const line = this.buffer.slice(0, end); this.buffer = this.buffer.slice(end + 1);
       let message: WireMessage;
       try { message = JSON.parse(line); } catch { this.fail("desktop_job_protocol", "Invalid Factory job helper response."); return; }
+      if (message?.ok === false && message.error === "factory_lease_refused"
+          && ["invalid_workspace", "invalid_binding"].includes(String(message.code))) {
+        this.fail(message.code === "invalid_workspace" ? "desktop_job_workspace" : "desktop_job_binding",
+          message.code === "invalid_workspace" ? "The selected workspace does not meet this execution policy. Choose a valid owned folder or Git workspace."
+            : "The selected workspace policy, account or session binding is invalid.",
+          message.code === "invalid_workspace" ? 422 : 400);
+        return;
+      }
       if (!message || message.ok !== true || typeof message.jobId !== "string" || !/^[a-zA-Z0-9_-]{1,160}$/.test(message.jobId)) {
         this.fail("desktop_job_protocol", "The Factory job helper refused the operation."); return;
       }
@@ -315,12 +443,12 @@ class LeaseChannel {
       else if (message.event !== "queued") this.fail("desktop_job_protocol", "Invalid Factory job helper response.");
     }
   }
-  private fail(code: string, message: string): void {
+  private fail(code: string, message: string, status = 503): void {
     if (this.settled) return;
     this.settled = true;
     clearTimeout(this.timer);
     this.signal?.removeEventListener("abort", this.abort);
-    const error = failure(code, message);
+    const error = new BridgeError(status, code, message);
     this.rejectReady(error); this.rejectExit(error);
     // Only this child is signalled. Its EOF policy records uncertain ownership.
     this.child.stdin.end();
@@ -366,9 +494,11 @@ function validateSubscriptionProfile(profile: unknown): void {
 }
 
 function validateWorkspacePolicy(policy: unknown, profile: unknown, role?: unknown): void {
-  if (policy !== undefined && (policy !== "controller-readonly" || !(SUBSCRIPTION_PROFILES as readonly string[]).includes(String(profile))
-      || role === "worker" || role === "validator")) {
-    throw new BridgeError(400, "desktop_workspace_policy", "Primary checkout access requires the fixed-seat read-only controller policy.");
+  if (policy !== undefined && (!["controller-readonly", "controller-host"].includes(String(policy))
+      || !(SUBSCRIPTION_PROFILES as readonly string[]).includes(String(profile))
+      || role === "worker" || role === "validator"
+      || (policy === "controller-host" && role !== undefined && role !== "chat" && role !== "orchestrator"))) {
+    throw new BridgeError(400, "desktop_workspace_policy", "Directory policies require an explicitly configured subscription controller.");
   }
 }
 

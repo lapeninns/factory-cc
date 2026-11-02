@@ -6,7 +6,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { APIWorkerService } from "../src/workers/service.js";
+import { APIWorkerService, type WorkerRepositoryPolicy } from "../src/workers/service.js";
 import { startWorkerControl } from "../src/workers/control.js";
 import { acquireDesktopJobLease, updateDesktopJobRecord, SUBSCRIPTION_PROFILES, type SubscriptionProfile } from "../src/runtime/desktop-jobs.js";
 import { startWorkerMcp } from "../src/workers/http.js";
@@ -21,6 +21,7 @@ export interface WorkerServerConfig {
   stateRoot: string;
   workspaceRoot: string;
   allowedRepositories: string[];
+  repositoryPolicy?: WorkerRepositoryPolicy;
   nativeRuntimePath: string;
   sharedStateRoot: string;
   approvalCommand?: string;
@@ -43,6 +44,8 @@ function privateFile(path: string, limit = 64 * 1024): string {
 export function readWorkerServerConfig(path: string): WorkerServerConfig {
   const value = JSON.parse(privateFile(path)) as WorkerServerConfig;
   if (!value || typeof value.enabled !== "boolean" || typeof value.approvalGuardVerified !== "boolean" || !["anthropic", "openrouter", "subscription"].includes(value.provider)) throw new Error("Invalid worker service configuration.");
+  if (value.repositoryPolicy !== undefined && !["allowlist", "owned-git"].includes(value.repositoryPolicy)) throw new Error("Invalid worker repository policy.");
+  if (value.repositoryPolicy === "owned-git" && value.provider !== "subscription") throw new Error("Owned Git repository access requires subscription authentication.");
   for (const key of ["stateRoot", "workspaceRoot", "nativeRuntimePath", "sharedStateRoot", "clientTokenFile"] as const) if (typeof value[key] !== "string" || !isAbsolute(value[key])) throw new Error("Worker paths must be absolute.");
   if (value.approvalCommand !== undefined && !isAbsolute(value.approvalCommand)) throw new Error("An approval helper path must be absolute.");
   if (value.provider === "subscription") {
@@ -50,7 +53,7 @@ export function readWorkerServerConfig(path: string): WorkerServerConfig {
     if (value.profileMappingPath !== undefined && !isAbsolute(value.profileMappingPath)) throw new Error("Profile mapping path must be absolute.");
   } else if (typeof value.apiKeyFile !== "string" || !isAbsolute(value.apiKeyFile) || !Number.isFinite(value.maxBudgetUsd) || value.maxBudgetUsd! <= 0) throw new Error("API workers require an explicit key file and budget.");
   if (!Number.isInteger(value.port) || value.port < 1024 || value.port > 65535 || value.port === 18787) throw new Error("Use a dedicated local worker port.");
-  if (!Array.isArray(value.allowedRepositories) || !value.allowedRepositories.length || value.allowedRepositories.some(path => typeof path !== "string" || !isAbsolute(path))) throw new Error("An explicit repository allowlist is required.");
+  if (!Array.isArray(value.allowedRepositories) || (value.repositoryPolicy !== "owned-git" && !value.allowedRepositories.length) || value.allowedRepositories.some(path => typeof path !== "string" || !isAbsolute(path))) throw new Error("An explicit repository allowlist is required.");
   if (!Number.isInteger(value.maxMs) || value.maxMs < 1000 || value.maxMs > 7200000 || !Number.isInteger(value.maxTurns) || value.maxTurns < 1 || value.maxTurns > 500) throw new Error("Finite worker deadline and turn bounds are required.");
   return value;
 }
@@ -71,7 +74,7 @@ export async function runFactoryWorkers(argv = process.argv.slice(2), options: {
     try { key = privateFile(config.apiKeyFile!, 16384).trim() || undefined; } catch { if (config.enabled) throw new Error("Configured API credential is unavailable or unsafe."); }
   }
   if (check) {
-    console.log(JSON.stringify({ configured: true, enabled: config.enabled, provider: config.provider, subscriptionProfile: config.subscriptionProfile, subscriptionLoginVerified, apiCredentialUsed: Boolean(key), approvalGuardVerified: config.approvalGuardVerified, repositoryCount: config.allowedRepositories.length, modelRequestsMade: false }));
+    console.log(JSON.stringify({ configured: true, enabled: config.enabled, provider: config.provider, subscriptionProfile: config.subscriptionProfile, subscriptionLoginVerified, apiCredentialUsed: Boolean(key), approvalGuardVerified: config.approvalGuardVerified, repositoryPolicy: config.repositoryPolicy ?? "allowlist", repositoryCount: config.allowedRepositories.length, modelRequestsMade: false }));
     return;
   }
   const clientToken = privateFile(config.clientTokenFile, 1024).trim();
@@ -95,7 +98,7 @@ export async function runFactoryWorkers(argv = process.argv.slice(2), options: {
   const workflows = Object.fromEntries(["implement", "investigate", "release-prepare"].map(name => [name, readFileSync(join(runtime, "workflows", name + ".md"), "utf8")]));
   const leases = { pythonExecutable: "/usr/bin/python3", runtimePackagePath: runtime, stateRoot: config.sharedStateRoot, maxRunning: 2 };
   const makeService = () => new APIWorkerService({ stateRoot: config.stateRoot, workspaceRoot: config.workspaceRoot,
-    allowedRepositories: config.allowedRepositories, provider: config.provider === "subscription" ? { kind: "subscription", profile: config.subscriptionProfile!, mappingPath: config.profileMappingPath } : { kind: config.provider }, maxConcurrent: 2,
+    allowedRepositories: config.allowedRepositories, repositoryPolicy: config.repositoryPolicy, provider: config.provider === "subscription" ? { kind: "subscription", profile: config.subscriptionProfile!, mappingPath: config.profileMappingPath } : { kind: config.provider }, maxConcurrent: 2,
     maxBudgetUsd: config.maxBudgetUsd, maxMs: config.maxMs, maxTurns: config.maxTurns, sourceEnv,
     policyText: policy, workflowText: workflows,
     acquireLease: (worker, signal) => acquireDesktopJobLease(leases, { factorySessionId: worker.id, bridgeSessionId: worker.id, cwd: worker.worktree, role: "worker", ...(config.subscriptionProfile ? { subscriptionProfile: config.subscriptionProfile } : {}) }, signal),

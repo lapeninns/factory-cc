@@ -37,11 +37,14 @@ export class ControlBroker implements RuntimeControl {
   private readonly receipts = new Map<string, { hash: string; result: Promise<ObjectValue> }>();
   private readonly launches = new Map<string, { cwd: string; cwdAliases: Set<string>; ended: boolean; hosts: Set<HostBinding>; requiresBinding?: boolean }>();
   private readonly failures: string[] = [];
+  private restoredDesktopBindings = 0;
   private closed = false;
 
   constructor(private readonly runtime: BridgeRuntime, private readonly store: SessionStore, private readonly approvalTimeoutMs: number,
-    private readonly options: { desktopLifecycle?: boolean; ignoreUnknownSessionMarkers?: boolean } = {}) {
+    private readonly options: { desktopLifecycle?: boolean; ignoreUnknownSessionMarkers?: boolean; restoreIdleDesktopBindings?: boolean } = {}) {
     if (options.desktopLifecycle && options.ignoreUnknownSessionMarkers) throw new Error("Desktop lifecycle cannot ignore unknown session markers.");
+    if (options.restoreIdleDesktopBindings !== undefined && typeof options.restoreIdleDesktopBindings !== "boolean") throw new Error("Desktop binding recovery must be an explicit boolean.");
+    if (options.restoreIdleDesktopBindings && !options.desktopLifecycle) throw new Error("Desktop binding recovery requires authenticated Desktop lifecycle events.");
   }
 
   requestApproval(request: RuntimeApprovalRequest): Promise<RuntimePermissionDecision> {
@@ -291,6 +294,7 @@ export class ControlBroker implements RuntimeControl {
       this.observePermissionMode(host, event);
       return { ok: true, bindingToken: host.token, additionalContext: `[factory-cc-session:${host.token}]` };
     }
+    if (!host) host = this.restoreIdleDesktopBinding(event, cwd, token, launchId);
     if (!host) throw new BridgeError(409, "host_not_registered", "SessionStart must register the Factory session first.");
     if (token !== host.token) throw new BridgeError(409, "stale_host_event", "Factory event is missing its live session generation or belongs to a prior one.");
     if (host.ended) {
@@ -345,6 +349,42 @@ export class ControlBroker implements RuntimeControl {
     if (typeof event.permission_mode !== "string") return;
     host.permissionMode = event.permission_mode;
     if (event.permission_mode === "spec") host.specRestricted = true;
+  }
+
+  /**
+   * A bridge restart loses its in-memory hooks, but Factory can retain the
+   * original opaque marker. Only the authenticated user-turn hook may recover
+   * that marker, and only from persisted records with no unfinished work.
+   * Ordinary model requests and other lifecycle events cannot register hosts.
+   */
+  private restoreIdleDesktopBinding(event: ObjectValue, cwd: string, token: unknown, launchId: unknown): HostBinding | undefined {
+    if (!this.options.restoreIdleDesktopBindings || !this.options.desktopLifecycle
+        || event.hook_event_name !== "UserPromptSubmit" || launchId !== undefined
+        || typeof token !== "string" || !/^[a-f0-9]{64}$/.test(token) || this.tokens.has(token)) return;
+    const records = this.store.list().filter(record => record.factorySessionId === event.session_id);
+    if (!records.length || records.some(record => record.factoryCwd !== cwd
+        || !["IDLE", "FAILED"].includes(record.state)
+        || record.cancelRequested !== false || record.hostEnded !== undefined
+        || !Array.isArray(record.pendingToolIds) || record.pendingToolIds.length !== 0
+        || (record.endedToolIds !== undefined && (!Array.isArray(record.endedToolIds) || record.endedToolIds.length !== 0))
+        || !Array.isArray(record.notes) || record.notes.some(note => typeof note !== "string"
+          || ["bridge-restarted-during-generation", "bridge-restarted-while-waiting-for-tool", "request-timeout-interrupted"].includes(note))
+        || (record.sdkSessionId !== undefined && (typeof record.sdkSessionId !== "string" || !record.sdkSessionId.trim()
+          || record.sdkSessionId.length > 256))
+        // A failed native process is not a resumable checkpoint. Pre-inference
+        // workspace rejection has no SDK session or provider token usage.
+        || (record.state === "FAILED" && (record.sdkSessionId !== undefined
+          || record.usage?.input_tokens !== 0 || record.usage?.output_tokens !== 0))
+        || this.hasApprovals(record.bridgeSessionId) || Boolean(this.runtime.pendingHostCalls?.(record.bridgeSessionId).length)
+        || [...this.hosts.values()].some(other => other.bridgeSessions.has(record.bridgeSessionId)))) return;
+    const host: HostBinding = { token, sessionId: event.session_id as string, cwd,
+      cwdAliases: new Set([cwd, resolve(event.cwd as string)]),
+      bridgeSessions: new Set(records.map(record => record.bridgeSessionId)), ended: false,
+      terminalResults: new Map(), desktopLifecycle: true };
+    this.hosts.set(`${cwd}\0${host.sessionId}`, host);
+    this.tokens.set(token, host);
+    this.restoredDesktopBindings++;
+    return host;
   }
 
   private async endHost(host: HostBinding, cancelled: boolean, reason: string): Promise<void> {
@@ -419,6 +459,7 @@ export class ControlBroker implements RuntimeControl {
 
   describe(): ObjectValue {
     return { ignoreUnknownSessionMarkers: this.options.ignoreUnknownSessionMarkers === true,
+      restoreIdleDesktopBindings: this.options.restoreIdleDesktopBindings === true, restoredDesktopBindings: this.restoredDesktopBindings,
       pendingApprovals: this.approvals.size, failures: [...this.failures], activeHostSessions: [...this.hosts.values()].filter((host) => !host.ended).length, boundNativeSessions: [...this.hosts.values()].filter((host) => !host.ended).reduce((n, host) => n + host.bridgeSessions.size, 0) };
   }
 }

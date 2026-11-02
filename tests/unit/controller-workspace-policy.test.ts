@@ -33,8 +33,9 @@ describe("trusted read-only controller workspace policy", () => {
     expect(() => validateDesktopJobBinding(base)).toThrow(/dedicated Git worktree/);
     expect(validateDesktopJobBinding({ ...base, workspacePolicy: "controller-readonly" }).cwd).toBe(primary);
     expect(validateDesktopJobBinding({ ...base, cwd: linked }).cwd).toBe(linked);
-    expect(() => validateDesktopJobBinding({ sessionId: "factory", cwd: primary, workspacePolicy: "controller-readonly" })).toThrow(/fixed-seat/);
-    expect(() => validateDesktopJobBinding({ ...base, workspacePolicy: "writer" } as unknown as DesktopJobBinding)).toThrow(/fixed-seat/);
+    const invalidPolicy = expect.objectContaining({ status: 400, code: "desktop_workspace_policy" });
+    expect(() => validateDesktopJobBinding({ sessionId: "factory", cwd: primary, workspacePolicy: "controller-readonly" })).toThrowError(invalidPolicy);
+    expect(() => validateDesktopJobBinding({ ...base, workspacePolicy: "writer" } as unknown as DesktopJobBinding)).toThrowError(invalidPolicy);
   });
   it("uses an immutable explicit operator flag and rejects incompatible routes", () => {
     const value = config();

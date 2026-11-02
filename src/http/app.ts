@@ -9,7 +9,7 @@ import { parseMessagesRequest } from "../protocol/validate.js";
 import { apiError } from "../protocol/messages.js";
 import { explicitSessionId, historyMessageHashes, historyPrefixHash, resolveSession, roleFromHeaders, sessionContextHash } from "../sessions/correlate.js";
 import { droidReasoningLevel } from "../runtime/reasoning.js";
-import { isEnded } from "../sessions/state.js";
+import { isEnded, type SessionRecord } from "../sessions/state.js";
 import { HUMAN_WAIT_TOOLS, MISSION_SPAWN_TOOLS, MISSION_WORKER_END_TOOL } from "../runtime/mission-tools.js";
 import { compactedSummaryText, lastSummarizedToolCall, sameToolInput, summaryQuote } from "../sessions/compaction.js";
 import { hostAllowsAnyTools } from "../runtime/native-tool-policy.js";
@@ -67,9 +67,34 @@ export function controllerJobBinding(config: BridgeConfig, input: RuntimeRequest
   return {
     sessionId: input.factorySession.sessionId, cwd: input.factorySession.cwd, launchId: input.factorySession.launchId,
     ...(profile === undefined ? {} : { subscriptionProfile: profile }),
-    ...(config.controllerReadOnly ? { workspacePolicy: "controller-readonly" as const } : {}),
+    ...(config.controllerReadOnly ? { workspacePolicy: config.controllerHostTools ? "controller-host" as const : "controller-readonly" as const } : {}),
     ...(config.controllerPool ? { nativeGeneration: input.session.nativeGeneration } : {}),
   };
+}
+
+/** Existing native checkpoints cannot inherit newly enabled host capabilities.
+ * A controlled restart may migrate an idle persisted conversation to a fresh
+ * generation, importing its supplied history without replaying callbacks. */
+export async function prepareControllerWorkspaceMigration(config: BridgeConfig, session: SessionRecord,
+  runtime: BridgeRuntime): Promise<Partial<SessionRecord> | undefined> {
+  if (!config.controllerHostTools || session.controllerWorkspacePolicy === "controller-host") return undefined;
+  if (session.controllerWorkspacePolicy !== undefined && session.controllerWorkspacePolicy !== "controller-readonly") {
+    throw new BridgeError(422, "controller_workspace_policy_invalid", "This session has an unsupported workspace capability.");
+  }
+  const unsafe = (): boolean => !["IDLE", "FAILED"].includes(session.state) || session.pendingToolIds.length > 0
+    || Boolean(session.endedToolIds?.length) || session.cancelRequested || session.hostEnded !== undefined
+    || runtime.isSessionUsable?.(session.bridgeSessionId) !== false
+    || Boolean(runtime.pendingHostCalls?.(session.bridgeSessionId).length)
+    || Boolean(runtime.protectedSessionIds?.().includes(session.bridgeSessionId));
+  if (unsafe()) throw new BridgeError(409, "controller_workspace_migration_busy", "Finish or safely restart this Workstream before enabling host operations; pending work cannot be migrated.");
+  const generation = (session.nativeGeneration ?? 0) + 1;
+  if (!Number.isSafeInteger(generation) || generation < 1 || generation > 1_000_000) {
+    throw new BridgeError(422, "native_generation_exhausted", "Start a new Workstream after its native generation limit.");
+  }
+  await runtime.forget?.(session);
+  if (unsafe()) throw new BridgeError(409, "controller_workspace_migration_busy", "This Workstream became active while preparing its workspace capability change.");
+  return { controllerWorkspacePolicy: "controller-host", nativeGeneration: generation, sdkSessionId: undefined,
+    retryableRequestHash: undefined, state: "IDLE" };
 }
 
 export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath: string, runtime: BridgeRuntime = createRuntime(config, logger, canaryPath)): BridgeApp {
@@ -83,7 +108,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
   });
   // Approvals wait on a person, so they get their own limit rather than the turn's idle limit.
   const control = new ControlBroker(runtime, store, config.approvalTimeoutMs, { desktopLifecycle: config.desktopLifecycle,
-    ignoreUnknownSessionMarkers: config.ignoreUnknownSessionMarkers });
+    ignoreUnknownSessionMarkers: config.ignoreUnknownSessionMarkers, restoreIdleDesktopBindings: config.controllerHostTools });
   runtime.setControl?.(control);
   const records: RedactedRequestRecord[] = [];
   let authFailureCount = 0;
@@ -449,6 +474,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         model: request.model,
         ...(claudeAccount ? { claudeAccount } : {}),
         ...(config.controllerPool ? { nativeGeneration: 0 } : {}),
+        ...(config.controllerReadOnly ? { controllerWorkspacePolicy: config.controllerHostTools ? "controller-host" as const : "controller-readonly" as const } : {}),
         ...(provider === "cursor" ? { provider } : {}),
         droidSessionId: explicitSessionId(headers, request),
         historyHash: historyPrefixHash(request),
@@ -462,13 +488,16 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     if (activeRequests.has(sessionId)) {
       throw new BridgeError(409, "session_busy", "another request is already running for this session");
     }
-    if (isEnded(session)) {
-      throw new BridgeError(409, "session_unavailable", "this session has ended; start a new session");
-    }
     const owner = Symbol(sessionId);
-    const previous = structuredClone(session);
+    let previous = structuredClone(session);
+    let workspaceMigrated = false;
     activeRequests.set(sessionId, owner);
     try {
+      if (resolved.match) {
+        const migration = await prepareControllerWorkspaceMigration(config, session, runtime);
+        if (migration) { store.update(sessionId, migration); workspaceMigrated = true; previous = structuredClone(session); }
+      }
+      if (isEnded(session)) throw new BridgeError(409, "session_unavailable", "this session has ended; start a new session");
       // The state write can be refused (session limit); the binding cannot be
       // undone. So write the state first and bind last, and if only the bind is
       // refused give the session back exactly as it was.
@@ -589,7 +618,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
 
       const turn: RuntimeTurn = await Promise.race([
         interrupted,
-        runtime.handle({ request, role, session, headers, ...(factorySession ? { factorySession } : {}), ...(resolved.reason === "upstream-retry" ? { recovery: "cold-import" as const } : {}) }, sink),
+        runtime.handle({ request, role, session, headers, ...(factorySession ? { factorySession } : {}), ...(resolved.reason === "upstream-retry" || workspaceMigrated ? { recovery: "cold-import" as const } : {}) }, sink),
       ]);
       if (cancellationRequested || store.get(sessionId)?.cancelRequested) {
         throw new BridgeError(499, "cancelled", "session cancelled");

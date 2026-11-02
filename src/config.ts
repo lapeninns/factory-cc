@@ -43,6 +43,8 @@ export interface BridgeConfig {
   readonly workerPool?: boolean;
   /** Explicit operator opt-in to native controller account selection. */
   readonly controllerPool?: boolean;
+  /** Explicit operator opt-in to exactly approved Factory filesystem actions. */
+  readonly controllerHostTools?: boolean;
   /** Private native account descriptors, deeply frozen and non-enumerable. */
   readonly subscriptionAccounts?: readonly SubscriptionAccount[];
   /** Explicit API-only native workflow mode; disabled unless opted in. */
@@ -317,6 +319,13 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
     throw new Error("Controller pool policy must be a boolean supplied by operator configuration.");
   }
   const controllerPool = overrides.controllerPool === true;
+  if (overrides.controllerHostTools !== undefined && typeof overrides.controllerHostTools !== "boolean") {
+    throw new Error("Controller host-tools policy must be a boolean supplied by operator configuration.");
+  }
+  const controllerHostTools = overrides.controllerHostTools === true;
+  if (controllerHostTools && (!controllerPool || !workerPool || !subscriptionDesktopJobs || !controllerReadOnly)) {
+    throw new Error("Controller host tools require the supervised subscription controller and worker pools.");
+  }
   if (controllerPool && (!workerPool || !subscriptionDesktopJobs || !controllerReadOnly)) {
     throw new Error("The controller pool requires the supervised worker pool and a read-only subscription Desktop controller.");
   }
@@ -427,6 +436,7 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
   Object.defineProperty(config, "controllerReadOnly", { value: controllerReadOnly, enumerable: true });
   Object.defineProperty(config, "workerPool", { value: workerPool, enumerable: true });
   Object.defineProperty(config, "controllerPool", { value: controllerPool, enumerable: true });
+  Object.defineProperty(config, "controllerHostTools", { value: controllerHostTools, enumerable: true });
   if (subscriptionAccounts) Object.defineProperty(config, "subscriptionAccounts", { value: subscriptionAccounts });
   return config;
 }
