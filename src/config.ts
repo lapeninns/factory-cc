@@ -4,13 +4,17 @@ import { chmodSync, mkdirSync, readFileSync } from "node:fs";
 import { isIPv6 } from "node:net";
 import { resolve } from "node:path";
 import type { BridgeMode } from "./types.js";
-import { parseAuthMode, type AuthMode } from "./upstream/auth-env.js";
+import { parseAuthMode, preflightAuth, type AuthMode } from "./upstream/auth-env.js";
 import { canonicalWorkspacePath } from "./workspace.js";
 import { parseClaudePool, POOL_PROFILE, type PoolMember } from "./upstream/claude-pool.js";
 import { claudeProfileModels, modelsFromIds, parseModelIds, validateModels, type BridgeModel } from "./models.js";
 
 export interface BridgeConfig {
   desktopProfile?: boolean;
+  /** Explicit API-only native workflow mode; disabled unless opted in. */
+  nativeWorkflows?: boolean;
+  workflowMaxBudgetUsd?: number;
+  workflowMaxMs?: number;
   host: string;
   port: number;
   mode: BridgeMode;
@@ -139,6 +143,20 @@ function tokenEnv(name: string): string | undefined {
 
 export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig {
   const authMode = parseAuthMode(overrides.authMode ?? env("BRIDGE_AUTH", "byok"));
+  const nativeRaw = env("BRIDGE_NATIVE_WORKFLOWS");
+  if (nativeRaw !== undefined && nativeRaw !== "0" && nativeRaw !== "1") throw new Error("BRIDGE_NATIVE_WORKFLOWS must be 0 or 1.");
+  const nativeWorkflows = overrides.nativeWorkflows ?? nativeRaw === "1";
+  const workflowMaxBudgetUsd = overrides.workflowMaxBudgetUsd ?? (env("BRIDGE_WORKFLOW_MAX_BUDGET_USD") === undefined ? undefined : Number(env("BRIDGE_WORKFLOW_MAX_BUDGET_USD")));
+  const workflowMaxMs = overrides.workflowMaxMs ?? (env("BRIDGE_WORKFLOW_MAX_MS") === undefined ? 30 * 60_000 : Number(env("BRIDGE_WORKFLOW_MAX_MS")));
+  if (nativeWorkflows) {
+    if (authMode !== "anthropic-api") throw new Error("Native workflows require BRIDGE_AUTH=anthropic-api; subscription fallback is forbidden.");
+    if (overrides.claudePool?.length || overrides.claudeProfiles?.length || env("BRIDGE_CLAUDE_POOL") || env("BRIDGE_CLAUDE_PROFILES")) throw new Error("Native workflows cannot use Claude profiles or an account pool.");
+    if (overrides.claudeExecutable || env("BRIDGE_CLAUDE_EXECUTABLE")) throw new Error("Native workflows cannot use a custom Claude executable.");
+    if (overrides.upstreamBaseUrl || overrides.upstreamModel || overrides.upstreamTokenEnv) throw new Error("Native workflows cannot use upstream routing overrides.");
+    if (!Number.isFinite(workflowMaxBudgetUsd) || workflowMaxBudgetUsd! <= 0) throw new Error("Native workflows require a positive finite BRIDGE_WORKFLOW_MAX_BUDGET_USD.");
+    if (!Number.isSafeInteger(workflowMaxMs) || workflowMaxMs < 1_000 || workflowMaxMs > 2 * 60 * 60_000) throw new Error("BRIDGE_WORKFLOW_MAX_MS must be an integer from 1000 to 7200000.");
+    preflightAuth("anthropic-api", process.env);
+  }
   const desktopProfile = overrides.desktopProfile ?? env("BRIDGE_DESKTOP") === "1";
   const claudeConfig = authMode === "claude-config" ? overrides.claudeConfig ?? readClaudeConfig(process.env, `${overrides.host ?? env("BRIDGE_HOST", "127.0.0.1")}:${overrides.port ?? intEnv("BRIDGE_PORT", 18787)}`, { requireSettings: desktopProfile && Boolean(process.env.CLAUDE_CONFIG_DIR) }) : undefined;
   if (claudeConfig) assertClaudeCredential(claudeConfig);
@@ -188,9 +206,15 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
     ? permissionRaw
     : "ask") as "bypass" | "ask";
 
+  if (nativeWorkflows && (mode !== "sdk" || !desktopProfile)) throw new Error("Native workflows require sdk mode and the guarded desktop profile.");
+  if (nativeWorkflows && (!isLoopbackHost(host) || permissionMode !== "ask" || (overrides.maxSessions ?? intEnv("BRIDGE_MAX_SESSIONS", 1)) !== 1)) {
+    throw new Error("Native workflows require loopback binding, ask permissions and BRIDGE_MAX_SESSIONS=1.");
+  }
   if (desktopProfile && (permissionMode !== "ask" || !isLoopbackHost(host))) throw new Error("Desktop profile requires ask permissions and loopback binding.");
   const config: BridgeConfig = {
     desktopProfile,
+    nativeWorkflows,
+    ...(nativeWorkflows ? { workflowMaxBudgetUsd, workflowMaxMs } : {}),
     host,
     port: overrides.port ?? intEnv("BRIDGE_PORT", 18787),
     mode,
@@ -203,7 +227,7 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
     logDir,
     sandboxDir: resolve(dataDir, "sandbox"),
     maxBodyBytes: overrides.maxBodyBytes ?? intEnv("BRIDGE_MAX_BODY_BYTES", 8 * 1024 * 1024),
-    maxSessions: overrides.maxSessions ?? intEnv("BRIDGE_MAX_SESSIONS", 32),
+    maxSessions: overrides.maxSessions ?? intEnv("BRIDGE_MAX_SESSIONS", nativeWorkflows ? 1 : 32),
     maxIdleSessions: overrides.maxIdleSessions ?? intEnv("BRIDGE_MAX_IDLE_SESSIONS", 4),
     sdkStartTimeoutMs: overrides.sdkStartTimeoutMs ?? intEnv("BRIDGE_SDK_START_TIMEOUT_MS", 60_000),
     sessionMaxRecords: overrides.sessionMaxRecords ?? intEnv("BRIDGE_SESSION_MAX_RECORDS", 1000),
@@ -240,6 +264,9 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
     ["BRIDGE_SESSION_RETENTION_MS", config.sessionRetentionMs, 1],
   ] as const) {
     if (value === undefined || !Number.isSafeInteger(value) || value < minimum) throw new Error(`${name} must be an integer >= ${minimum}.`);
+  }
+  if (nativeWorkflows && config.models?.some((model) => model.id.includes("/") || model.model.includes("/") || model.claudeProfile || model.provider === "cursor" || !/^(?:claude-[a-z0-9.-]+|opus|sonnet|haiku)$/.test(model.model))) {
+    throw new Error("Native workflows require unprefixed Anthropic model routes, without account or Cursor selection.");
   }
   if (claudeConfig) Object.defineProperty(config, "claudeConfig", { value: claudeConfig });
   if (claudeProfiles?.length) Object.defineProperty(config, "claudeProfiles", { value: claudeProfiles });

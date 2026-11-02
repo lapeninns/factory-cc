@@ -26,11 +26,11 @@ export interface PresetSystemPrompt {
   append: string;
 }
 
-export function buildPresetSystemPrompt(desktopProfile = false): PresetSystemPrompt {
+export function buildPresetSystemPrompt(desktopProfile = false, nativeWorkflows = false): PresetSystemPrompt {
   return {
     type: "preset",
     preset: "claude_code",
-    append: STABLE_DROID_APPEND + (desktopProfile ? " Desktop profile: all changes, commands, background jobs, planning approvals and subagents MUST use the advertised mcp__droid__ tools. Droid owns approvals and autonomy, including spec mode. Native tools are read-only and may be denied; never work around that denial." : ""),
+    append: STABLE_DROID_APPEND + (nativeWorkflows ? " Explicit API workflow mode: native Workflow may orchestrate bounded local children after approval. Native Agent/Task registries and all native side effects remain forbidden. Children must use the advertised Factory MCP tools for all mutations and Factory-owned operations, and must respect the current Factory mode. Native reads remain limited to the current host-authorized equivalents. Do not request remote execution, named workflows or script-path workflows." : "") + (desktopProfile ? (nativeWorkflows ? " Desktop profile: native Workflow is the approved orchestration exception; all mutations and Factory-owned operations use the advertised mcp__droid__ tools. Droid owns approvals and spec mode." : " Desktop profile: all changes, commands, background jobs, planning approvals and subagents MUST use the advertised mcp__droid__ tools. Droid owns approvals and autonomy, including spec mode. Native tools are read-only and may be denied; never work around that denial.") : ""),
   };
 }
 

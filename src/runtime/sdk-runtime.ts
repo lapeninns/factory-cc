@@ -1,3 +1,5 @@
+import { WorkflowPermits, workflowAllowed, validateWorkflowInput } from './native-workflows.js';
+import { assertNativeWorkflowSupport } from './native-workflow-support.js';
 import { DESKTOP_DISALLOWED_TOOLS, DESKTOP_APPROVAL_DENIAL, DESKTOP_READ_DENIAL } from "./desktop-policy.js";
 import { mkdirSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
@@ -146,6 +148,9 @@ interface LiveSdk {
   pending: Map<string, DroidCall>;
   candidates: Map<string, DroidCall>;
   /** The main thread's assistant message being streamed: its tool_use order and whether it has ended. */
+  workflowPermits?: WorkflowPermits;
+  workflowTimer?: ReturnType<typeof setTimeout>;
+  workflowDeferredResult?: Record<string, unknown>;
   assistantTurn?: { id: string; toolUses: Array<{ id: string; name: string }>; seen: Set<string>; stopped: boolean };
   /** Task batches waiting for their assistant message to finish streaming. */
   batchChecks: Set<() => void>;
@@ -773,6 +778,10 @@ export class SdkRuntime implements BridgeRuntime {
     const query = live.query;
     const owner = live.processOwner;
     live.queryEpoch++;
+    live.workflowPermits?.cancel(new BridgeError(409, "workflow_query_retired", "The native workflow query was retired"));
+    if (live.workflowTimer) clearTimeout(live.workflowTimer);
+    live.workflowTimer = undefined;
+    live.workflowDeferredResult = undefined;
     live.inputs.close();
     live.query = undefined;
     live.loop = undefined;
@@ -818,16 +827,28 @@ export class SdkRuntime implements BridgeRuntime {
     live.names = names;
     live.policyKey = queryPolicy(input, this.config);
     const epoch = live.queryEpoch;
+    const workflowPermits = this.config.nativeWorkflows ? new WorkflowPermits() : undefined;
+    live.workflowPermits = workflowPermits;
     const server = sdk.createSdkMcpServer({ name: "droid", version: "0.1.0", tools: [], alwaysLoad: true });
     const catalog = new DroidMcpCatalog(server, async (original, args, extra, mcpName) => {
         if (live.queryEpoch !== epoch) throw new BridgeError(409, "stale_native_query", "This native query has been retired.");
         if (live.terminal) throw live.terminal;
         if (live.hostEnding) throw new BridgeError(409, "host_session_ended", live.hostEnding);
         if (!live.catalog?.has(original)) throw new BridgeError(409, "tool_not_advertised", `Droid no longer advertises ${original}`);
+        let workflowCallId: string | undefined;
         try {
           // Only this handler proves the native CLI and MCP server accepted the
           // invocation. Assistant tool_use output alone is merely a proposal.
-          const call = await this.claimCall(live, original, args, extractCallId(extra), mcpName);
+          const call = workflowPermits
+            ? { id: workflowPermits.claim(`mcp__droid__${mcpName}`, args, epoch, extractCallId(extra)), name: original, input: args, mcpName }
+            : await this.claimCall(live, original, args, extractCallId(extra), mcpName);
+          workflowCallId = call.id;
+          if (workflowPermits) {
+            const denied = toolAccessDenial(live, `mcp__droid__${mcpName}`, this.control?.factoryPermissionMode?.(live.current?.session.bridgeSessionId ?? ""));
+            if (denied) throw new BridgeError(409, "workflow_tool_not_authorized", denied);
+            live.claimedHandlers.add(call.id);
+            live.candidates.delete(call.id);
+          }
           if (live.terminal) throw live.terminal;
           if (live.retiredCandidates.has(call.id)) throw new BridgeError(409, "sdk_tool_rejected", "The native SDK already completed this tool invocation");
           if (!live.catalog?.has(original)) throw new BridgeError(409, "tool_not_advertised", `Droid no longer advertises ${original}`);
@@ -839,7 +860,7 @@ export class SdkRuntime implements BridgeRuntime {
           }
           let consumed!: () => void;
           live.hostResultConsumptions.set(call.id, { promise: new Promise<void>((resolve) => { consumed = resolve; }), resolve: () => consumed() });
-          const batch = !prefetched && original === "Task" ? await this.taskBatch(live, call) : [];
+          const batch = !workflowPermits && !prefetched && original === "Task" ? await this.taskBatch(live, call) : [];
           if (live.terminal) throw live.terminal;
           const waiting = live.mailbox.wait(call.id, this.config.toolWaitMs);
           if (!prefetched) {
@@ -859,6 +880,9 @@ export class SdkRuntime implements BridgeRuntime {
         } catch (error) {
           if (live.queryEpoch === epoch) this.stop(live, this.sdkError(error));
           throw error;
+        } finally {
+          if (workflowCallId) workflowPermits?.release(workflowCallId);
+          this.finishDeferredWorkflow(live);
         }
       }, names);
     live.catalog = catalog;
@@ -903,12 +927,17 @@ export class SdkRuntime implements BridgeRuntime {
       allowedTools: ["mcp__droid__*"],
       env, permissionMode: this.config.desktopProfile || this.config.permissionMode === "ask" ? "default" : "bypassPermissions",
       allowDangerouslySkipPermissions: !this.config.desktopProfile && this.config.permissionMode !== "ask", abortController: abort,
-      systemPrompt: buildPresetSystemPrompt(this.config.desktopProfile),
+      systemPrompt: buildPresetSystemPrompt(this.config.desktopProfile, this.config.nativeWorkflows),
       canUseTool: async (name: string, toolInput: Record<string, unknown>, context?: NativePermissionContext) => live.queryEpoch === epoch
         ? this.canUseTool(live, name, toolInput, context)
         : { behavior: "deny", message: "This native query has been retired." },
     };
-    if (this.config.desktopProfile) options.disallowedTools = [...DESKTOP_DISALLOWED_TOOLS];
+    if (this.config.desktopProfile || this.config.nativeWorkflows) options.disallowedTools = DESKTOP_DISALLOWED_TOOLS.filter(name => !(this.config.nativeWorkflows && name === "Workflow"));
+    if (this.config.nativeWorkflows) {
+      options.maxBudgetUsd = this.config.workflowMaxBudgetUsd;
+      env.CLAUDE_CONFIG_DIR = join(this.config.dataDir, "native-workflow-config");
+      mkdirSync(env.CLAUDE_CONFIG_DIR, { recursive: true, mode: 0o700 });
+    }
     // Empty setting sources keep settings.json env blocks and permissions.allow
     // from bypassing this bridge. inherit keeps the CLI default (all sources).
     if (this.config.desktopProfile || this.config.authMode !== "inherit") {
@@ -924,9 +953,10 @@ export class SdkRuntime implements BridgeRuntime {
         options.settings = { apiKeyHelper: helper };
       }
     }
+    if (this.config.nativeWorkflows) options.settings = { ...(options.settings as object ?? {}), enableWorkflows: true, ultracode: true, workflowSizeGuideline: "small" };
     // The host can change its tool capability between turns without rebuilding
     // native history. Check at invocation, including under native bypass mode.
-    options.hooks = { PreToolUse: [{ hooks: [async (hook: { tool_name?: string; tool_use_id?: string }) => {
+    options.hooks = { PreToolUse: [{ hooks: [async (hook: { tool_name?: string; tool_use_id?: string; tool_input?: unknown }) => {
         if (live.queryEpoch !== epoch) return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "This native query has been retired." } };
         if (live.terminal) return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "The host session has ended." } };
         if (hook.tool_name && !isDroidMcpName(hook.tool_name)) live.nativeCallsThisRequest = true;
@@ -937,7 +967,25 @@ export class SdkRuntime implements BridgeRuntime {
           live.events.push({ at: now(), type: cancelled ? "cancelled_turn_tool_denied" : "steering_turn_tool_denied", data: { toolName: hook.tool_name, toolUseId: hook.tool_use_id } });
           return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: cancelled ? CANCELLED_TURN_DENIAL : STEERING_TURN_DENIAL } };
         }
-        if (this.config.desktopProfile && hook.tool_name && !hook.tool_name.startsWith("mcp__droid__") && !["Read", "Glob", "Grep", "LS"].includes(hook.tool_name)) return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: DESKTOP_APPROVAL_DENIAL } };
+        if (this.config.nativeWorkflows && hook.tool_name === "Workflow") {
+          if (!workflowAllowed(this.config, live.current?.request, this.control?.factoryPermissionMode?.(live.current?.session.bridgeSessionId ?? "") ?? live.current?.factoryPermissionMode)) return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "Workflow execution is not authorised in this host mode." } };
+          const invalid = validateWorkflowInput((hook.tool_input ?? {}) as Record<string, unknown>);
+          if (invalid) return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: invalid } };
+          // Workflow may be classified safe by the native permission engine.
+          // Always ask the Factory controller here, before the script can run.
+          const decision = await this.canUseTool(live, "Workflow", (hook.tool_input ?? {}) as Record<string, unknown>, { toolUseID: hook.tool_use_id });
+          if (decision.behavior !== "allow") return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: decision.message } };
+          if (!live.workflowTimer) live.workflowTimer = setTimeout(() => { void this.stop(live, new BridgeError(504, "workflow_deadline", "Native workflow exceeded its absolute deadline")); }, this.config.workflowMaxMs);
+          return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: decision.updatedInput ?? hook.tool_input } };
+        }
+        if (this.config.nativeWorkflows && hook.tool_name?.startsWith("mcp__droid__")) {
+          const denied = toolAccessDenial(live, hook.tool_name, this.control?.factoryPermissionMode?.(live.current?.session.bridgeSessionId ?? ""));
+          if (denied) return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: denied } };
+          try { await workflowPermits!.acquire(hook.tool_use_id, hook.tool_name, hook.tool_input, epoch); }
+          catch { return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "Workflow action identity unavailable or cancelled" } }; }
+          return {};
+        }
+        if ((this.config.desktopProfile || this.config.nativeWorkflows) && hook.tool_name && !hook.tool_name.startsWith("mcp__droid__") && !["Read", "Glob", "Grep", "LS"].includes(hook.tool_name)) return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: DESKTOP_APPROVAL_DENIAL } };
         const denial = prefetched ? undefined : toolAccessDenial(live, hook.tool_name, this.control?.factoryPermissionMode?.(input.session.bridgeSessionId));
         if (!denial) return {};
         const data = { sessionId: input.session.bridgeSessionId, sdkSessionId: live.sdkSessionId, toolName: hook.tool_name, toolUseId: hook.tool_use_id, reason: denial };
@@ -950,15 +998,17 @@ export class SdkRuntime implements BridgeRuntime {
     else if (process.env.ANTHROPIC_MODEL) options.model = process.env.ANTHROPIC_MODEL;
     const reasoning = claudeReasoningOptions(droidReasoningLevel(input.request));
     if (reasoning?.effort) options.effort = reasoning.effort;
+    else if (this.config.nativeWorkflows && !reasoning) options.effort = "medium";
     if (reasoning?.thinking) options.thinking = reasoning.thinking;
     live.reasoningKey = claudeReasoningKey(input.request);
     if (this.config.claudeExecutable) options.pathToClaudeCodeExecutable = this.config.claudeExecutable;
     if (live.sdkSessionId) options.resume = live.sdkSessionId;
     const expectedResumeId = route ? live.sdkSessionId : undefined;
-    const queryStart = { resumed: Boolean(live.sdkSessionId), sdkSessionId: live.sdkSessionId, droidMcp: catalog.definitions().map((tool) => tool.name), effort: reasoning?.effort ?? null, thinking: reasoning?.thinking?.type ?? null };
+    const queryStart = { resumed: Boolean(live.sdkSessionId), sdkSessionId: live.sdkSessionId, droidMcp: catalog.definitions().map((tool) => tool.name), effort: options.effort ?? null, thinking: reasoning?.thinking?.type ?? null };
     live.events.push({ at: now(), type: "sdk_query_start", data: queryStart });
     this.logger.info("sdk_query_options", queryStart);
     try {
+      if (this.config.nativeWorkflows) options.pathToClaudeCodeExecutable = assertNativeWorkflowSupport().executable;
       live.query = sdk.query({ prompt: live.inputs, options });
       // Iterate the Query itself. Its close() owns process shutdown; never call raw generator.return().
       live.loop = this.consume(live, live.query, live.queryEpoch, expectedResumeId);
@@ -1081,9 +1131,12 @@ export class SdkRuntime implements BridgeRuntime {
   }
 
   private async canUseTool(live: LiveSdk, name: string, input: Record<string, unknown>, context: NativePermissionContext = {}): Promise<RuntimePermissionDecision> {
-    if (this.config.desktopProfile) return { behavior: "deny", message: ["Read", "Glob", "Grep", "LS"].includes(name) ? DESKTOP_READ_DENIAL : DESKTOP_APPROVAL_DENIAL };
+    const nativeWorkflow = name === "Workflow" && workflowAllowed(this.config, live.current?.request, this.control?.factoryPermissionMode?.(live.current?.session.bridgeSessionId ?? "") ?? live.current?.factoryPermissionMode);
+    const workflowInvalid = nativeWorkflow ? validateWorkflowInput(input) : undefined;
+    if (workflowInvalid) return { behavior: "deny", message: workflowInvalid };
+    if ((this.config.desktopProfile || this.config.nativeWorkflows) && !nativeWorkflow) return { behavior: "deny", message: ["Read", "Glob", "Grep", "LS"].includes(name) ? DESKTOP_READ_DENIAL : DESKTOP_APPROVAL_DENIAL };
     if (live.terminal) return { behavior: "deny", message: "Session is closed" };
-    const denial = toolAccessDenial(live, name, live.current && this.control?.factoryPermissionMode?.(live.current.session.bridgeSessionId));
+    const denial = nativeWorkflow ? undefined : toolAccessDenial(live, name, live.current && this.control?.factoryPermissionMode?.(live.current.session.bridgeSessionId));
     if (denial) return { behavior: "deny", message: denial };
     const control = this.control;
     if (!control || !live.current) {
@@ -1120,12 +1173,18 @@ export class SdkRuntime implements BridgeRuntime {
       if (live.terminal || live.queryEpoch !== epoch || approval.signal.aborted || this.control !== control) {
         return { behavior: "deny", message: "Native approval is no longer live" };
       }
-      const currentDenial = toolAccessDenial(live, name, live.current && this.control?.factoryPermissionMode?.(live.current.session.bridgeSessionId));
+      const currentDenial = nativeWorkflow
+        ? (workflowAllowed(this.config, live.current?.request, this.control?.factoryPermissionMode?.(live.current?.session.bridgeSessionId ?? "") ?? live.current?.factoryPermissionMode) ? undefined : "Workflow permission changed while approval was pending")
+        : toolAccessDenial(live, name, live.current && this.control?.factoryPermissionMode?.(live.current.session.bridgeSessionId));
       if (currentDenial) return { behavior: "deny", message: currentDenial };
       if (!decision || (decision.behavior !== "allow" && decision.behavior !== "deny")) {
         return { behavior: "deny", message: "The approval controller returned an invalid decision" };
       }
       live.events.push({ at: now(), type: decision.behavior === "allow" ? "permission_allowed" : "permission_denied", data: { toolName: name, toolUseId: context.toolUseID } });
+      if (nativeWorkflow && decision.behavior === "allow") {
+        const invalid = validateWorkflowInput(decision.updatedInput ?? input);
+        if (invalid) return { behavior: "deny", message: invalid };
+      }
       return decision.behavior === "allow"
         ? { behavior: "allow", updatedInput: decision.updatedInput ?? input }
         : { behavior: "deny", message: decision.message || "The operation was denied" };
@@ -1265,6 +1324,7 @@ export class SdkRuntime implements BridgeRuntime {
         if (arrival.callId === id) arrival.reject(new BridgeError(409, "sdk_tool_rejected", "The native SDK rejected this tool invocation before handoff"));
       }
       if (live.pending.has(id)) throw new BridgeError(502, "sdk_tool_interrupted", "The native SDK completed a Droid tool before its external result arrived; do not replay it");
+      live.workflowPermits?.release(id);
     }
   }
 
@@ -1276,7 +1336,8 @@ export class SdkRuntime implements BridgeRuntime {
       const source = typeof query.next === "function"
         ? { [Symbol.asyncIterator]: () => query as AsyncIterator<Record<string, unknown>> }
         : iterator;
-      for await (const message of source) {
+      for await (const rawMessage of source) {
+        let message = rawMessage;
         if (live.terminal || live.queryEpoch !== epoch) return;
         if (message.type === "system" && message.subtype === "api_retry" && (message.error_status === 429 || message.error_status === 529)) {
           const retryAfter = typeof message.retry_delay_ms === "number" && Number.isFinite(message.retry_delay_ms) && message.retry_delay_ms >= 0
@@ -1304,7 +1365,7 @@ export class SdkRuntime implements BridgeRuntime {
           if (expectedResumeId && !message.parent_tool_use_id && message.session_id !== expectedResumeId) {
             throw new BridgeError(502, "sdk_resume_identity_changed", "The SDK did not resume the requested native session; refusing to continue without its history.");
           }
-          if (!expectedResumeId || !message.parent_tool_use_id) live.sdkSessionId = message.session_id;
+          if (!message.parent_tool_use_id) live.sdkSessionId = message.session_id;
         }
         const event = { at: now(), type: String(message.subtype === "compact_boundary" ? "compact_boundary" : message.type ?? "sdk"), data: summarizeSdk(message) };
         live.events.push(event);
@@ -1315,7 +1376,14 @@ export class SdkRuntime implements BridgeRuntime {
         }
         this.noteUsage(live, message);
         if (message.type === "system" && message.subtype === "task_started" && typeof message.task_id === "string") live.backgroundTasks.add(message.task_id);
-        if (message.type === "system" && message.subtype === "task_notification" && typeof message.task_id === "string") live.backgroundTasks.delete(message.task_id);
+        if (message.type === "system" && message.subtype === "task_notification" && typeof message.task_id === "string") {
+          live.backgroundTasks.delete(message.task_id);
+          if (this.config.nativeWorkflows && ["failed", "cancelled", "stopped"].includes(String(message.status))) throw new BridgeError(502, "workflow_child_failed", "Native workflow child did not complete successfully");
+          if (this.config.nativeWorkflows && !live.backgroundTasks.size && !live.pending.size && live.workflowDeferredResult) {
+            message = live.workflowDeferredResult;
+            live.workflowDeferredResult = undefined;
+          }
+        }
         if (message.type === "stream_event") {
           if (message.parent_tool_use_id) continue;
           this.trackAssistantTurn(live, message);
@@ -1372,7 +1440,10 @@ export class SdkRuntime implements BridgeRuntime {
           this.settleBatches(live);
         }
         if (message.type === "result") {
-          if (message.parent_tool_use_id) continue;
+          if (message.parent_tool_use_id) {
+            if (this.config.nativeWorkflows && (message.is_error === true || (typeof message.subtype === "string" && message.subtype !== "success"))) throw new BridgeError(502, "workflow_child_failed", "Native workflow child did not complete successfully");
+            continue;
+          }
           if (live.interrupting) {
             // The aborted turn has ended, whatever subtype it reports. What it left
             // unmatched is moot: interrupt() now retires this process.
@@ -1387,29 +1458,9 @@ export class SdkRuntime implements BridgeRuntime {
             throw new BridgeError(502, "sdk_execution_error", errors || extractText(message) || String(message.subtype ?? "SDK execution failed"));
           }
           if (!live.active) continue;
+          if (this.config.nativeWorkflows && (live.backgroundTasks.size || live.pending.size || live.workflowPermits?.pending)) { live.workflowDeferredResult = message; continue; }
           if (live.pending.size || live.handlerArrivals.size) throw new BridgeError(502, "sdk_unfinished_tools", "SDK ended a turn while Droid tools were unresolved");
-          for (const id of live.candidates.keys()) live.retiredCandidates.add(id);
-          live.candidates.clear();
-          for (const id of live.prefetched) live.events.push({ at: now(), type: "task_batch_unclaimed", data: { toolUseId: id } });
-          live.prefetched.clear();
-          const fallback = extractText(message);
-          if (!live.streamed && !live.blocks.length && fallback) live.blocks.push({ type: "text", text: fallback });
-          const handoff = live.turnHandoff;
-          live.turnHandoff = undefined;
-          if (handoff?.followup.length) {
-            // The previous response ended. Deliver steering as a real user turn
-            // whose reply continues this same HTTP response.
-            live.sentUserTurns++;
-            live.inputs.push({
-              type: "user", message: { role: "user", content: handoff.followup },
-              parent_tool_use_id: null, session_id: live.sdkSessionId ?? "", uuid: randomUUID(),
-            });
-            live.events.push({ at: now(), type: handoff.reason === "cancelled" ? "cancelled_turn_followup" : "steering_turn_followup", data: { sdkSessionId: live.sdkSessionId } });
-            continue;
-          }
-          live.active = false;
-          live.turnStartedAt = undefined;
-          this.publish(live, this.makeTurn(live, [], "end_turn"));
+          this.completeRootResult(live, message);
         }
       }
       if (!live.terminal && live.queryEpoch === epoch) {
@@ -1419,6 +1470,33 @@ export class SdkRuntime implements BridgeRuntime {
     } catch (error) {
       if (!live.terminal && live.queryEpoch === epoch) this.stop(live, this.sdkError(error));
     }
+  }
+
+  private completeRootResult(live: LiveSdk, message: Record<string, unknown>): void {
+    for (const id of live.candidates.keys()) live.retiredCandidates.add(id);
+    live.candidates.clear();
+    for (const id of live.prefetched) live.events.push({ at: now(), type: "task_batch_unclaimed", data: { toolUseId: id } });
+    live.prefetched.clear();
+    const fallback = extractText(message);
+    if (!live.streamed && !live.blocks.length && fallback) live.blocks.push({ type: "text", text: fallback });
+    const handoff = live.turnHandoff;
+    live.turnHandoff = undefined;
+    if (handoff?.followup.length) {
+      // The previous response ended. Deliver steering as a real user turn
+      // whose reply continues this same HTTP response.
+      live.sentUserTurns++;
+      live.inputs.push({
+        type: "user", message: { role: "user", content: handoff.followup },
+        parent_tool_use_id: null, session_id: live.sdkSessionId ?? "", uuid: randomUUID(),
+      });
+      live.events.push({ at: now(), type: handoff.reason === "cancelled" ? "cancelled_turn_followup" : "steering_turn_followup", data: { sdkSessionId: live.sdkSessionId } });
+      return;
+    }
+    if (live.workflowTimer) clearTimeout(live.workflowTimer);
+    live.workflowTimer = undefined;
+    live.active = false;
+    live.turnStartedAt = undefined;
+    this.publish(live, this.makeTurn(live, [], "end_turn"));
   }
 
   private noteUsage(live: LiveSdk, message: Record<string, unknown>): void {
@@ -1449,6 +1527,13 @@ export class SdkRuntime implements BridgeRuntime {
     live.streamed = "";
     live.textBreak = false;
     return turn;
+  }
+
+  private finishDeferredWorkflow(live: LiveSdk): void {
+    if (!this.config.nativeWorkflows || live.terminal || !live.workflowDeferredResult || live.backgroundTasks.size || live.pending.size || live.workflowPermits?.pending) return;
+    const result = live.workflowDeferredResult;
+    live.workflowDeferredResult = undefined;
+    this.completeRootResult(live, result);
   }
 
   private publish(live: LiveSdk, turn: RuntimeTurn): void {
@@ -1506,6 +1591,10 @@ export class SdkRuntime implements BridgeRuntime {
       error = new BridgeError(error.status, error.code, error.message, { ...error.extra, retry_from_history: true });
     }
     live.terminal = error;
+    if (live.workflowTimer) clearTimeout(live.workflowTimer);
+    live.workflowTimer = undefined;
+    live.workflowDeferredResult = undefined;
+    live.workflowPermits?.cancel(error);
     live.active = false;
     live.turnHandoff = undefined;
     live.inputs.close();
