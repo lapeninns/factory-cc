@@ -15,7 +15,7 @@ function fixture() {
 }
 
 describe("per-seat Factory lifecycle bindings", () => {
-  it("keeps legacy and named generations independent through real hook processes", async () => {
+  it.each(["BRIDGE_FACTORY_BINDING_TEAM8", "BRIDGE_FACTORY_BINDING_POOL"])("keeps legacy and %s generations independent through real hook processes", async bindingEnv => {
     const f = fixture(), requests: Array<{ key: string; body: Record<string, unknown> }> = [];
     const server = createServer(async (request, response) => {
       let raw = ""; for await (const chunk of request) raw += chunk;
@@ -30,11 +30,11 @@ describe("per-seat Factory lifecycle bindings", () => {
     const url = `http://127.0.0.1:${address.port}`;
     const one = join(f.root, "one.json"), eight = join(f.root, "eight.json");
     installFactoryHooks({ hooksPath: f.hooksPath, configPath: one, url, hookToken: "fixture-one", desktopLifecycle: true });
-    installFactoryHooks({ hooksPath: f.hooksPath, configPath: eight, url, hookToken: "fixture-eight", desktopLifecycle: true, bindingEnv: "BRIDGE_FACTORY_BINDING_TEAM8" });
+    installFactoryHooks({ hooksPath: f.hooksPath, configPath: eight, url, hookToken: "fixture-eight", desktopLifecycle: true, bindingEnv });
     const hookConfig = JSON.parse(readFileSync(f.hooksPath, "utf8"));
     expect(hookConfig.SessionStart).toHaveLength(2);
     expect(JSON.parse(readFileSync(one, "utf8"))).not.toHaveProperty("bindingEnv");
-    expect(JSON.parse(readFileSync(eight, "utf8"))).toHaveProperty("bindingEnv", "BRIDGE_FACTORY_BINDING_TEAM8");
+    expect(JSON.parse(readFileSync(eight, "utf8"))).toHaveProperty("bindingEnv", bindingEnv);
 
     const invoke = async (configPath: string, event: string, bindings: Record<string, string> = {}) => {
       const env = { ...process.env };
@@ -53,8 +53,8 @@ describe("per-seat Factory lifecycle bindings", () => {
       expect((await invoke(eight, "SessionStart")).code).toBe(0);
       const persisted = readFileSync(f.envFile, "utf8");
       expect(persisted).toContain(`export BRIDGE_FACTORY_BINDING='${"a".repeat(64)}'`);
-      expect(persisted).toContain(`export BRIDGE_FACTORY_BINDING_TEAM8='${"b".repeat(64)}'`);
-      const bindings = { BRIDGE_FACTORY_BINDING: "a".repeat(64), BRIDGE_FACTORY_BINDING_TEAM8: "b".repeat(64) };
+      expect(persisted).toContain(`export ${bindingEnv}='${"b".repeat(64)}'`);
+      const bindings = { BRIDGE_FACTORY_BINDING: "a".repeat(64), [bindingEnv]: "b".repeat(64) };
       expect((await invoke(one, "UserPromptSubmit", bindings)).code).toBe(0);
       expect((await invoke(eight, "UserPromptSubmit", bindings)).code).toBe(0);
       expect(requests.slice(-2)).toMatchObject([
@@ -69,7 +69,7 @@ describe("per-seat Factory lifecycle bindings", () => {
     }
   });
 
-  it.each(["HOME", "BRIDGE_FACTORY_BINDING_TEAM0", "BRIDGE_FACTORY_BINDING_TEAM9", "BRIDGE_FACTORY_BINDING_TEAM01", "BRIDGE_FACTORY_BINDING_TEAM8\n", "BRIDGE_FACTORY_BINDING;echo x"])("rejects unsafe binding names before writes: %s", bindingEnv => {
+  it.each(["HOME", "BRIDGE_FACTORY_BINDING_TEAM0", "BRIDGE_FACTORY_BINDING_TEAM9", "BRIDGE_FACTORY_BINDING_TEAM01", "BRIDGE_FACTORY_BINDING_TEAM8\n", "BRIDGE_FACTORY_BINDING_POOL_OTHER", "BRIDGE_FACTORY_BINDING;echo x"])("rejects unsafe binding names before writes: %s", bindingEnv => {
     const f = fixture(), configPath = join(f.root, "private.json");
     expect(() => installFactoryHooks({ hooksPath: f.hooksPath, configPath, url: "http://127.0.0.1:1", hookToken: "fixture", bindingEnv })).toThrow("binding environment name");
     expect(existsSync(configPath)).toBe(false); expect(existsSync(f.hooksPath)).toBe(false);
@@ -78,10 +78,12 @@ describe("per-seat Factory lifecycle bindings", () => {
   });
 
   it("strips every named generation from inherited SDK environments and denies passthrough", () => {
-    const source = { PATH: "/usr/bin:/bin", HOME: "/tmp", BRIDGE_FACTORY_BINDING_TEAM2: "private-generation-two", BRIDGE_FACTORY_BINDING_TEAM8: "private-generation-eight" };
+    const source = { PATH: "/usr/bin:/bin", HOME: "/tmp", BRIDGE_FACTORY_BINDING_TEAM2: "private-generation-two", BRIDGE_FACTORY_BINDING_TEAM8: "private-generation-eight", BRIDGE_FACTORY_BINDING_POOL: "private-generation-pool" };
     expect(buildChildEnv("inherit", source)).not.toHaveProperty("BRIDGE_FACTORY_BINDING_TEAM2");
     expect(buildChildEnv("inherit", source)).not.toHaveProperty("BRIDGE_FACTORY_BINDING_TEAM8");
     expect(buildChildEnv("subscription", source)).not.toHaveProperty("BRIDGE_FACTORY_BINDING_TEAM8");
+    expect(buildChildEnv("inherit", source)).not.toHaveProperty("BRIDGE_FACTORY_BINDING_POOL");
+    expect(buildChildEnv("subscription", source)).not.toHaveProperty("BRIDGE_FACTORY_BINDING_POOL");
     expect(() => buildChildEnv("subscription", { ...source, BRIDGE_ENV_PASSTHROUGH: "BRIDGE_FACTORY_BINDING_TEAM8" })).toThrow("BRIDGE_ENV_PASSTHROUGH");
   });
 });

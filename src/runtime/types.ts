@@ -110,6 +110,8 @@ export interface BridgeRuntime {
   describe?(): Record<string, unknown>;
   protectedSessionIds?(): string[];
   isSessionUsable?(sessionId: string): boolean;
+  /** Retire a failed, side-effect-free native generation only after verified cleanup. */
+  prepareColdRetry?(sessionId: string): Promise<void>;
   /** Drop only inactive retained metadata after its durable session was pruned. */
   forget?(session: RetiredSession): Promise<void>;
   close?(): Promise<void>;

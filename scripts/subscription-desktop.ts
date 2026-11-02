@@ -3,20 +3,29 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSy
 import { isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { prepareSubscription } from "../src/workers/subscription-auth.js";
-import { loadConfig } from "../src/config.js";
+import { loadConfig, validateSubscriptionAccountPool, type SubscriptionAccount } from "../src/config.js";
 import { createBridgeApp, listen } from "../src/http/app.js";
 import { createLogger } from "../src/logging.js";
 import { installShutdownHandlers } from "../src/index.js";
 import { SUBSCRIPTION_PROFILES, validateDesktopJobBinding, type SubscriptionProfile } from "../src/runtime/desktop-jobs.js";
 
 export function parseSubscriptionDesktop(argv: string[]) {
-  const values = new Map<string, string>(); let check = false;
+  const values = new Map<string, string>(); let check = false, workerPool = false, controllerPool = false;
   for (let i = 0; i < argv.length; i++) {
     const name = argv[i]!;
     if (name === "--check") { check = true; continue; }
+    if (name === "--worker-pool") {
+      if (workerPool) throw new Error("Duplicate worker pool option.");
+      workerPool = true; continue;
+    }
+    if (name === "--controller-pool") {
+      if (controllerPool) throw new Error("Duplicate controller pool option.");
+      controllerPool = true; continue;
+    }
     if (!["--profile", "--project", "--data-dir", "--port", "--runtime-path", "--state-root", "--worker-control", "--worker-mcp-prefix"].includes(name) || values.has(name) || !argv[i + 1] || argv[i + 1]!.startsWith("--")) throw new Error("Invalid subscription Desktop arguments.");
     values.set(name, argv[++i]!);
   }
+  if (controllerPool && !workerPool) throw new Error("The controller pool requires --worker-pool.");
   const profile = values.get("--profile");
   if (!SUBSCRIPTION_PROFILES.includes(profile as SubscriptionProfile)) throw new Error("Select one assigned Team profile.");
   const project = values.get("--project"), dataDir = values.get("--data-dir");
@@ -31,7 +40,11 @@ export function parseSubscriptionDesktop(argv: string[]) {
   if (!workerControlFile || !isAbsolute(workerControlFile) || !workerMcpPrefix || !/^(?:mcp__[A-Za-z0-9_]+__|[A-Za-z0-9_-]+___)$/.test(workerMcpPrefix)) {
     throw new Error("The read-only controller requires its absolute worker-control path and exact MCP namespace.");
   }
-  return { check, profile: profile as SubscriptionProfile, project: worktree, dataDir: resolve(dataDir), runtimePath: resolve(runtimePath), stateRoot: resolve(stateRoot), port, workerControlFile, workerMcpPrefix };
+  if (workerMcpPrefix !== (workerPool ? "factory-workers-pool___" : `factory-workers-${profile}___`)) {
+    throw new Error(workerPool ? "The pooled controller requires the exact supervised pool worker namespace."
+      : "The read-only controller must use its own fixed seat's worker namespace.");
+  }
+  return { check, workerPool, controllerPool, profile: profile as SubscriptionProfile, project: worktree, dataDir: resolve(dataDir), runtimePath: resolve(runtimePath), stateRoot: resolve(stateRoot), port, workerControlFile: resolve(workerControlFile), workerMcpPrefix };
 }
 
 function privateFile(path: string): string {
@@ -48,6 +61,12 @@ function readState(args: ReturnType<typeof parseSubscriptionDesktop>): Record<st
     if (readdirSync(args.dataDir).length === 0) return credentials;
     const marker = JSON.parse(privateFile(join(args.dataDir, "subscription-desktop.json")));
     if (marker.profile !== args.profile || marker.project !== args.project) throw new Error("This state belongs to another profile or project.");
+    if ((marker.workerPool ?? false) !== args.workerPool || (marker.controllerPool ?? false) !== args.controllerPool
+        || (marker.workerMcpPrefix !== undefined && marker.workerMcpPrefix !== args.workerMcpPrefix)
+        || (marker.workerControlFile !== undefined && marker.workerControlFile !== args.workerControlFile)
+        || (args.workerPool && (marker.workerMcpPrefix === undefined || marker.workerControlFile === undefined))) {
+      throw new Error("This state belongs to another worker connection or pool policy.");
+    }
     if ((marker.runtimePath !== undefined && marker.runtimePath !== args.runtimePath)
         || (marker.stateRoot !== undefined && marker.stateRoot !== args.stateRoot)) throw new Error("This state belongs to another shared runtime.");
     for (const name of ["client", "admin", "hook"]) {
@@ -61,17 +80,28 @@ function readState(args: ReturnType<typeof parseSubscriptionDesktop>): Record<st
 export async function runSubscriptionDesktop(argv = process.argv.slice(2)): Promise<void> {
   const args = parseSubscriptionDesktop(argv);
   const credentials = readState(args);
-  const prepared = await prepareSubscription(args.profile);
+  const preparedAccounts = args.controllerPool
+    ? await Promise.all(SUBSCRIPTION_PROFILES.map(profile => prepareSubscription(profile)))
+    : [await prepareSubscription(args.profile)];
+  const prepared = preparedAccounts.find(account => account.expectedIdentity.profile === args.profile);
+  if (!prepared) throw new Error("The configured initial subscription profile did not pass its native preflight.");
+  const subscriptionAccounts: readonly SubscriptionAccount[] | undefined = args.controllerPool
+    ? validateSubscriptionAccountPool(preparedAccounts.map((account, index) => ({ profile: account.expectedIdentity.profile,
+      expectedEmail: account.expectedIdentity.email, env: account.env, weight: index < 4 ? 5 : 1 })),
+    { profile: args.profile, expectedEmail: prepared.expectedIdentity.email, configDir: prepared.env.CLAUDE_CONFIG_DIR })
+    : undefined;
   if (args.check) {
-    console.log(JSON.stringify({ profile: args.profile, authentication: "subscription", apiCredentialsUsed: false, preflightVerified: true, desktopJobs: true, port: args.port, modelRequestsMade: false }));
+    console.log(JSON.stringify({ profile: args.profile, workerPool: args.workerPool, controllerPool: args.controllerPool,
+      ...(subscriptionAccounts ? { controllerProfiles: subscriptionAccounts.map(account => account.profile) } : {}),
+      authentication: "subscription", apiCredentialsUsed: false, preflightVerified: true, desktopJobs: true, port: args.port, modelRequestsMade: false }));
     return;
   }
-  // The complete launch environment uses one native subscription. No key/helper,
-  // router, cloud selector or pool variable is inherited by the child runtime.
+  // Ambient process environment starts on the configured initial subscription.
+  // Other preflighted native accounts are private immutable descriptors only.
   for (const name of Object.keys(process.env)) if (/^ANTHROPIC_|^CLAUDE_|^BRIDGE_|^AWS_|^GOOGLE_|^OPENROUTER_/.test(name)) delete process.env[name];
   Object.assign(process.env, prepared.env);
   const config = loadConfig({ mode: "sdk", authMode: "subscription", desktopProfile: true, desktopLifecycle: true, desktopJobs: true,
-    controllerReadOnly: true,
+    controllerReadOnly: true, workerPool: args.workerPool, controllerPool: args.controllerPool, subscriptionAccounts,
     desktopRuntimePath: args.runtimePath, desktopStateRoot: args.stateRoot,
     host: "127.0.0.1", port: args.port, dataDir: args.dataDir, sdkCwd: args.project, permissionMode: "ask", maxSessions: 16,
     clientToken: credentials.client ?? randomBytes(32).toString("hex"), adminToken: credentials.admin ?? randomBytes(32).toString("hex"), hookToken: credentials.hook ?? randomBytes(32).toString("hex"),
@@ -79,12 +109,14 @@ export async function runSubscriptionDesktop(argv = process.argv.slice(2)): Prom
     models: [{ id: "claude-opus-5-5", model: "claude-opus-5-5", displayName: `${args.profile} Opus 5.5 subscription` }] });
   mkdirSync(args.dataDir, { recursive: true, mode: 0o700 });
   if (!existsSync(join(args.dataDir, "subscription-desktop.json"))) {
-    writeFileSync(join(args.dataDir, "subscription-desktop.json"), JSON.stringify({ profile: args.profile, project: args.project, runtimePath: args.runtimePath, stateRoot: args.stateRoot }) + "\n", { mode: 0o600, flag: "wx" });
+    writeFileSync(join(args.dataDir, "subscription-desktop.json"), JSON.stringify({ profile: args.profile, project: args.project, runtimePath: args.runtimePath, stateRoot: args.stateRoot,
+      workerPool: args.workerPool, controllerPool: args.controllerPool, workerMcpPrefix: args.workerMcpPrefix, workerControlFile: args.workerControlFile }) + "\n", { mode: 0o600, flag: "wx" });
     for (const [name, value] of [["client", config.clientToken], ["admin", config.adminToken], ["hook", config.hookToken]]) writeFileSync(join(args.dataDir, name + "-token"), value + "\n", { mode: 0o600, flag: "wx" });
   }
   const logger = createLogger(config.logDir), app = createBridgeApp(config, logger, join(config.sandboxDir, "CANARY.txt"));
   installShutdownHandlers(app, logger); await listen(app, config);
-  console.log(JSON.stringify({ ready: true, profile: args.profile, url: app.url, authentication: "subscription", apiCredentialsUsed: false }));
+  console.log(JSON.stringify({ ready: true, profile: args.profile, workerPool: args.workerPool, controllerPool: args.controllerPool,
+    url: app.url, authentication: "subscription", apiCredentialsUsed: false }));
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {

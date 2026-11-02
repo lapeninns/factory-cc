@@ -41,6 +41,7 @@ export class SessionStore {
     model: string;
     provider?: ModelProvider;
     claudeAccount?: string;
+    nativeGeneration?: number;
     droidSessionId?: string;
     historyHash?: string;
     contextHash?: string;
@@ -58,6 +59,7 @@ export class SessionStore {
       model: input.model,
       ...(input.provider ? { provider: input.provider } : {}),
       ...(input.claudeAccount ? { claudeAccount: input.claudeAccount } : {}),
+      ...(input.nativeGeneration === undefined ? {} : { nativeGeneration: input.nativeGeneration }),
       historyHash: input.historyHash,
       contextHash: input.contextHash,
       ...(input.reasoning ? { reasoning: input.reasoning } : {}),

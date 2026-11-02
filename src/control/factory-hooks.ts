@@ -9,7 +9,7 @@ const MAX_HOOK_BYTES = 4 * 1024 * 1024;
 const CONFIG_FLAG = "--factory-cc-hook-config";
 const DESKTOP_FLAG = "--factory-cc-desktop-lifecycle";
 const DEFAULT_BINDING_ENV = "BRIDGE_FACTORY_BINDING";
-const BINDING_ENV_NAMES = new Set([DEFAULT_BINDING_ENV, ...Array.from({ length: 8 }, (_, index) => `BRIDGE_FACTORY_BINDING_TEAM${index + 1}`)]);
+const BINDING_ENV_NAMES = new Set([DEFAULT_BINDING_ENV, "BRIDGE_FACTORY_BINDING_POOL", ...Array.from({ length: 8 }, (_, index) => `BRIDGE_FACTORY_BINDING_TEAM${index + 1}`)]);
 
 type JsonObject = Record<string, unknown>;
 interface HookConfig { url: string; hookToken?: string; command?: string; desktopLifecycle?: boolean; bindingEnv?: string }

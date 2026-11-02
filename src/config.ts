@@ -2,7 +2,7 @@ import { assertClaudeCredential, readClaudeConfig, claudeConfigModels, loadClaud
 import { randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync } from "node:fs";
 import { isIPv6 } from "node:net";
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import type { BridgeMode } from "./types.js";
 import { parseAuthMode, preflightAuth, type AuthMode } from "./upstream/auth-env.js";
 import { selectionFromConfig } from "./upstream/providers.js";
@@ -10,6 +10,15 @@ import { canonicalWorkspacePath } from "./workspace.js";
 import { parseClaudePool, POOL_PROFILE, type PoolMember } from "./upstream/claude-pool.js";
 import { claudeProfileModels, modelsFromIds, parseModelIds, validateModels, type BridgeModel } from "./models.js";
 import { SUBSCRIPTION_PROFILES, type SubscriptionProfile } from "./runtime/desktop-jobs.js";
+import { sanitizedSubscriptionEnvironment } from "./workers/subscription-auth.js";
+
+/** Private, preflight-verified native account routing; never model or request input. */
+export interface SubscriptionAccount {
+  readonly profile: SubscriptionProfile;
+  readonly expectedEmail: string;
+  readonly env: Readonly<Record<string, string>>;
+  readonly weight: number;
+}
 
 export interface BridgeConfig {
   desktopProfile?: boolean;
@@ -30,6 +39,12 @@ export interface BridgeConfig {
   subscriptionProfile?: SubscriptionProfile;
   /** Trusted operator-only mode: primary checkout reads, isolated worker writes. */
   readonly controllerReadOnly?: boolean;
+  /** Explicit operator opt-in to the supervised aggregate worker connection. */
+  readonly workerPool?: boolean;
+  /** Explicit operator opt-in to native controller account selection. */
+  readonly controllerPool?: boolean;
+  /** Private native account descriptors, deeply frozen and non-enumerable. */
+  readonly subscriptionAccounts?: readonly SubscriptionAccount[];
   /** Explicit API-only native workflow mode; disabled unless opted in. */
   nativeWorkflows?: boolean;
   workflowProvider?: "anthropic" | "openrouter";
@@ -161,6 +176,36 @@ function tokenEnv(name: string): string | undefined {
   return value;
 }
 
+/** The launcher and configuration loader share this check, including --check mode. */
+export function validateSubscriptionAccountPool(value: unknown, current: { profile: SubscriptionProfile; expectedEmail: string; configDir?: string }): readonly SubscriptionAccount[] {
+  const fail = (): never => { throw new Error("The controller pool requires eight distinct, clean, preflight-verified native Team account descriptors matching its initial identity."); };
+  if (!Array.isArray(value) || value.length !== SUBSCRIPTION_PROFILES.length) return fail();
+  const profiles = new Set<string>(), emails = new Set<string>(), directories = new Set<string>();
+  const accounts: SubscriptionAccount[] = [];
+  for (const raw of value) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)
+        || Object.keys(raw).some(key => !["profile", "expectedEmail", "env", "weight"].includes(key))) return fail();
+    const account = raw as SubscriptionAccount;
+    if (!SUBSCRIPTION_PROFILES.includes(account.profile) || profiles.has(account.profile)
+        || typeof account.expectedEmail !== "string" || !/^[^\s@]+@[^\s@]+$/.test(account.expectedEmail)
+        || emails.has(account.expectedEmail.toLowerCase()) || !Number.isSafeInteger(account.weight) || account.weight < 1 || account.weight > 9999
+        || !account.env || typeof account.env !== "object" || Array.isArray(account.env)
+        || Object.values(account.env).some(item => typeof item !== "string" || item.includes("\0"))) return fail();
+    const configDir = account.env.CLAUDE_CONFIG_DIR;
+    if (typeof configDir !== "string" || !isAbsolute(configDir) || resolve(configDir) !== configDir || directories.has(configDir)) return fail();
+    const clean = sanitizedSubscriptionEnvironment(account.env, configDir);
+    if (Object.keys(account.env).length !== Object.keys(clean).length
+        || Object.entries(clean).some(([key, item]) => account.env[key] !== item)) return fail();
+    preflightAuth("subscription", clean);
+    profiles.add(account.profile); emails.add(account.expectedEmail.toLowerCase()); directories.add(configDir);
+    accounts.push(Object.freeze({ profile: account.profile, expectedEmail: account.expectedEmail, weight: account.weight, env: Object.freeze({ ...clean }) }));
+  }
+  const selected = accounts.find(account => account.profile === current.profile);
+  if (!selected || selected.expectedEmail.toLowerCase() !== current.expectedEmail.toLowerCase()
+      || !current.configDir || selected.env.CLAUDE_CONFIG_DIR !== current.configDir) return fail();
+  return Object.freeze(accounts);
+}
+
 export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig {
   const authMode = parseAuthMode(overrides.authMode ?? env("BRIDGE_AUTH", "byok"));
   const nativeRaw = env("BRIDGE_NATIVE_WORKFLOWS");
@@ -264,6 +309,24 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
     throw new Error("Controller read-only policy must be a boolean supplied by operator configuration.");
   }
   const controllerReadOnly = overrides.controllerReadOnly === true;
+  if (overrides.workerPool !== undefined && typeof overrides.workerPool !== "boolean") {
+    throw new Error("Worker pool policy must be a boolean supplied by operator configuration.");
+  }
+  const workerPool = overrides.workerPool === true;
+  if (overrides.controllerPool !== undefined && typeof overrides.controllerPool !== "boolean") {
+    throw new Error("Controller pool policy must be a boolean supplied by operator configuration.");
+  }
+  const controllerPool = overrides.controllerPool === true;
+  if (controllerPool && (!workerPool || !subscriptionDesktopJobs || !controllerReadOnly)) {
+    throw new Error("The controller pool requires the supervised worker pool and a read-only subscription Desktop controller.");
+  }
+  if (!controllerPool && overrides.subscriptionAccounts !== undefined) {
+    throw new Error("Private subscription account descriptors require explicit controller pool configuration.");
+  }
+  let subscriptionAccounts: readonly SubscriptionAccount[] | undefined;
+  if (workerPool && (!subscriptionDesktopJobs || !controllerReadOnly)) {
+    throw new Error("The supervised worker pool requires a read-only subscription Desktop controller.");
+  }
   if (controllerReadOnly && (!subscriptionDesktopJobs || !workerControlFile || !workerMcpPrefix)) {
     throw new Error("Read-only controllers require supervised fixed-seat subscription Desktop and its exact worker connection.");
   }
@@ -273,8 +336,9 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
         || typeof overrides.subscriptionExpectedEmail !== "string" || !/^[^\s@]+@[^\s@]+$/.test(overrides.subscriptionExpectedEmail)) {
       throw new Error("Subscription Desktop jobs require a private fixed Team profile and expected account identity.");
     }
-    if (controllerReadOnly && workerMcpPrefix !== `factory-workers-${overrides.subscriptionProfile}___`) {
-      throw new Error("The read-only controller must use its own fixed seat's worker namespace.");
+    if (controllerReadOnly && workerMcpPrefix !== (workerPool ? "factory-workers-pool___" : `factory-workers-${overrides.subscriptionProfile}___`)) {
+      throw new Error(workerPool ? "The pooled controller requires the exact supervised pool worker namespace."
+        : "The read-only controller must use its own fixed seat's worker namespace.");
     }
     if (claudeProfiles?.length || claudePool?.length || overrides.claudeExecutable || env("BRIDGE_CLAUDE_EXECUTABLE")
         || workflowRoute.baseUrl || workflowRoute.model || workflowRoute.tokenEnv || overrides.workflowProvider) {
@@ -285,6 +349,9 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
       throw new Error("Subscription Desktop jobs refuse API, router, helper and token environment credentials; values are not shown.");
     }
     preflightAuth("subscription", process.env);
+    if (controllerPool) subscriptionAccounts = validateSubscriptionAccountPool(overrides.subscriptionAccounts, {
+      profile: overrides.subscriptionProfile, expectedEmail: overrides.subscriptionExpectedEmail, configDir: process.env.CLAUDE_CONFIG_DIR,
+    });
   }
   if (desktopProfile && (permissionMode !== "ask" || !isLoopbackHost(host))) throw new Error("Desktop profile requires ask permissions and loopback binding.");
   const config: BridgeConfig = {
@@ -358,5 +425,8 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
   if (overrides.subscriptionExpectedEmail) Object.defineProperty(config, "subscriptionExpectedEmail", { value: overrides.subscriptionExpectedEmail });
   if (overrides.subscriptionProfile) Object.defineProperty(config, "subscriptionProfile", { value: overrides.subscriptionProfile });
   Object.defineProperty(config, "controllerReadOnly", { value: controllerReadOnly, enumerable: true });
+  Object.defineProperty(config, "workerPool", { value: workerPool, enumerable: true });
+  Object.defineProperty(config, "controllerPool", { value: controllerPool, enumerable: true });
+  if (subscriptionAccounts) Object.defineProperty(config, "subscriptionAccounts", { value: subscriptionAccounts });
   return config;
 }

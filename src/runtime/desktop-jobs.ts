@@ -8,7 +8,7 @@ import type { BridgeRuntime, RetiredSession, RuntimeControl, RuntimeHostEnd, Run
 export const SUBSCRIPTION_PROFILES = ["team1", "team2", "team3", "team4", "team5", "team6", "team7", "team8"] as const;
 export type SubscriptionProfile = typeof SUBSCRIPTION_PROFILES[number];
 export type DesktopWorkspacePolicy = "controller-readonly";
-export interface DesktopJobBinding { sessionId: string; cwd: string; launchId?: string; subscriptionProfile?: SubscriptionProfile; workspacePolicy?: DesktopWorkspacePolicy }
+export interface DesktopJobBinding { sessionId: string; cwd: string; launchId?: string; subscriptionProfile?: SubscriptionProfile; workspacePolicy?: DesktopWorkspacePolicy; nativeGeneration?: number }
 export type DesktopJobState = "waiting_host" | "idle" | "completed" | "failed" | "cancelled" | "unknown";
 export interface DesktopJobRelease {
   state: DesktopJobState;
@@ -59,6 +59,10 @@ export function validateDesktopJobBinding(binding: DesktopJobBinding | undefined
   }
   validateSubscriptionProfile(binding.subscriptionProfile);
   validateWorkspacePolicy(binding.workspacePolicy, binding.subscriptionProfile);
+  if (binding.nativeGeneration !== undefined && (!Number.isSafeInteger(binding.nativeGeneration) || binding.nativeGeneration < 0
+      || binding.nativeGeneration > 1_000_000 || binding.workspacePolicy !== "controller-readonly")) {
+    throw failure("desktop_job_generation", "Invalid native controller generation.");
+  }
   try {
     const cwd = realpathSync(binding.cwd);
     const directory = lstatSync(cwd);
@@ -135,13 +139,14 @@ export class DesktopJobsRuntime implements BridgeRuntime {
     catch (error) { return Promise.reject(error); }
     const id = input.session.bridgeSessionId;
     if (this.active.has(id)) return Promise.reject(new BridgeError(409, "desktop_job_busy", "This Factory model phase is already running."));
-    const request: DesktopJobAcquire = { factorySessionId: binding.sessionId, bridgeSessionId: id, cwd: binding.cwd, role: input.role,
+    const request: DesktopJobAcquire = { factorySessionId: binding.sessionId,
+      bridgeSessionId: binding.nativeGeneration === undefined ? id : `${id}:g${binding.nativeGeneration}`, cwd: binding.cwd, role: input.role,
       ...(binding.subscriptionProfile === undefined ? {} : { subscriptionProfile: binding.subscriptionProfile }),
       ...(binding.workspacePolicy === undefined ? {} : { workspacePolicy: binding.workspacePolicy }) };
     try { validateWorkspacePolicy(request.workspacePolicy, request.subscriptionProfile, request.role); }
     catch (error) { return Promise.reject(error); }
     const known = this.known.get(id);
-    if (known && (known.cwd !== request.cwd || known.factorySessionId !== request.factorySessionId
+    if (known && (known.bridgeSessionId !== request.bridgeSessionId || known.cwd !== request.cwd || known.factorySessionId !== request.factorySessionId
                   || known.subscriptionProfile !== request.subscriptionProfile || known.workspacePolicy !== request.workspacePolicy)) {
       return Promise.reject(new BridgeError(409, "desktop_job_identity", "This native session is already bound to another Factory session or worktree."));
     }
@@ -198,6 +203,17 @@ export class DesktopJobsRuntime implements BridgeRuntime {
     if (phase?.done) await phase.done.catch(() => undefined);
     await this.update(sessionId, { state: cleanupVerified ? "cancelled" : "unknown", cleanupVerified });
     if (!cleanupVerified) throw cleanupError;
+  }
+
+  async prepareColdRetry(sessionId: string): Promise<void> {
+    if (this.active.has(sessionId) || !this.inner.prepareColdRetry) {
+      throw failure("desktop_retry_unsafe", "The native generation cannot be safely retired for retry.");
+    }
+    // The native runtime owns the cold-import safety decision and process proof.
+    // Retain the old lease identity until its terminal record is acknowledged.
+    await this.inner.prepareColdRetry(sessionId);
+    await this.update(sessionId, { state: "failed", cleanupVerified: true });
+    this.known.delete(sessionId);
   }
 
   private async update(id: string, result: DesktopJobRelease): Promise<void> {

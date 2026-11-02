@@ -28,7 +28,8 @@ import { ControlBroker } from "../control/broker.js";
 import { controlPageHtml, controlPageHeaders } from "./control-page.js";
 import { configuredModels, providerFromModelId, resolveRequestModel, type BridgeModel, type ModelProvider } from "../models.js";
 import { ClaudePool, PERSONAL_ACCOUNT, POOL_PROFILE } from "../upstream/claude-pool.js";
-import { DesktopJobsRuntime } from "../runtime/desktop-jobs.js";
+import { DesktopJobsRuntime, type DesktopJobBinding } from "../runtime/desktop-jobs.js";
+import type { RuntimeRequest } from "../runtime/types.js";
 
 export interface BridgeApp {
   server: Server;
@@ -51,15 +52,31 @@ function listenUrl(host: string, port: number): string {
   return `http://${formatListenHost(host)}:${port}`;
 }
 
+/** Only persisted, privately selected controller identities reach the lease. */
+export function controllerJobBinding(config: BridgeConfig, input: RuntimeRequest): DesktopJobBinding | undefined {
+  if (!input.factorySession?.desktopLifecycle) return undefined;
+  let profile = config.subscriptionProfile;
+  if (config.controllerPool) {
+    const selected = config.subscriptionAccounts?.find(account => account.profile === input.session.claudeAccount);
+    if (!selected || !Number.isSafeInteger(input.session.nativeGeneration) || input.session.nativeGeneration! < 0
+        || input.session.nativeGeneration! > 1_000_000) {
+      throw new BridgeError(503, "subscription_pool_unassigned", "The native controller has no valid selected subscription generation.");
+    }
+    profile = selected.profile;
+  }
+  return {
+    sessionId: input.factorySession.sessionId, cwd: input.factorySession.cwd, launchId: input.factorySession.launchId,
+    ...(profile === undefined ? {} : { subscriptionProfile: profile }),
+    ...(config.controllerReadOnly ? { workspacePolicy: "controller-readonly" as const } : {}),
+    ...(config.controllerPool ? { nativeGeneration: input.session.nativeGeneration } : {}),
+  };
+}
+
 export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath: string, runtime: BridgeRuntime = createRuntime(config, logger, canaryPath)): BridgeApp {
   if (config.desktopJobs) runtime = new DesktopJobsRuntime(runtime, {
     pythonExecutable: "/usr/bin/python3", runtimePackagePath: config.desktopRuntimePath!,
     stateRoot: config.desktopStateRoot!, maxRunning: 2,
-    getBinding: (input) => input.factorySession?.desktopLifecycle ? {
-      sessionId: input.factorySession.sessionId, cwd: input.factorySession.cwd, launchId: input.factorySession.launchId,
-      ...(config.subscriptionProfile === undefined ? {} : { subscriptionProfile: config.subscriptionProfile }),
-      ...(config.controllerReadOnly ? { workspacePolicy: "controller-readonly" as const } : {}),
-    } : undefined,
+    getBinding: (input) => controllerJobBinding(config, input),
   });
   const store = new SessionStore(join(config.dataDir, "sessions"), config.persistSessions, config.maxSessions, logger, {
     ...DEFAULT_SESSION_RETENTION, maxRecords: config.sessionMaxRecords ?? 1000, maxAgeMs: config.sessionRetentionMs ?? DEFAULT_SESSION_RETENTION.maxAgeMs,
@@ -70,10 +87,21 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
   runtime.setControl?.(control);
   const records: RedactedRequestRecord[] = [];
   let authFailureCount = 0;
-  const claudePool = config.claudePool ? new ClaudePool(config.claudePool) : undefined;
+  const claudePool = config.controllerPool
+    ? new ClaudePool((config.subscriptionAccounts ?? []).map(account => ({ id: account.profile, weight: account.weight })))
+    : config.claudePool ? new ClaudePool(config.claudePool) : undefined;
   /** Pool entries always take a pool account. Other Claude entries keep their own account unless it is sitting out a limit. */
   const claudeAccountFor = (listed: BridgeModel | undefined): string | undefined => {
     if (!claudePool || listed?.provider === "cursor") return undefined;
+    if (config.controllerPool) {
+      const states = claudePool.status();
+      if (!states.length || states.every(account => claudePool.isCooling(account.id))) {
+        const earliest = Math.min(...states.map(account => Date.parse(account.coolingUntil ?? "")));
+        throw new BridgeError(429, "rate_limit_error", "All configured controller accounts are cooling; retry after the earliest recovery.",
+          { retry_after: Math.max(1, Math.ceil((earliest - Date.now()) / 1000)), usage_limit: true });
+      }
+      return claudePool.pick();
+    }
     const own = listed?.claudeProfile ?? PERSONAL_ACCOUNT;
     return own === POOL_PROFILE || claudePool.isCooling(own) ? claudePool.pick() : undefined;
   };
@@ -410,13 +438,17 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       // Droid desktop has no conversation ID header or hooks to disambiguate.
       continueIdenticalTranscripts: config.desktopProfile,
     });
-    const claudeAccount = resolved.match ? undefined : claudeAccountFor(listed);
+    const retryNeedsAccount = config.controllerPool && resolved.reason === "upstream-retry"
+      && resolved.match?.claudeAccount && claudePool?.isCooling(resolved.match.claudeAccount);
+    const claudeAccount = !resolved.match || retryNeedsAccount ? claudeAccountFor(listed) : undefined;
+    if (resolved.match && claudeAccount) store.update(resolved.match.bridgeSessionId, { claudeAccount });
     if (claudeAccount) logger.info("claude_account_assigned", { model: request.model, account: claudeAccount });
     const session = resolved.match
       ?? withSlot(() => store.create({
         role,
         model: request.model,
         ...(claudeAccount ? { claudeAccount } : {}),
+        ...(config.controllerPool ? { nativeGeneration: 0 } : {}),
         ...(provider === "cursor" ? { provider } : {}),
         droidSessionId: explicitSessionId(headers, request),
         historyHash: historyPrefixHash(request),
@@ -608,19 +640,40 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         logger.warn("claude_account_cooling", { sessionId, account: limitedAccount, seconds, usageLimit: (error as BridgeError).extra.usage_limit === true });
       }
       if (retryableUpstream) {
-        await runtime.cancel(sessionId, "upstream-backoff").catch(() => logger.error("runtime_cancel_failed", { sessionId, reason: "upstream-backoff" }));
-        if (!current.cancelRequested && current.hostEnded === undefined && activeRequests.get(sessionId) === owner
+        let retired = true;
+        try {
+          if (config.controllerPool) {
+            if (!runtime.prepareColdRetry) throw new Error("Verified native retry is unavailable");
+            await runtime.prepareColdRetry(sessionId);
+          } else await runtime.cancel(sessionId, "upstream-backoff");
+        } catch {
+          logger.error("runtime_cancel_failed", { sessionId, reason: "upstream-backoff" });
+          if (config.controllerPool) retired = false;
+        }
+        if (retired && !current.cancelRequested && current.hostEnded === undefined && activeRequests.get(sessionId) === owner
             && (current.state === "GENERATING" || current.state === "RESUMING")) {
           // The retry imports this conversation's history, so it can start on a different account.
-          const next = limitedAccount ? claudeAccountFor(listed) : undefined;
+          let next: string | undefined;
+          try { next = limitedAccount ? claudeAccountFor(listed) : undefined; }
+          catch (coolingError) { error = coolingError; }
           const nextAccount = next && !claudePool!.isCooling(next) ? next : undefined;
-          store.update(sessionId, { pendingToolIds: [], sdkSessionId: undefined, retryableRequestHash: requestFingerprint, ...(nextAccount ? { claudeAccount: nextAccount } : {}) });
-          store.setState(sessionId, "IDLE");
-          if (nextAccount) {
-            logger.info("claude_account_failover", { sessionId, from: limitedAccount, to: nextAccount });
-            // Another account is ready now: ask Droid to retry at once instead of waiting out this account's limit.
-            error = new BridgeError(429, "rate_limit_error", `Claude account ${limitedAccount} hit its limit; retry continues on ${nextAccount}.`, { retry_after: 1, retry_from_history: true });
+          const nextGeneration = (current.nativeGeneration ?? 0) + 1;
+          if (config.controllerPool && nextGeneration > 1_000_000) {
+            store.setState(sessionId, "FAILED");
+            error = new BridgeError(503, "native_generation_exhausted", "Start a new Workstream after its native generation limit.");
+          } else {
+            store.update(sessionId, { pendingToolIds: [], sdkSessionId: undefined, retryableRequestHash: requestFingerprint,
+              ...(config.controllerPool ? { nativeGeneration: nextGeneration } : {}), ...(nextAccount ? { claudeAccount: nextAccount } : {}) });
+            store.setState(sessionId, "IDLE");
+            if (nextAccount) {
+              logger.info("claude_account_failover", { sessionId, from: limitedAccount, to: nextAccount });
+              // Another account is ready now: ask Droid to retry at once instead of waiting out this account's limit.
+              error = new BridgeError(429, "rate_limit_error", `Claude account ${limitedAccount} hit its limit; retry continues on ${nextAccount}.`, { retry_after: 1, retry_from_history: true });
+            }
           }
+        } else if (!retired) {
+          store.setState(sessionId, "FAILED");
+          error = new BridgeError(503, "native_cleanup_incomplete", "The old native generation could not be verified stopped; account failover was refused.");
         }
       } else if (recoverableSwitch || rejectedInput) {
         if (!cancellationRequested && current && !current.cancelRequested && current.hostEnded === undefined
@@ -752,6 +805,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
 
   function runtimeStatus(): Record<string, unknown> {
     return { ...runtime.describe?.(), control: control.describe(), authFailureCount, activeRequests: activeRequests.size,
+      ...(config.controllerPool ? { controllerPool: { enabled: true, accounts: claudePool!.status() } } : {}),
       retainedSessions: store.list().length, workerEndTimers: workerEndTimers.size, compactionLinks: compactions.size,
       memory: { rss: process.memoryUsage().rss, heapUsed: process.memoryUsage().heapUsed }, closing };
   }

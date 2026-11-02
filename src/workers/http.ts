@@ -17,8 +17,9 @@ export async function serveWorkerMcp(controller: WorkerController, options: { po
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     response.once("close", () => { void transport.close(); void mcp.close(); });
     try {
-      let raw = "";
-      for await (const chunk of request) { raw += chunk; if (Buffer.byteLength(raw) > 1024 * 1024) throw new Error(); }
+      const chunks: Buffer[] = []; let size = 0;
+      for await (const chunk of request) { const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk); size += bytes.length; if (size > 1024 * 1024) throw new Error(); chunks.push(bytes); }
+      const raw = Buffer.concat(chunks).toString("utf8");
       await mcp.connect(transport);
       await transport.handleRequest(request, response, JSON.parse(raw));
     } catch {

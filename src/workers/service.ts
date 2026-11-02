@@ -16,6 +16,7 @@ import type { Usage } from "../types.js";
 import { privateDirectory, readWorkers, workerId, writeWorker, type WorkerRecord, type WorkerWorkflow } from "./worker-state.js";
 import { prepareSubscription, verifyNativeSubscription, type SubscriptionIdentity } from "./subscription-auth.js";
 import type { SubscriptionProfile } from "../runtime/desktop-jobs.js";
+import { upstreamError } from "../runtime/upstream-error.js";
 
 const exec = promisify(execFile);
 const TERMINAL = new Set(["completed", "failed", "cancelled", "unknown"]);
@@ -341,9 +342,10 @@ export class APIWorkerService {
       if (childFailed) record.reason = "child_task_failed";
       else if (childrenPending) record.reason = "child_completion_unproven";
       if (!live.sawResult && !live.cancelRequested && !deadline) record.reason = "native_result_missing";
-    } catch {
+    } catch (error) {
       record.state = live.cancelRequested ? "cancelled" : "failed";
-      record.reason = live.cancelRequested ? "cancelled" : deadline ? "deadline_exceeded" : "native_execution_failed";
+      record.backoff ??= workerBackoff(error);
+      record.reason = live.cancelRequested ? "cancelled" : deadline ? "deadline_exceeded" : record.backoff ? "native_" + record.backoff.kind : "native_execution_failed";
       record.error = "Worker execution did not complete successfully. Review its recorded state and approvals.";
     } finally {
       live.generation++;
@@ -476,6 +478,23 @@ export class APIWorkerService {
     const record = live.record;
     const childId = typeof value.parent_tool_use_id === "string" && value.parent_tool_use_id ? value.parent_tool_use_id : undefined;
     const isChild = childId !== undefined;
+    if (!isChild) {
+      if (value.type === "assistant" && value.error === "rate_limit") {
+        const message = object(value.message);
+        const text = (Array.isArray(message?.content) ? message.content : [])
+          .filter(part => object(part)?.type === "text").map(part => String(object(part)?.text ?? "")).join("\n");
+        const reset = /\|(\d{10})\b/.exec(text);
+        record.backoff = { kind: "usage_limit", retryAfterSeconds: reset ? Math.max(60, Math.min(86400, Number(reset[1]) - Math.floor(Date.now() / 1000))) : 3600 };
+      } else if (value.type === "assistant" && value.error === "overloaded") {
+        record.backoff = { kind: "overloaded", retryAfterSeconds: 60 };
+      } else if (value.type === "rate_limit_event" && object(value.rate_limit_info)?.status === "rejected") {
+        const reset = object(value.rate_limit_info)?.resetsAt;
+        record.backoff = { kind: "usage_limit", retryAfterSeconds: typeof reset === "number" && Number.isFinite(reset)
+          ? Math.max(60, Math.min(86400, Math.ceil(reset - Date.now() / 1000))) : 3600 };
+      } else if (value.type === "system" && value.subtype === "api_retry" && [429, 529].includes(Number(value.error_status))) {
+        record.backoff = workerBackoff({ status: value.error_status });
+      }
+    }
     if (!isChild && typeof value.session_id === "string" && value.session_id.length < 160) {
       if (!record.sdkSessionId) record.sdkSessionId = value.session_id;
       else if (record.sdkSessionId !== value.session_id) {
@@ -523,9 +542,20 @@ export class APIWorkerService {
       live.sawResult = true; live.resultSucceeded = value.subtype === "success" && value.is_error !== true;
       if (typeof value.result === "string") record.result = redactValue(value.result).slice(0, 100_000);
       if (!live.resultSucceeded) record.reason = typeof value.subtype === "string" ? value.subtype.slice(0, 120) : "native_error_result";
+      if (live.resultSucceeded) delete record.backoff;
+      else if (record.backoff) record.reason = "native_" + record.backoff.kind;
     }
     this.save(live);
   }
+}
+
+/** Only native error/status evidence is classified; successful model text is ignored. */
+export function workerBackoff(error: unknown): WorkerRecord["backoff"] {
+  const mapped = upstreamError(error);
+  if (!mapped) return undefined;
+  const usage = mapped.extra.usage_limit === true;
+  const seconds = typeof mapped.extra.retry_after === "number" && Number.isFinite(mapped.extra.retry_after) ? mapped.extra.retry_after : usage ? 3600 : 60;
+  return { kind: usage ? "usage_limit" : mapped.code === "rate_limit_error" ? "rate_limit" : "overloaded", retryAfterSeconds: Math.max(1, Math.min(86400, Math.ceil(seconds))) };
 }
 
 function now(): string { return new Date().toISOString(); }

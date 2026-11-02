@@ -27,6 +27,8 @@ export interface WorkerRecord {
   result?: string;
   error?: string;
   reason?: string;
+  /** Sanitized capacity evidence from the native SDK, never prompt prose. */
+  backoff?: { kind: "rate_limit" | "usage_limit" | "overloaded"; retryAfterSeconds: number };
   pendingApprovalCount: number;
   cleanupVerified: boolean | null;
   usage?: Record<string, unknown>;

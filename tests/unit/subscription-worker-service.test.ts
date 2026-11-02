@@ -159,4 +159,48 @@ describe("fixed-seat subscription workers", () => {
     expect(readdirSync(join(folder, "workspaces"))).toEqual([]);
     expect(mocked.query).not.toHaveBeenCalled();
   });
+
+  it("records native usage-limit evidence without retaining provider error text", async () => {
+    const reset = Math.floor(Date.now() / 1000) + 7200;
+    const runtime = service({ run: async context => {
+      context.message({ type: "assistant", error: "rate_limit", message: { content: [{ type: "text", text: `Private usage detail|${reset}` }] } });
+      context.message({ type: "result", subtype: "error_during_execution", is_error: true });
+    } });
+    const worker = await start(runtime);
+    await until(() => runtime.status(worker.id).state === "failed");
+    const result = runtime.status(worker.id);
+    expect(result.reason).toBe("native_usage_limit");
+    expect(result.backoff).toMatchObject({ kind: "usage_limit" });
+    expect(result.backoff!.retryAfterSeconds).toBeGreaterThan(7100);
+    expect(JSON.stringify(result)).not.toContain("Private usage detail");
+    expect(result.cleanupVerified).toBe(true);
+  });
+
+  it("classifies thrown upstream 429 errors but never successful prose about limits", async () => {
+    const limited = service({ run: async () => { throw Object.assign(new Error("Private provider detail"), { status: 429 }); } });
+    const first = await start(limited);
+    await until(() => limited.status(first.id).state === "failed");
+    expect(limited.status(first.id)).toMatchObject({ reason: "native_rate_limit", backoff: { kind: "rate_limit", retryAfterSeconds: 60 } });
+    expect(JSON.stringify(limited.status(first.id))).not.toContain("Private provider detail");
+    const good = service({ stateRoot: join(folder, "good-state"), workspaceRoot: join(folder, "good-workspaces"), run: async context => {
+      context.message({ type: "system", subtype: "api_retry", error_status: 429 });
+      context.message({ type: "result", subtype: "success", is_error: false, result: "Documentation mentions rate_limit_error, but this run succeeded." });
+    } });
+    const second = await start(good);
+    await until(() => good.status(second.id).state === "completed");
+    expect(good.status(second.id).backoff).toBeUndefined();
+  });
+
+  it.each(["rate_limit_event", "overloaded"])("records structured native %s capacity failures", async kind => {
+    const runtime = service({ run: async context => {
+      context.message(kind === "rate_limit_event"
+        ? { type: "rate_limit_event", rate_limit_info: { status: "rejected", resetsAt: Math.floor(Date.now() / 1000) + 500 } }
+        : { type: "assistant", error: "overloaded" });
+      context.message({ type: "result", subtype: "error_during_execution", is_error: true });
+    } });
+    const worker = await start(runtime);
+    await until(() => runtime.status(worker.id).state === "failed");
+    expect(runtime.status(worker.id).backoff?.kind).toBe(kind === "overloaded" ? "overloaded" : "usage_limit");
+    expect(runtime.status(worker.id).backoff!.retryAfterSeconds).toBeGreaterThanOrEqual(60);
+  });
 });

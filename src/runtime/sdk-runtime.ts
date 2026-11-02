@@ -11,7 +11,7 @@ import { resolveRequestCwd } from "../workspace.js";
 import { asBlocks, collectToolResults } from "../protocol/content.js";
 import { assistantMessage } from "../protocol/messages.js";
 import { ToolMailbox } from "../relay/mailbox.js";
-import type { BridgeConfig } from "../config.js";
+import type { BridgeConfig, SubscriptionAccount } from "../config.js";
 import type { ContentBlock, Json, Usage } from "../types.js";
 import { BridgeError } from "../types.js";
 import { appendLogLine, type Logger } from "../logging.js";
@@ -139,6 +139,8 @@ interface LiveSdk {
   query?: ReturnType<SdkHandle["query"]>;
   processOwner?: string;
   cleanup?: Promise<void>;
+  cleanupFailed?: boolean;
+  subscriptionAccount?: SubscriptionAccount;
   retiring?: Promise<void>;
   turnStartedAt?: number;
   nativeCallsThisRequest?: boolean;
@@ -285,6 +287,8 @@ export class SdkRuntime implements BridgeRuntime {
         sessions: [...this.lives.entries()].map(([sessionId, live]) => ({
           sessionId, sdkSessionId: live.sdkSessionId, modelId: live.modelRoute?.id,
           nativeModel: live.modelRoute?.model, active: live.active, ended: Boolean(live.terminal),
+          ...(live.subscriptionAccount ? { subscriptionProfile: live.subscriptionAccount.profile,
+            nativeGeneration: live.current?.session.nativeGeneration } : {}),
         })),
       } : {}),
     };
@@ -384,6 +388,7 @@ export class SdkRuntime implements BridgeRuntime {
     const id = input.session.bridgeSessionId;
     let live = this.lives.get(id);
     if (input.recovery === "cold-import") {
+      if (this.config.controllerPool && live) throw new BridgeError(409, "native_retry_unprepared", "Retire the prior native generation before account failover.");
       if (live && !live.terminal) throw new BridgeError(409, "session_busy", "The previous query has not stopped");
       live = this.createLive();
       this.lives.set(id, live);
@@ -408,6 +413,9 @@ export class SdkRuntime implements BridgeRuntime {
     if (!live) {
       live = this.createLive(input.session.sdkSessionId);
       this.lives.set(id, live);
+    }
+    if (this.config.controllerPool && live.policyKey && live.policyKey !== queryPolicy(input, this.config)) {
+      throw new BridgeError(409, "session_configuration_changed", "The controller account or native generation changed without verified retirement.");
     }
     if (live.terminal) throw live.terminal;
     if (live.hostEnding) throw new BridgeError(409, "host_session_ending", live.hostEnding);
@@ -555,7 +563,27 @@ export class SdkRuntime implements BridgeRuntime {
 
   async cancel(sessionId: string, reason: string): Promise<void> {
     const live = this.lives.get(sessionId);
-    if (live) await this.stop(live, new BridgeError(499, "cancelled", reason));
+    if (live) {
+      await this.stop(live, new BridgeError(499, "cancelled", reason));
+      if (live.cleanupFailed) throw new BridgeError(503, "native_cleanup_incomplete", "Native process cleanup could not be verified.");
+    }
+  }
+
+  async prepareColdRetry(sessionId: string): Promise<void> {
+    const live = this.lives.get(sessionId);
+    if (!live?.terminal) {
+      throw new BridgeError(409, "native_retry_unsafe", "This native generation is not safe to import as history.");
+    }
+    await live.cleanup;
+    if (live.cleanupFailed || live.query
+        || (live.processOwner && this.processes.has(live.processOwner))) {
+      throw new BridgeError(503, "native_cleanup_incomplete", "Native process cleanup could not be verified.");
+    }
+    if (live.terminal.extra.retry_from_history !== true) {
+      throw new BridgeError(409, "native_retry_unsafe", "This native generation is not safe to import as history.");
+    }
+    // No callbacks or process state cross the generation boundary.
+    this.lives.delete(sessionId);
   }
 
   async close(): Promise<void> {
@@ -915,8 +943,12 @@ export class SdkRuntime implements BridgeRuntime {
     live.catalog = catalog;
     await catalog.update(droidTools);
     if (live.terminal) throw live.terminal;
+    const subscriptionAccount = this.subscriptionAccountFor(input.session);
+    live.subscriptionAccount = subscriptionAccount;
     const claudeConfig = this.claudeConfigFor(route, input.session);
-    const env = this.config.authMode === "claude-config"
+    const env = subscriptionAccount
+      ? buildChildEnv("subscription", { ...subscriptionAccount.env })
+      : this.config.authMode === "claude-config"
       ? buildChildEnv("claude-config", process.env, undefined, { bridgeListen: `${this.config.host}:${this.config.port}`, claudeConfig })
       : sdkEnv(selection, `${this.config.host}:${this.config.port}`, this.config.authMode);
     // Project skills may run the local generator through native Bash. Bind its
@@ -1088,8 +1120,9 @@ export class SdkRuntime implements BridgeRuntime {
     }
     const observed = observationFrom(info);
     live.accountSnapshot = observed;
-    if (mode === "subscription" && this.config.subscriptionExpectedEmail) {
-      try { verifyNativeSubscription(info, { email: this.config.subscriptionExpectedEmail }); }
+    const expectedEmail = live.subscriptionAccount?.expectedEmail ?? this.config.subscriptionExpectedEmail;
+    if (mode === "subscription" && expectedEmail) {
+      try { verifyNativeSubscription(info, { email: expectedEmail }); }
       catch { this.rejectAuth(live, mode, "unknown", "The native subscription identity does not match this controller's assigned Team account. Refusing to send a prompt."); }
     }
     const email = maskEmail(stringField(info, "email"));
@@ -1128,6 +1161,7 @@ export class SdkRuntime implements BridgeRuntime {
 
   /** The session's assigned account wins (pool or limit failover); otherwise the entry's own account. */
   private claudeProfileFor(route: ModelRoute | undefined, session: { claudeAccount?: string } | undefined) {
+    if (this.config.controllerPool) return undefined;
     const account = session?.claudeAccount ?? route?.claudeProfile;
     if (account === POOL_PROFILE) throw new BridgeError(500, "pool_unassigned", "This pool session has no Claude account assigned.");
     if (!account || account === PERSONAL_ACCOUNT) return undefined;
@@ -1138,6 +1172,15 @@ export class SdkRuntime implements BridgeRuntime {
 
   private claudeConfigFor(route: ModelRoute | undefined, session: { claudeAccount?: string } | undefined) {
     return this.claudeProfileFor(route, session)?.config ?? this.config.claudeConfig;
+  }
+
+  private subscriptionAccountFor(session: { claudeAccount?: string; nativeGeneration?: number }): SubscriptionAccount | undefined {
+    if (!this.config.controllerPool) return undefined;
+    const account = this.config.subscriptionAccounts?.find(item => item.profile === session.claudeAccount);
+    if (!account || !Number.isSafeInteger(session.nativeGeneration) || session.nativeGeneration! < 0 || session.nativeGeneration! > 1_000_000) {
+      throw new BridgeError(500, "subscription_pool_unassigned", "The controller has no valid privately configured subscription generation.");
+    }
+    return account;
   }
 
   private rememberAuth(mode: BridgeConfig["authMode"], classification: AuthClassification, observed: AuthObservation, email?: string, startupMs?: number, claudeProfile?: string): void {
@@ -1480,6 +1523,15 @@ export class SdkRuntime implements BridgeRuntime {
       for await (const rawMessage of source) {
         let message = rawMessage;
         if (live.terminal || live.queryEpoch !== epoch) return;
+        if (message.type === "rate_limit_event") {
+          const info = message.rate_limit_info as { status?: unknown; resetsAt?: unknown } | undefined;
+          if (info?.status === "rejected") {
+            const reset = typeof info.resetsAt === "number" && Number.isFinite(info.resetsAt) ? info.resetsAt : undefined;
+            throw new BridgeError(429, "rate_limit_error", "The native subscription usage limit was reached.", {
+              usage_limit: true, ...(reset === undefined ? {} : { retry_after: Math.max(1, Math.ceil(reset - Date.now() / 1000)) }),
+            });
+          }
+        }
         if (message.type === "system" && message.subtype === "api_retry" && (message.error_status === 429 || message.error_status === 529)) {
           const retryAfter = typeof message.retry_delay_ms === "number" && Number.isFinite(message.retry_delay_ms) && message.retry_delay_ms >= 0
             ? Math.max(1, Math.ceil(message.retry_delay_ms / 1000)) : undefined;
@@ -1492,7 +1544,7 @@ export class SdkRuntime implements BridgeRuntime {
           }
         } else live.upstreamBackoff = undefined;
         if (message.type === "assistant" && message.error) {
-          const mapped = upstreamError(message.error === "rate_limit" ? "rate_limit_error" : extractText(message));
+          const mapped = upstreamError(message.error === "rate_limit" ? "rate_limit_error" : message.error === "overloaded" ? "overloaded_error" : extractText(message));
           if (mapped) throw message.error === "rate_limit" ? usageLimitError(mapped, extractText(message)) : mapped;
         }
         live.watchdog?.touch();
@@ -1752,6 +1804,7 @@ export class SdkRuntime implements BridgeRuntime {
     live.cleanup = this.retireQuery(live).catch(() => {
       // Ownership remains in the reaper and capacity stays occupied on failure.
       this.logger.error("sdk_cleanup_incomplete", { sdkSessionId: live.sdkSessionId });
+      live.cleanupFailed = true;
       live.terminal = new BridgeError(error.status, error.code, error.message, { ...error.extra, retry_from_history: false });
     });
     live.waiter?.reject(error);
@@ -1839,7 +1892,8 @@ function mcpContent(content: string | ContentBlock[]): Record<string, unknown>[]
 
 function queryPolicy(input: RuntimeRequest, config: BridgeConfig): string {
   return JSON.stringify({ ...(config.models === undefined ? { model: input.request.model } : {}), role: input.role, cwd: resolveCwd(input, config), permission: config.permissionMode,
-    controllerReadOnly: config.controllerReadOnly === true, ...(config.controllerReadOnly ? { workerMcpPrefix: config.workerMcpPrefix } : {}) });
+    controllerReadOnly: config.controllerReadOnly === true, ...(config.controllerReadOnly ? { workerMcpPrefix: config.workerMcpPrefix } : {}),
+    ...(config.controllerPool ? { subscriptionAccount: input.session.claudeAccount, nativeGeneration: input.session.nativeGeneration } : {}) });
 }
 function controllerHostToolAllowed(config: BridgeConfig, name: string): boolean {
   if (!config.controllerReadOnly) return true;

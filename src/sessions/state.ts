@@ -13,6 +13,8 @@ export interface SessionRecord {
   provider?: ModelProvider;
   /** Claude account running this session (`personal` or a profile id). Set by the pool or after a limit moved it; absent means the model entry's own account. */
   claudeAccount?: string;
+  /** Monotonic native lease generation for an explicitly enabled controller pool. */
+  nativeGeneration?: number;
   /** Persist replay safety independently of process-local callback state. */
   hostEnded?: "resumable" | "terminal" | "interrupted";
   role: RoleTag;
