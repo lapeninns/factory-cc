@@ -18,6 +18,14 @@ export async function startWorkerControl(controller: ApprovalController, path: s
     response.setHeader("Cache-Control", "no-store");
     const expected = Buffer.from(`Bearer ${token}`), actual = Buffer.from(request.headers.authorization ?? "");
     if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) { response.writeHead(401).end(); return; }
+    const pendingPath = request.url?.match(/^\/pending\/(worker-[a-f0-9-]{36})$/);
+    if (request.method === "GET" && pendingPath) {
+      try {
+        const current = controller.status(pendingPath[1]!) as { approvals?: unknown[] };
+        response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ id: pendingPath[1], approvals: current.approvals ?? [] }));
+      } catch { response.writeHead(404).end(); }
+      return;
+    }
     if (request.method !== "POST" || request.url !== "/decision") { response.writeHead(404).end(); return; }
     try {
       let raw = "";

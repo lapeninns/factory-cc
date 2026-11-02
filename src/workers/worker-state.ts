@@ -31,6 +31,8 @@ export interface WorkerRecord {
   usage?: Record<string, unknown>;
   billingEstimate?: Record<string, unknown>;
   checkEvidence: Array<{ toolUseId: string; status: "succeeded" | "failed"; commandSha256: string }>;
+  authentication?: "anthropic" | "openrouter" | "subscription";
+  subscriptionProfile?: "team1" | "team2" | "team3" | "team4";
 }
 
 export function privateDirectory(path: string): string {

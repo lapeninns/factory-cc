@@ -55,7 +55,11 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
   if (config.desktopJobs) runtime = new DesktopJobsRuntime(runtime, {
     pythonExecutable: "/usr/bin/python3", runtimePackagePath: config.desktopRuntimePath!,
     stateRoot: config.desktopStateRoot!, maxRunning: 2,
-    getBinding: (input) => input.factorySession?.desktopLifecycle ? input.factorySession : undefined,
+    getBinding: (input) => input.factorySession?.desktopLifecycle ? {
+      sessionId: input.factorySession.sessionId, cwd: input.factorySession.cwd, launchId: input.factorySession.launchId,
+      ...(config.subscriptionProfile === undefined ? {} : { subscriptionProfile: config.subscriptionProfile }),
+      ...(config.controllerReadOnly ? { workspacePolicy: "controller-readonly" as const } : {}),
+    } : undefined,
   });
   const store = new SessionStore(join(config.dataDir, "sessions"), config.persistSessions, config.maxSessions, logger, {
     ...DEFAULT_SESSION_RETENTION, maxRecords: config.sessionMaxRecords ?? 1000, maxAgeMs: config.sessionRetentionMs ?? DEFAULT_SESSION_RETENTION.maxAgeMs,

@@ -8,24 +8,27 @@ import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { APIWorkerService } from "../src/workers/service.js";
 import { startWorkerControl } from "../src/workers/control.js";
-import { acquireDesktopJobLease } from "../src/runtime/desktop-jobs.js";
+import { acquireDesktopJobLease, updateDesktopJobRecord } from "../src/runtime/desktop-jobs.js";
 import { startWorkerMcp } from "../src/workers/http.js";
+import { prepareSubscription } from "../src/workers/subscription-auth.js";
 
 export interface WorkerServerConfig {
   enabled: boolean;
-  provider: "anthropic" | "openrouter";
-  apiKeyFile: string;
+  provider: "anthropic" | "openrouter" | "subscription";
+  subscriptionProfile?: "team1" | "team2" | "team3" | "team4";
+  profileMappingPath?: string;
+  apiKeyFile?: string;
   stateRoot: string;
   workspaceRoot: string;
   allowedRepositories: string[];
   nativeRuntimePath: string;
   sharedStateRoot: string;
-  approvalCommand: string;
+  approvalCommand?: string;
   port: number;
   clientTokenFile: string;
-  /** Set only after the actual Factory command-approval flow has been verified. */
+  /** Set only after the actual Factory native AskUser approval flow has been verified. */
   approvalGuardVerified: boolean;
-  maxBudgetUsd: number;
+  maxBudgetUsd?: number;
   maxMs: number;
   maxTurns: number;
 }
@@ -39,26 +42,36 @@ function privateFile(path: string, limit = 64 * 1024): string {
 
 export function readWorkerServerConfig(path: string): WorkerServerConfig {
   const value = JSON.parse(privateFile(path)) as WorkerServerConfig;
-  if (!value || typeof value.enabled !== "boolean" || typeof value.approvalGuardVerified !== "boolean" || !["anthropic", "openrouter"].includes(value.provider)) throw new Error("Invalid worker service configuration.");
-  for (const key of ["apiKeyFile", "stateRoot", "workspaceRoot", "nativeRuntimePath", "sharedStateRoot", "approvalCommand", "clientTokenFile"] as const) if (typeof value[key] !== "string" || !isAbsolute(value[key])) throw new Error("Worker paths must be absolute.");
+  if (!value || typeof value.enabled !== "boolean" || typeof value.approvalGuardVerified !== "boolean" || !["anthropic", "openrouter", "subscription"].includes(value.provider)) throw new Error("Invalid worker service configuration.");
+  for (const key of ["stateRoot", "workspaceRoot", "nativeRuntimePath", "sharedStateRoot", "clientTokenFile"] as const) if (typeof value[key] !== "string" || !isAbsolute(value[key])) throw new Error("Worker paths must be absolute.");
+  if (value.approvalCommand !== undefined && !isAbsolute(value.approvalCommand)) throw new Error("An approval helper path must be absolute.");
+  if (value.provider === "subscription") {
+    if (!["team1", "team2", "team3", "team4"].includes(value.subscriptionProfile ?? "") || value.apiKeyFile !== undefined || value.maxBudgetUsd !== undefined || value.approvalCommand !== undefined) throw new Error("Subscription workers require one fixed Team profile and forbid API key/budget or shell-approval configuration.");
+    if (value.profileMappingPath !== undefined && !isAbsolute(value.profileMappingPath)) throw new Error("Profile mapping path must be absolute.");
+  } else if (typeof value.apiKeyFile !== "string" || !isAbsolute(value.apiKeyFile) || !Number.isFinite(value.maxBudgetUsd) || value.maxBudgetUsd! <= 0) throw new Error("API workers require an explicit key file and budget.");
   if (!Number.isInteger(value.port) || value.port < 1024 || value.port > 65535 || value.port === 18787) throw new Error("Use a dedicated local worker port.");
   if (!Array.isArray(value.allowedRepositories) || !value.allowedRepositories.length || value.allowedRepositories.some(path => typeof path !== "string" || !isAbsolute(path))) throw new Error("An explicit repository allowlist is required.");
-  if (!Number.isFinite(value.maxBudgetUsd) || value.maxBudgetUsd <= 0 || !Number.isInteger(value.maxMs) || value.maxMs < 1000 || value.maxMs > 7200000 || !Number.isInteger(value.maxTurns) || value.maxTurns < 1 || value.maxTurns > 500) throw new Error("Finite worker budget, deadline and turn bounds are required.");
+  if (!Number.isInteger(value.maxMs) || value.maxMs < 1000 || value.maxMs > 7200000 || !Number.isInteger(value.maxTurns) || value.maxTurns < 1 || value.maxTurns > 500) throw new Error("Finite worker deadline and turn bounds are required.");
   return value;
 }
 
-export async function runFactoryWorkers(argv = process.argv.slice(2)): Promise<void> {
+export async function runFactoryWorkers(argv = process.argv.slice(2), options: { subscriptionOnly?: boolean } = {}): Promise<void> {
   const check = argv.includes("--check");
   const serve = argv.includes("--serve");
   const filtered = argv.filter(value => value !== "--check" && value !== "--serve");
   if (filtered.length !== 2 || filtered[0] !== "--config") throw new Error("Use --config /absolute/private/config.json [--check].");
   const config = readWorkerServerConfig(filtered[1]!);
+  if (options.subscriptionOnly && config.provider !== "subscription") throw new Error("This entry point accepts subscription authentication only.");
   let key: string | undefined;
-  if (check || serve) {
-    try { key = privateFile(config.apiKeyFile, 16384).trim() || undefined; } catch { if (config.enabled) throw new Error("Configured API credential is unavailable or unsafe."); }
+  let subscriptionLoginVerified = false;
+  if (config.provider === "subscription" && (check || serve)) {
+    try { await prepareSubscription(config.subscriptionProfile!, { mappingPath: config.profileMappingPath }); subscriptionLoginVerified = true; }
+    catch { if (config.enabled) throw new Error("The fixed Team subscription login is not ready."); }
+  } else if (check || serve) {
+    try { key = privateFile(config.apiKeyFile!, 16384).trim() || undefined; } catch { if (config.enabled) throw new Error("Configured API credential is unavailable or unsafe."); }
   }
   if (check) {
-    console.log(JSON.stringify({ configured: true, enabled: config.enabled, provider: config.provider, credentialPresent: Boolean(key), approvalGuardVerified: config.approvalGuardVerified, repositoryCount: config.allowedRepositories.length, modelRequestsMade: false }));
+    console.log(JSON.stringify({ configured: true, enabled: config.enabled, provider: config.provider, subscriptionProfile: config.subscriptionProfile, subscriptionLoginVerified, apiCredentialUsed: Boolean(key), approvalGuardVerified: config.approvalGuardVerified, repositoryCount: config.allowedRepositories.length, modelRequestsMade: false }));
     return;
   }
   const clientToken = privateFile(config.clientTokenFile, 1024).trim();
@@ -82,15 +95,16 @@ export async function runFactoryWorkers(argv = process.argv.slice(2)): Promise<v
   const workflows = Object.fromEntries(["implement", "investigate", "release-prepare"].map(name => [name, readFileSync(join(runtime, "workflows", name + ".md"), "utf8")]));
   const leases = { pythonExecutable: "/usr/bin/python3", runtimePackagePath: runtime, stateRoot: config.sharedStateRoot, maxRunning: 2 };
   const makeService = () => new APIWorkerService({ stateRoot: config.stateRoot, workspaceRoot: config.workspaceRoot,
-    allowedRepositories: config.allowedRepositories, provider: { kind: config.provider }, maxConcurrent: 2,
+    allowedRepositories: config.allowedRepositories, provider: config.provider === "subscription" ? { kind: "subscription", profile: config.subscriptionProfile!, mappingPath: config.profileMappingPath } : { kind: config.provider }, maxConcurrent: 2,
     maxBudgetUsd: config.maxBudgetUsd, maxMs: config.maxMs, maxTurns: config.maxTurns, sourceEnv,
     policyText: policy, workflowText: workflows,
-    acquireLease: (worker, signal) => acquireDesktopJobLease(leases, { factorySessionId: worker.id, bridgeSessionId: worker.id, cwd: worker.worktree, role: "worker" }, signal),
+    acquireLease: (worker, signal) => acquireDesktopJobLease(leases, { factorySessionId: worker.id, bridgeSessionId: worker.id, cwd: worker.worktree, role: "worker", ...(config.subscriptionProfile ? { subscriptionProfile: config.subscriptionProfile } : {}) }, signal),
+    finalizeLease: (worker, result) => updateDesktopJobRecord(leases, { factorySessionId: worker.id, bridgeSessionId: worker.id, cwd: worker.worktree, role: "worker", ...(config.subscriptionProfile ? { subscriptionProfile: config.subscriptionProfile } : {}) }, result),
   });
   let service: APIWorkerService;
   const guarded = {
     start: (input: Parameters<APIWorkerService["start"]>[0]) => {
-      if (!config.enabled || !config.approvalGuardVerified || !key) throw new Error("Workers remain disabled until API and Factory approval verification complete.");
+      if (!config.enabled || !config.approvalGuardVerified || (config.provider === "subscription" ? !subscriptionLoginVerified : !key)) throw new Error("Workers remain disabled until authentication and Factory approval verification complete.");
       return service.start(input);
     },
     status: (id: string) => service.status(id), list: () => service.list(), cancel: (id: string) => service.cancel(id),

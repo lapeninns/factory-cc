@@ -5,7 +5,9 @@ import { BridgeError, type Usage } from "../types.js";
 import type { BridgeRuntime, RetiredSession, RuntimeControl, RuntimeHostEnd, RuntimeRequest, RuntimeTurn, StreamSink } from "./types.js";
 
 /** Values supplied by the authenticated host controller, never request metadata. */
-export interface DesktopJobBinding { sessionId: string; cwd: string; launchId?: string }
+export type SubscriptionProfile = "team1" | "team2" | "team3" | "team4";
+export type DesktopWorkspacePolicy = "controller-readonly";
+export interface DesktopJobBinding { sessionId: string; cwd: string; launchId?: string; subscriptionProfile?: SubscriptionProfile; workspacePolicy?: DesktopWorkspacePolicy }
 export type DesktopJobState = "waiting_host" | "idle" | "completed" | "failed" | "cancelled" | "unknown";
 export interface DesktopJobRelease {
   state: DesktopJobState;
@@ -19,6 +21,10 @@ export interface DesktopJobAcquire {
   bridgeSessionId: string;
   cwd: string;
   role: RuntimeRequest["role"];
+  /** Fixed by private operator configuration, never selected by a worker task. */
+  subscriptionProfile?: SubscriptionProfile;
+  /** Supplied only by the immutable read-only controller configuration. */
+  workspacePolicy?: DesktopWorkspacePolicy;
 }
 export interface DesktopJobLease { jobId: string; release(result: DesktopJobRelease): Promise<void> }
 export interface DesktopLeaseOptions {
@@ -50,11 +56,15 @@ export function validateDesktopJobBinding(binding: DesktopJobBinding | undefined
   if (!binding || !binding.sessionId || binding.sessionId.length > 256 || !isAbsolute(binding.cwd)) {
     throw failure("desktop_job_binding", "This model requires an authenticated Factory session and its assigned worktree.");
   }
+  validateSubscriptionProfile(binding.subscriptionProfile);
+  validateWorkspacePolicy(binding.workspacePolicy, binding.subscriptionProfile);
   try {
     const cwd = realpathSync(binding.cwd);
     const directory = lstatSync(cwd);
     const git = lstatSync(join(cwd, ".git"));
-    if (!directory.isDirectory() || directory.uid !== process.getuid?.() || !git.isFile() || git.isSymbolicLink()) throw new Error();
+    const markerAllowed = git.isFile() || (binding.workspacePolicy === "controller-readonly" && git.isDirectory());
+    if (!directory.isDirectory() || directory.uid !== process.getuid?.() || !markerAllowed || git.isSymbolicLink()
+        || git.uid !== process.getuid?.()) throw new Error();
     return { ...binding, cwd };
   } catch {
     throw failure("desktop_job_workspace", "Open this Factory session in a dedicated Git worktree before using the supervised model.");
@@ -124,9 +134,14 @@ export class DesktopJobsRuntime implements BridgeRuntime {
     catch (error) { return Promise.reject(error); }
     const id = input.session.bridgeSessionId;
     if (this.active.has(id)) return Promise.reject(new BridgeError(409, "desktop_job_busy", "This Factory model phase is already running."));
-    const request = { factorySessionId: binding.sessionId, bridgeSessionId: id, cwd: binding.cwd, role: input.role };
+    const request: DesktopJobAcquire = { factorySessionId: binding.sessionId, bridgeSessionId: id, cwd: binding.cwd, role: input.role,
+      ...(binding.subscriptionProfile === undefined ? {} : { subscriptionProfile: binding.subscriptionProfile }),
+      ...(binding.workspacePolicy === undefined ? {} : { workspacePolicy: binding.workspacePolicy }) };
+    try { validateWorkspacePolicy(request.workspacePolicy, request.subscriptionProfile, request.role); }
+    catch (error) { return Promise.reject(error); }
     const known = this.known.get(id);
-    if (known && (known.cwd !== request.cwd || known.factorySessionId !== request.factorySessionId)) {
+    if (known && (known.cwd !== request.cwd || known.factorySessionId !== request.factorySessionId
+                  || known.subscriptionProfile !== request.subscriptionProfile || known.workspacePolicy !== request.workspacePolicy)) {
       return Promise.reject(new BridgeError(409, "desktop_job_identity", "This native session is already bound to another Factory session or worktree."));
     }
     this.known.set(id, request);
@@ -317,12 +332,34 @@ function safeRelease(result: DesktopJobRelease): WireMessage {
 }
 
 export async function acquireDesktopJobLease(options: DesktopLeaseOptions, request: DesktopJobAcquire, signal: AbortSignal): Promise<DesktopJobLease> {
-  const channel = new LeaseChannel(options, { op: "acquire", ...request }, signal);
+  const channel = new LeaseChannel(options, { op: "acquire", ...safeAcquire(request) }, signal);
   const jobId = await channel.ready;
   return { jobId, release: (result) => channel.release(result, options.releaseTimeoutMs ?? 5_000) };
 }
 
 export async function updateDesktopJobRecord(options: DesktopLeaseOptions, request: DesktopJobAcquire, result: DesktopJobRelease): Promise<void> {
-  const channel = new LeaseChannel({ ...options, admissionTimeoutMs: options.releaseTimeoutMs ?? 5_000 }, { op: "update", ...request, ...safeRelease(result) });
+  const channel = new LeaseChannel({ ...options, admissionTimeoutMs: options.releaseTimeoutMs ?? 5_000 }, { op: "update", ...safeAcquire(request), ...safeRelease(result) });
   await channel.exited;
+}
+
+function validateSubscriptionProfile(profile: unknown): void {
+  if (profile !== undefined && (typeof profile !== "string" || !["team1", "team2", "team3", "team4"].includes(profile))) {
+    throw new BridgeError(400, "desktop_job_profile", "Only fixed team1 through team4 subscription profiles are supported.");
+  }
+}
+
+function validateWorkspacePolicy(policy: unknown, profile: unknown, role?: unknown): void {
+  if (policy !== undefined && (policy !== "controller-readonly" || !["team1", "team2", "team3", "team4"].includes(String(profile))
+      || role === "worker" || role === "validator")) {
+    throw new BridgeError(400, "desktop_workspace_policy", "Primary checkout access requires the fixed-seat read-only controller policy.");
+  }
+}
+
+function safeAcquire(request: DesktopJobAcquire): WireMessage {
+  validateSubscriptionProfile(request.subscriptionProfile);
+  validateWorkspacePolicy(request.workspacePolicy, request.subscriptionProfile, request.role);
+  return { factorySessionId: request.factorySessionId, bridgeSessionId: request.bridgeSessionId,
+    cwd: request.cwd, role: request.role,
+    ...(request.subscriptionProfile === undefined ? {} : { subscriptionProfile: request.subscriptionProfile }),
+    ...(request.workspacePolicy === undefined ? {} : { workspacePolicy: request.workspacePolicy }) };
 }

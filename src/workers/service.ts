@@ -14,6 +14,7 @@ import { redactJson, redactValue } from "../security/redact.js";
 import type { Logger } from "../logging.js";
 import type { Usage } from "../types.js";
 import { privateDirectory, readWorkers, workerId, writeWorker, type WorkerRecord, type WorkerWorkflow } from "./worker-state.js";
+import { prepareSubscription, verifyNativeSubscription, type SubscriptionIdentity } from "./subscription-auth.js";
 
 const exec = promisify(execFile);
 const TERMINAL = new Set(["completed", "failed", "cancelled", "unknown"]);
@@ -28,8 +29,14 @@ export interface WorkerApproval {
   requestedAt: string;
 }
 export interface WorkerView extends WorkerRecord { approvals: WorkerApproval[] }
+export interface WorkerLeaseResult {
+  state: "completed" | "failed" | "cancelled" | "unknown" | "waiting_host";
+  cleanupVerified: boolean;
+  usage?: Usage;
+  sdkSessionId?: string;
+}
 export interface WorkerLease {
-  release(value: { state: "completed" | "failed" | "cancelled" | "unknown"; cleanupVerified: boolean; usage?: Usage; sdkSessionId?: string }): Promise<void>;
+  release(value: WorkerLeaseResult): Promise<void>;
 }
 export interface WorkerRunContext {
   worker: Readonly<WorkerRecord>;
@@ -41,9 +48,9 @@ export interface APIWorkerServiceOptions {
   stateRoot: string;
   workspaceRoot: string;
   allowedRepositories: string[];
-  provider: { kind: "anthropic" | "openrouter" };
+  provider: { kind: "anthropic" | "openrouter" } | { kind: "subscription"; profile: "team1" | "team2" | "team3" | "team4"; mappingPath?: string; executable?: string };
   maxConcurrent?: number;
-  maxBudgetUsd: number;
+  maxBudgetUsd?: number;
   maxMs: number;
   maxTurns?: number;
   sourceEnv?: NodeJS.ProcessEnv;
@@ -54,8 +61,18 @@ export interface APIWorkerServiceOptions {
   verifyRuntime?: () => NativeWorkflowSupport;
   cleanup?: (id: string) => Promise<void>;
   acquireLease?: (worker: Readonly<WorkerRecord>, signal: AbortSignal) => Promise<WorkerLease>;
+  /** Finish a parked shared record after native cleanup, without reacquiring inference capacity. */
+  finalizeLease?: (worker: Readonly<WorkerRecord>, result: WorkerLeaseResult) => Promise<void>;
 }
 interface PendingApproval { view: WorkerApproval; settle(decision: "allow" | "deny"): void }
+interface SubscriptionApprovalBatch {
+  generation: number;
+  controller: AbortController;
+  parked: Promise<void>;
+  resuming?: Promise<void>;
+  requests: Map<string, { decision?: "allow" | "deny"; finish(allowed: boolean): void }>;
+  detach(): void;
+}
 interface LiveWorker {
   record: WorkerRecord;
   task?: string;
@@ -71,6 +88,7 @@ interface LiveWorker {
   generation: number;
   children: Map<string, { id: string; state: "running" | "completed" | "failed" | "cancelled" }>;
   lease?: WorkerLease;
+  approvalBatch?: SubscriptionApprovalBatch;
 }
 const silentLogger = { info() {}, warn() {}, error() {} } as unknown as Logger;
 
@@ -89,10 +107,11 @@ export class APIWorkerService {
   constructor(private readonly options: APIWorkerServiceOptions) {
     this.capacity = options.maxConcurrent ?? 2;
     if (!Number.isSafeInteger(this.capacity) || this.capacity < 1 || this.capacity > 2) throw new Error("Worker concurrency must be one or two.");
-    if (!Number.isFinite(options.maxBudgetUsd) || options.maxBudgetUsd <= 0) throw new Error("An explicit positive estimated budget is required.");
+    if (options.provider.kind !== "subscription" && (!Number.isFinite(options.maxBudgetUsd) || options.maxBudgetUsd! <= 0)) throw new Error("An explicit positive estimated budget is required.");
+    if (options.provider.kind === "subscription" && options.maxBudgetUsd !== undefined) throw new Error("Subscription workers do not use an API spend budget.");
     if (!Number.isSafeInteger(options.maxMs) || options.maxMs < 1000 || options.maxMs > 2 * 60 * 60_000) throw new Error("Worker deadline must be from one second to two hours.");
     if (!Number.isSafeInteger(options.maxTurns ?? 32) || (options.maxTurns ?? 32) < 1 || (options.maxTurns ?? 32) > 500) throw new Error("Worker turn limit must be an integer from 1 to 500.");
-    if (!["anthropic", "openrouter"].includes(options.provider.kind)) throw new Error("An explicit API provider is required.");
+    if (!["anthropic", "openrouter", "subscription"].includes(options.provider.kind)) throw new Error("An explicit authentication route is required.");
     if (!options.allowedRepositories.length) throw new Error("An explicit repository allowlist is required.");
     this.root = privateDirectory(options.stateRoot);
     this.workspaces = privateDirectory(options.workspaceRoot);
@@ -125,8 +144,7 @@ export class APIWorkerService {
     if (!["implement", "investigate", "release-prepare"].includes(input.workflow)) throw new Error("Unknown worker workflow.");
     const repository = canonicalRepository(input.repository);
     if (!this.repositories.has(repository)) throw new Error("Repository is not in the worker allowlist.");
-    this.environment();
-    (this.options.verifyRuntime ?? assertNativeWorkflowSupport)();
+    await this.prepareRuntime();
     const sourceRoot = await git(repository, ["rev-parse", "--show-toplevel"]);
     if (realpathSync(sourceRoot) !== repository) throw new Error("Use the allowlisted repository root.");
     const sourceCommit = await git(repository, ["rev-parse", "--verify", "HEAD^{commit}"]);
@@ -138,7 +156,8 @@ export class APIWorkerService {
     const timestamp = now();
     const record: WorkerRecord = { version: 1, id, state: "queued", repository, worktree: realpathSync(worktree), branch,
       sourceCommit, sourceDirty, workflow: input.workflow, requested: { model: "claude-opus-5-5", effort: "medium", ultracode: true },
-      createdAt: timestamp, updatedAt: timestamp, observedModels: [], pendingApprovalCount: 0, cleanupVerified: null, checkEvidence: [] };
+      createdAt: timestamp, updatedAt: timestamp, observedModels: [], pendingApprovalCount: 0, cleanupVerified: null, checkEvidence: [],
+      authentication: this.options.provider.kind, ...(this.options.provider.kind === "subscription" ? { subscriptionProfile: this.options.provider.profile } : {}) };
     const live = this.live(record, input.task);
     this.workers.set(id, live);
     this.save(live);
@@ -208,6 +227,7 @@ export class APIWorkerService {
   }
 
   private environment(): Record<string, string> {
+    if (this.options.provider.kind === "subscription") throw new Error("Subscription authentication requires the native login preflight.");
     const source = this.options.sourceEnv ?? process.env;
     const routedModel = "anthropic/claude-opus-5.5";
     const selection: UpstreamSelection = { provider: { id: "openrouter", label: "Explicit Factory worker API", baseUrl: "https://openrouter.ai/api", model: routedModel, tokenEnv: "BRIDGE_OPENROUTER_API_KEY", authHeader: "authorization" },
@@ -220,6 +240,15 @@ export class APIWorkerService {
     return env;
   }
 
+  private async prepareRuntime(): Promise<{ env: Record<string, string>; support: NativeWorkflowSupport; identity?: SubscriptionIdentity }> {
+    if (this.options.provider.kind === "subscription") {
+      const selected = this.options.provider;
+      const prepared = await prepareSubscription(selected.profile, { mappingPath: selected.mappingPath, executable: selected.executable, sourceEnv: this.options.sourceEnv });
+      return { env: prepared.env, support: (this.options.verifyRuntime ?? assertNativeWorkflowSupport)(), identity: prepared.expectedIdentity };
+    }
+    return { env: this.environment(), support: (this.options.verifyRuntime ?? assertNativeWorkflowSupport)() };
+  }
+
   private async execute(live: LiveWorker): Promise<void> {
     const { record } = live;
     const generation = ++live.generation;
@@ -230,9 +259,8 @@ export class APIWorkerService {
       record.state = "starting"; record.startedAt = now(); this.save(live);
       live.lease = await this.options.acquireLease?.(record, live.controller.signal);
       if (live.controller.signal.aborted) throw new Error("Worker stopped before execution.");
-      const support = (this.options.verifyRuntime ?? assertNativeWorkflowSupport)();
-      const env = this.environment();
-      env.CLAUDE_CONFIG_DIR = privateDirectory(join(this.root, "native-config", record.id));
+      const { support, env, identity } = await this.prepareRuntime();
+      if (this.options.provider.kind !== "subscription") env.CLAUDE_CONFIG_DIR = privateDirectory(join(this.root, "native-config", record.id));
       const permission: CanUseTool = (tool, input, options) => this.requestPermission(live, tool, input, options.signal, options.toolUseID);
       const options: Options = {
         cwd: record.worktree, env, abortController: live.controller, model: "claude-opus-5-5", effort: "medium",
@@ -241,7 +269,7 @@ export class APIWorkerService {
         settings: { ultracode: true, enableWorkflows: true, workflowSizeGuideline: "small" },
         disallowedTools: BLOCKED_TOOLS,
         systemPrompt: { type: "preset", preset: "claude_code", append: this.policy(record) },
-        maxBudgetUsd: this.options.maxBudgetUsd, maxTurns: this.options.maxTurns ?? 32,
+        ...(this.options.provider.kind !== "subscription" ? { maxBudgetUsd: this.options.maxBudgetUsd } : {}), maxTurns: this.options.maxTurns ?? 32,
         sandbox: { enabled: true, failIfUnavailable: true, autoAllowBashIfSandboxed: false, allowUnsandboxedCommands: false, filesystem: { allowWrite: [record.worktree] } },
         hooks: { PreToolUse: [{ hooks: [async (event, toolUseId, context) => {
           if (event.hook_event_name !== "PreToolUse") return {};
@@ -280,6 +308,21 @@ export class APIWorkerService {
       const context: WorkerRunContext = { worker: structuredClone(record), prompt: live.task!, options, message: (value) => this.message(live, value) };
       const run = async (): Promise<void> => {
         if (this.options.run) await this.options.run(context);
+        else if (identity) {
+          // The native process authenticates before any user prompt is released.
+          let permit!: (allowed: boolean) => void;
+          const admitted = new Promise<boolean>(resolve => { permit = resolve; });
+          const prompt = (async function* () {
+            if (await admitted) yield { type: "user" as const, message: { role: "user" as const, content: context.prompt }, parent_tool_use_id: null, session_id: "" };
+          })();
+          const session = query({ prompt, options });
+          try {
+            verifyNativeSubscription(await session.accountInfo(), identity);
+            if (live.controller.signal.aborted || this.workers.get(record.id) !== live || live.generation !== generation || TERMINAL.has(record.state)) throw new Error("Worker execution ended before subscription admission.");
+            permit(true);
+            for await (const value of session) context.message(value as unknown as Record<string, unknown>);
+          } finally { permit(false); session.close(); }
+        }
         else {
           const session = query({ prompt: context.prompt, options });
           try { for await (const value of session) context.message(value as unknown as Record<string, unknown>); }
@@ -305,7 +348,10 @@ export class APIWorkerService {
       live.generation++;
       clearTimeout(timer);
       live.task = undefined;
+      const approvalBatch = live.approvalBatch;
+      approvalBatch?.controller.abort();
       this.denyApprovals(live);
+      if (approvalBatch) await Promise.allSettled([approvalBatch.parked, approvalBatch.resuming]);
       try {
         if (this.options.cleanup) await this.options.cleanup(record.id);
         else await this.processes.stop(record.id);
@@ -314,7 +360,13 @@ export class APIWorkerService {
         record.cleanupVerified = false; record.state = "unknown"; record.reason = "owned_process_cleanup_unproven";
       }
       record.endedAt = now();
-      try { await live.lease?.release({ state: record.state === "completed" ? "completed" : record.state === "cancelled" ? "cancelled" : record.state === "unknown" ? "unknown" : "failed", cleanupVerified: record.cleanupVerified === true, usage: live.providerEvidence ? { ...live.usage.providerTotals(), estimated: false } : undefined, sdkSessionId: record.sdkSessionId }); }
+      const lease = live.lease;
+      live.lease = undefined;
+      const leaseResult: WorkerLeaseResult = { state: record.state === "completed" ? "completed" : record.state === "cancelled" ? "cancelled" : record.state === "unknown" ? "unknown" : "failed", cleanupVerified: record.cleanupVerified === true, usage: live.providerEvidence ? { ...live.usage.providerTotals(), estimated: false } : undefined, sdkSessionId: record.sdkSessionId };
+      try {
+        if (lease) await lease.release(leaseResult);
+        else await this.options.finalizeLease?.(record, leaseResult);
+      }
       catch { record.state = "unknown"; record.cleanupVerified = false; record.reason = "shared_lease_release_unproven"; }
       this.save(live);
     }
@@ -325,6 +377,7 @@ export class APIWorkerService {
   }
   private requestPermission(live: LiveWorker, tool: string, input: Record<string, unknown>, signal: AbortSignal, toolUseId?: string): ReturnType<CanUseTool> {
     if (live.controller.signal.aborted || signal.aborted || TERMINAL.has(live.record.state)) return Promise.resolve({ behavior: "deny", message: "The worker is no longer accepting actions." });
+    if (this.options.provider.kind === "subscription" && this.options.acquireLease) return this.subscriptionPermission(live, tool, input, signal, toolUseId);
     const id = randomUUID(), snapshot = structuredClone(input);
     const view: WorkerApproval = { id, toolName: tool.slice(0, 160), input: redactJson(snapshot), requestedAt: now(), ...(toolUseId ? { toolUseId } : {}) };
     return new Promise((resolvePermission) => {
@@ -343,6 +396,77 @@ export class APIWorkerService {
       live.record.pendingApprovalCount = live.approvals.size; live.record.state = "waiting_approval"; this.save(live);
       signal.addEventListener("abort", abort, { once: true }); live.controller.signal.addEventListener("abort", abort, { once: true });
       if (signal.aborted || live.controller.signal.aborted) abort();
+    });
+  }
+  private subscriptionPermission(live: LiveWorker, tool: string, input: Record<string, unknown>, signal: AbortSignal, toolUseId?: string): ReturnType<CanUseTool> {
+    let batch = live.approvalBatch;
+    if (!batch) {
+      const controller = new AbortController(), abort = () => controller.abort();
+      live.controller.signal.addEventListener("abort", abort, { once: true });
+      const lease = live.lease;
+      live.lease = undefined;
+      batch = { generation: live.generation, controller, requests: new Map(),
+        parked: Promise.resolve().then(() => lease?.release({ state: "waiting_host", cleanupVerified: false, sdkSessionId: live.record.sdkSessionId })),
+        detach: () => live.controller.signal.removeEventListener("abort", abort) };
+      live.approvalBatch = batch;
+      // A failed handoff cannot authorize more work. Final cleanup resolves the shared record.
+      void batch.parked.catch(() => live.controller.abort());
+    }
+    const current = batch, id = randomUUID(), snapshot = structuredClone(input);
+    const view: WorkerApproval = { id, toolName: tool.slice(0, 160), input: redactJson(snapshot), requestedAt: now(), ...(toolUseId ? { toolUseId } : {}) };
+    return new Promise(resolvePermission => {
+      const abort = () => settle("deny");
+      const pending = { decision: undefined as "allow" | "deny" | undefined, finish: (allowed: boolean) => {
+        signal.removeEventListener("abort", abort);
+        live.controller.signal.removeEventListener("abort", abort);
+        resolvePermission(allowed && !signal.aborted ? { behavior: "allow", updatedInput: snapshot }
+          : { behavior: "deny", message: "Denied by the Factory controller or worker cancellation." });
+      } };
+      const settle = (decision: "allow" | "deny") => {
+        if (pending.decision !== undefined) return;
+        pending.decision = decision;
+        live.approvals.delete(id);
+        live.record.pendingApprovalCount = live.approvals.size;
+        if (!TERMINAL.has(live.record.state)) live.record.state = live.approvals.size ? "waiting_approval" : "starting";
+        this.save(live);
+        this.resumeApprovedBatch(live, current);
+      };
+      current.requests.set(id, pending);
+      live.approvals.set(id, { view, settle });
+      live.record.pendingApprovalCount = live.approvals.size;
+      live.record.state = "waiting_approval"; this.save(live);
+      signal.addEventListener("abort", abort, { once: true });
+      live.controller.signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted || live.controller.signal.aborted) abort();
+    });
+  }
+  private resumeApprovedBatch(live: LiveWorker, batch: SubscriptionApprovalBatch): void {
+    if (batch.resuming || [...batch.requests.values()].some(request => request.decision === undefined)) return;
+    const active = () => this.workers.get(live.record.id) === live && live.approvalBatch === batch
+      && live.generation === batch.generation && !live.controller.signal.aborted && !batch.controller.signal.aborted && !TERMINAL.has(live.record.state);
+    const finish = (allow: boolean) => {
+      if (live.approvalBatch === batch) live.approvalBatch = undefined;
+      batch.detach();
+      for (const request of batch.requests.values()) request.finish(allow && request.decision === "allow");
+    };
+    batch.resuming = (async () => {
+      await batch.parked;
+      if (!active()) { finish(false); return; }
+      // Denial also lets the native model continue; every non-cancelled result
+      // therefore waits for the same fixed seat before reaching the SDK.
+      const lease = await this.options.acquireLease!(structuredClone(live.record), batch.controller.signal);
+      live.lease = lease;
+      if (!active()) { finish(false); return; }
+      if ([...batch.requests.values()].some(request => request.decision === undefined)) {
+        live.lease = undefined;
+        await lease.release({ state: "waiting_host", cleanupVerified: false, sdkSessionId: live.record.sdkSessionId });
+        return;
+      }
+      live.record.state = "running"; this.save(live);
+      finish(true);
+    })().catch(() => { live.controller.abort(); finish(false); }).finally(() => {
+      batch.resuming = undefined;
+      if (live.approvalBatch === batch) this.resumeApprovedBatch(live, batch);
     });
   }
   private denyApprovals(live: LiveWorker): void { for (const item of [...live.approvals.values()]) item.settle("deny"); }

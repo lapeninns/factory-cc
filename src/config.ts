@@ -9,6 +9,7 @@ import { selectionFromConfig } from "./upstream/providers.js";
 import { canonicalWorkspacePath } from "./workspace.js";
 import { parseClaudePool, POOL_PROFILE, type PoolMember } from "./upstream/claude-pool.js";
 import { claudeProfileModels, modelsFromIds, parseModelIds, validateModels, type BridgeModel } from "./models.js";
+import type { SubscriptionProfile } from "./runtime/desktop-jobs.js";
 
 export interface BridgeConfig {
   desktopProfile?: boolean;
@@ -18,6 +19,15 @@ export interface BridgeConfig {
   desktopRuntimePath?: string;
   desktopStateRoot?: string;
   desktopWorkflow?: "implement" | "investigate" | "release-prepare";
+  /** Private worker-control channel used only by the native Factory AskUser adapter. */
+  workerControlFile?: string;
+  workerMcpPrefix?: string;
+  /** Private fixed-seat comparison, deliberately non-enumerable at runtime. */
+  subscriptionExpectedEmail?: string;
+  /** Operator-selected seat; never read from request metadata or environment. */
+  subscriptionProfile?: SubscriptionProfile;
+  /** Trusted operator-only mode: primary checkout reads, isolated worker writes. */
+  readonly controllerReadOnly?: boolean;
   /** Explicit API-only native workflow mode; disabled unless opted in. */
   nativeWorkflows?: boolean;
   workflowProvider?: "anthropic" | "openrouter";
@@ -180,6 +190,9 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
   const desktopRuntimePath = overrides.desktopRuntimePath ?? env("BRIDGE_DESKTOP_RUNTIME_PATH");
   const desktopStateRoot = overrides.desktopStateRoot ?? env("BRIDGE_DESKTOP_STATE_ROOT");
   const desktopWorkflow = overrides.desktopWorkflow ?? env("BRIDGE_DESKTOP_WORKFLOW", "implement");
+  const workerControlFile = overrides.workerControlFile ?? env("BRIDGE_WORKER_CONTROL_FILE");
+  const workerMcpPrefix = overrides.workerMcpPrefix ?? env("BRIDGE_WORKER_MCP_PREFIX");
+  if ((workerControlFile || workerMcpPrefix) && (!desktopProfile || !workerControlFile?.startsWith("/") || !workerMcpPrefix || !/^(?:mcp__[A-Za-z0-9_]+__|[A-Za-z0-9_-]+___)$/.test(workerMcpPrefix))) throw new Error("Worker approvals require a desktop profile, private absolute control path and exact MCP namespace.");
   if (desktopJobs && (!desktopProfile || !desktopLifecycle || !desktopRuntimePath || !desktopStateRoot || !["implement", "investigate", "release-prepare"].includes(desktopWorkflow!))) {
     throw new Error("Desktop jobs require the desktop profile, explicit lifecycle binding, runtime/state paths and a supported workflow.");
   }
@@ -237,12 +250,36 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
   if (nativeWorkflows && (!isLoopbackHost(host) || permissionMode !== "ask" || (!desktopJobs && nativeSessionLimit !== 1) || (desktopJobs && (!Number.isSafeInteger(nativeSessionLimit) || nativeSessionLimit < 1 || nativeSessionLimit > 8)))) {
     throw new Error("Native workflows require loopback binding, ask permissions and BRIDGE_MAX_SESSIONS=1.");
   }
-  if (desktopJobs && mode === "sdk" && !nativeWorkflows) throw new Error("Desktop SDK jobs require the explicit API-backed native workflow route.");
+  const subscriptionDesktopJobs = desktopJobs && mode === "sdk" && authMode === "subscription" && !nativeWorkflows;
+  if (overrides.controllerReadOnly !== undefined && typeof overrides.controllerReadOnly !== "boolean") {
+    throw new Error("Controller read-only policy must be a boolean supplied by operator configuration.");
+  }
+  const controllerReadOnly = overrides.controllerReadOnly === true;
+  if (controllerReadOnly && (!subscriptionDesktopJobs || !workerControlFile || !workerMcpPrefix)) {
+    throw new Error("Read-only controllers require supervised fixed-seat subscription Desktop and its exact worker connection.");
+  }
+  if (desktopJobs && mode === "sdk" && !nativeWorkflows && !subscriptionDesktopJobs) throw new Error("Desktop SDK jobs require an explicit native workflow route or a fixed subscription seat.");
+  if (subscriptionDesktopJobs) {
+    if (!overrides.subscriptionProfile || !["team1", "team2", "team3", "team4"].includes(overrides.subscriptionProfile)
+        || typeof overrides.subscriptionExpectedEmail !== "string" || !/^[^\s@]+@[^\s@]+$/.test(overrides.subscriptionExpectedEmail)) {
+      throw new Error("Subscription Desktop jobs require a private fixed Team profile and expected account identity.");
+    }
+    if (claudeProfiles?.length || claudePool?.length || overrides.claudeExecutable || env("BRIDGE_CLAUDE_EXECUTABLE")
+        || workflowRoute.baseUrl || workflowRoute.model || workflowRoute.tokenEnv || overrides.workflowProvider) {
+      throw new Error("Subscription Desktop jobs cannot use an account pool, custom executable or API routing override.");
+    }
+    if (Object.keys(process.env).some(name => process.env[name] && (/^ANTHROPIC_|^OPENROUTER_/.test(name)
+        || ["BRIDGE_API_KEY_HELPER", "BRIDGE_OPENROUTER_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"].includes(name)))) {
+      throw new Error("Subscription Desktop jobs refuse API, router, helper and token environment credentials; values are not shown.");
+    }
+    preflightAuth("subscription", process.env);
+  }
   if (desktopProfile && (permissionMode !== "ask" || !isLoopbackHost(host))) throw new Error("Desktop profile requires ask permissions and loopback binding.");
   const config: BridgeConfig = {
     desktopProfile,
     desktopJobs, desktopLifecycle, desktopRuntimePath, desktopStateRoot,
     desktopWorkflow: desktopWorkflow as BridgeConfig["desktopWorkflow"],
+    workerControlFile, workerMcpPrefix,
     nativeWorkflows,
     ...(nativeWorkflows ? { workflowProvider: workflowProvider as "anthropic" | "openrouter" } : {}),
     ...(nativeWorkflows ? { workflowMaxBudgetUsd, workflowMaxMs } : {}),
@@ -300,7 +337,14 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
   if (nativeWorkflows && !openrouter && config.models?.some((model) => model.id.includes("/") || model.model.includes("/") || model.claudeProfile || model.provider === "cursor" || !/^(?:claude-[a-z0-9.-]+|opus|sonnet|haiku)$/.test(model.model))) {
     throw new Error("Native workflows require unprefixed Anthropic model routes, without account or Cursor selection.");
   }
+  if (subscriptionDesktopJobs && (config.models?.length !== 1 || config.models[0]?.id !== "claude-opus-5-5"
+      || config.models[0]?.model !== "claude-opus-5-5" || config.models[0]?.claudeProfile || config.models[0]?.provider === "cursor")) {
+    throw new Error("Subscription Desktop jobs require the fixed unprefixed Opus 5.5 model route.");
+  }
   if (claudeConfig) Object.defineProperty(config, "claudeConfig", { value: claudeConfig });
   if (claudeProfiles?.length) Object.defineProperty(config, "claudeProfiles", { value: claudeProfiles });
+  if (overrides.subscriptionExpectedEmail) Object.defineProperty(config, "subscriptionExpectedEmail", { value: overrides.subscriptionExpectedEmail });
+  if (overrides.subscriptionProfile) Object.defineProperty(config, "subscriptionProfile", { value: overrides.subscriptionProfile });
+  Object.defineProperty(config, "controllerReadOnly", { value: controllerReadOnly, enumerable: true });
   return config;
 }

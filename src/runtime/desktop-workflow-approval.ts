@@ -19,6 +19,12 @@ function display(value: unknown): string {
 
 /** Generate only the installed Droid's documented plain-text AskUser shape. */
 export function desktopWorkflowQuestion(request: MessagesRequest, cwd: string, input: Record<string, unknown>): DesktopWorkflowQuestion | undefined {
+  return desktopActionQuestion(request, `Allow this one native Workflow in ${display(cwd)}?`, input, "Allow this workflow once", "Deny this workflow");
+}
+
+/** A generic exact-action question, also used for supervised worker permissions. */
+export function desktopActionQuestion(request: MessagesRequest, action: string, input: unknown,
+  allowAnswer = "Allow this action once", denyAnswer = "Deny this action"): DesktopWorkflowQuestion | undefined {
   const tool = request.tools?.find((item) => item.name === "AskUser");
   const properties = tool?.input_schema.properties;
   if (!tool || !properties || typeof properties !== "object" || Array.isArray(properties)) return undefined;
@@ -29,10 +35,9 @@ export function desktopWorkflowQuestion(request: MessagesRequest, cwd: string, i
   // Approval must expose the complete input rather than silently truncate it.
   if (rendered.length > 16_000) return undefined;
   const digest = createHash("sha256").update(JSON.stringify(input)).digest("hex").slice(0, 12);
-  const question = `Allow this one native Workflow in ${display(cwd)}? Input ${digest}: ${rendered}`;
-  const allowAnswer = "Allow this workflow once";
+  const question = `${action.replaceAll("[", "［").replaceAll("]", "］").replace(/[\r\n]/g, " ")} Input ${digest}: ${rendered}`;
   const args: Record<string, unknown> = {
-    questionnaire: `1. [question] ${question}\n[topic] Workflow approval\n[option] Deny this workflow\n[option] ${allowAnswer}`,
+    questionnaire: `1. [question] ${question}\n[topic] Action approval\n[option] ${denyAnswer}\n[option] ${allowAnswer}`,
   };
   if (properties.blocking !== undefined) {
     const blocking = properties.blocking;
