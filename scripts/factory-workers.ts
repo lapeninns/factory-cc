@@ -1,0 +1,110 @@
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { APIWorkerService } from "../src/workers/service.js";
+import { startWorkerControl } from "../src/workers/control.js";
+import { acquireDesktopJobLease } from "../src/runtime/desktop-jobs.js";
+import { startWorkerMcp } from "../src/workers/http.js";
+
+export interface WorkerServerConfig {
+  enabled: boolean;
+  provider: "anthropic" | "openrouter";
+  apiKeyFile: string;
+  stateRoot: string;
+  workspaceRoot: string;
+  allowedRepositories: string[];
+  nativeRuntimePath: string;
+  sharedStateRoot: string;
+  approvalCommand: string;
+  port: number;
+  clientTokenFile: string;
+  /** Set only after the actual Factory command-approval flow has been verified. */
+  approvalGuardVerified: boolean;
+  maxBudgetUsd: number;
+  maxMs: number;
+  maxTurns: number;
+}
+
+function privateFile(path: string, limit = 64 * 1024): string {
+  if (!isAbsolute(path)) throw new Error("An absolute private file is required.");
+  const info = lstatSync(path);
+  if (!info.isFile() || info.isSymbolicLink() || info.mode & 0o077 || (process.getuid && info.uid !== process.getuid()) || info.size > limit) throw new Error("Unsafe private configuration file.");
+  return readFileSync(path, "utf8");
+}
+
+export function readWorkerServerConfig(path: string): WorkerServerConfig {
+  const value = JSON.parse(privateFile(path)) as WorkerServerConfig;
+  if (!value || typeof value.enabled !== "boolean" || typeof value.approvalGuardVerified !== "boolean" || !["anthropic", "openrouter"].includes(value.provider)) throw new Error("Invalid worker service configuration.");
+  for (const key of ["apiKeyFile", "stateRoot", "workspaceRoot", "nativeRuntimePath", "sharedStateRoot", "approvalCommand", "clientTokenFile"] as const) if (typeof value[key] !== "string" || !isAbsolute(value[key])) throw new Error("Worker paths must be absolute.");
+  if (!Number.isInteger(value.port) || value.port < 1024 || value.port > 65535 || value.port === 18787) throw new Error("Use a dedicated local worker port.");
+  if (!Array.isArray(value.allowedRepositories) || !value.allowedRepositories.length || value.allowedRepositories.some(path => typeof path !== "string" || !isAbsolute(path))) throw new Error("An explicit repository allowlist is required.");
+  if (!Number.isFinite(value.maxBudgetUsd) || value.maxBudgetUsd <= 0 || !Number.isInteger(value.maxMs) || value.maxMs < 1000 || value.maxMs > 7200000 || !Number.isInteger(value.maxTurns) || value.maxTurns < 1 || value.maxTurns > 500) throw new Error("Finite worker budget, deadline and turn bounds are required.");
+  return value;
+}
+
+export async function runFactoryWorkers(argv = process.argv.slice(2)): Promise<void> {
+  const check = argv.includes("--check");
+  const serve = argv.includes("--serve");
+  const filtered = argv.filter(value => value !== "--check" && value !== "--serve");
+  if (filtered.length !== 2 || filtered[0] !== "--config") throw new Error("Use --config /absolute/private/config.json [--check].");
+  const config = readWorkerServerConfig(filtered[1]!);
+  let key: string | undefined;
+  if (check || serve) {
+    try { key = privateFile(config.apiKeyFile, 16384).trim() || undefined; } catch { if (config.enabled) throw new Error("Configured API credential is unavailable or unsafe."); }
+  }
+  if (check) {
+    console.log(JSON.stringify({ configured: true, enabled: config.enabled, provider: config.provider, credentialPresent: Boolean(key), approvalGuardVerified: config.approvalGuardVerified, repositoryCount: config.allowedRepositories.length, modelRequestsMade: false }));
+    return;
+  }
+  const clientToken = privateFile(config.clientTokenFile, 1024).trim();
+  if (!/^[a-f0-9]{48,128}$/.test(clientToken)) throw new Error("Invalid local worker client token.");
+  if (!serve) {
+    // Factory starts one stdio adapter per session; all adapters use one daemon.
+    const client = new Client({ name: "factory-worker-adapter", version: "1.0.0" });
+    await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${config.port}/mcp`), { requestInit: { headers: { authorization: `Bearer ${clientToken}` } } }));
+    const proxy = new Server({ name: "factory-supervised-workers", version: "1.0.0" }, { capabilities: { tools: {} }, instructions: "Delegate independent implementation to factory_worker_start, then poll status/wait and report the result. Workers use separate worktrees. Do not use built-in SpawnAgent for work that requires this isolation." });
+    proxy.setRequestHandler(ListToolsRequestSchema, () => client.listTools());
+    proxy.setRequestHandler(CallToolRequestSchema, request => client.callTool(request.params));
+    process.stdin.once("end", () => { void client.close(); void proxy.close(); });
+    await proxy.connect(new StdioServerTransport());
+    return;
+  }
+  const sourceEnv = { ...process.env };
+  for (const name of Object.keys(sourceEnv)) if (/^ANTHROPIC_|^CLAUDE_CODE_(?:OAUTH|USE_|API_BASE_URL|GATEWAY_TOKEN)|^BRIDGE_OPENROUTER_API_KEY$/.test(name)) delete sourceEnv[name];
+  if (key) sourceEnv[config.provider === "anthropic" ? "ANTHROPIC_API_KEY" : "BRIDGE_OPENROUTER_API_KEY"] = key;
+  const runtime = realpathSync(config.nativeRuntimePath);
+  const policy = readFileSync(join(runtime, "policies/team-policy.md"), "utf8");
+  const workflows = Object.fromEntries(["implement", "investigate", "release-prepare"].map(name => [name, readFileSync(join(runtime, "workflows", name + ".md"), "utf8")]));
+  const leases = { pythonExecutable: "/usr/bin/python3", runtimePackagePath: runtime, stateRoot: config.sharedStateRoot, maxRunning: 2 };
+  const makeService = () => new APIWorkerService({ stateRoot: config.stateRoot, workspaceRoot: config.workspaceRoot,
+    allowedRepositories: config.allowedRepositories, provider: { kind: config.provider }, maxConcurrent: 2,
+    maxBudgetUsd: config.maxBudgetUsd, maxMs: config.maxMs, maxTurns: config.maxTurns, sourceEnv,
+    policyText: policy, workflowText: workflows,
+    acquireLease: (worker, signal) => acquireDesktopJobLease(leases, { factorySessionId: worker.id, bridgeSessionId: worker.id, cwd: worker.worktree, role: "worker" }, signal),
+  });
+  let service: APIWorkerService;
+  const guarded = {
+    start: (input: Parameters<APIWorkerService["start"]>[0]) => {
+      if (!config.enabled || !config.approvalGuardVerified || !key) throw new Error("Workers remain disabled until API and Factory approval verification complete.");
+      return service.start(input);
+    },
+    status: (id: string) => service.status(id), list: () => service.list(), cancel: (id: string) => service.cancel(id),
+  };
+  const { server } = await startWorkerMcp(() => { service = makeService(); return guarded; }, { port: config.port, token: clientToken, approvalCommand: config.approvalCommand });
+  let control;
+  try { control = await startWorkerControl(service!, join(config.stateRoot, "approval-control.json")); }
+  catch (error) { server.close(); await service!.close(); throw error; }
+  let stopping: Promise<void> | undefined;
+  const stop = () => stopping ??= (async () => { await service.close(); await control.close(); await new Promise<void>(resolve => server.close(() => resolve())); })();
+  process.once("SIGINT", () => void stop());
+  process.once("SIGTERM", () => void stop());
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
+  runFactoryWorkers().catch(() => { console.error("Factory worker service could not start. Check its private configuration, runtime and approval setup."); process.exitCode = 1; });
+}

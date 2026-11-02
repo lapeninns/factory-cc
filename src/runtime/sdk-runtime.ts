@@ -1,5 +1,6 @@
 import { WorkflowPermits, workflowAllowed, workflowProviderAllowed, validateWorkflowInput } from './native-workflows.js';
 import { assertNativeWorkflowSupport } from './native-workflow-support.js';
+import { desktopJobPolicy, desktopWorkflowApproved, desktopWorkflowQuestion, type DesktopWorkflowQuestion } from "./desktop-workflow-approval.js";
 import { DESKTOP_DISALLOWED_TOOLS, DESKTOP_APPROVAL_DENIAL, DESKTOP_READ_DENIAL } from "./desktop-policy.js";
 import { mkdirSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
@@ -101,6 +102,11 @@ interface HostResultConsumption {
   promise: Promise<void>;
   resolve(): void;
 }
+interface DesktopApprovalReceipt {
+  question: DesktopWorkflowQuestion;
+  resolve?: (decision: RuntimePermissionDecision) => void;
+  fingerprint?: string;
+}
 interface NativePermissionContext {
   signal?: AbortSignal;
   toolUseID?: string;
@@ -163,6 +169,7 @@ interface LiveSdk {
   hostResultConsumptions: Map<string, HostResultConsumption>;
   hostCompletionFingerprints: Map<string, string>;
   approvals: Set<AbortController>;
+  desktopApprovals: Map<string, DesktopApprovalReceipt>;
   hostEnding?: string;
   resumableAfterHostEnd?: boolean;
   lastRequestKey?: string;
@@ -564,6 +571,7 @@ export class SdkRuntime implements BridgeRuntime {
       candidates: new Map(), handlerArrivals: new Set(), retiredCandidates: new Set(), batchChecks: new Set(), prefetched: new Set(),
       claimedHandlers: new Set(), resultFingerprints: new Map(), sentUserTurns: 0,
       hostResultConsumptions: new Map(), hostCompletionFingerprints: new Map(), approvals: new Set(),
+      desktopApprovals: new Map(),
       starting: false, queryEpoch: 0, lastTouched: Date.now(), backgroundTasks: new Set(),
     };
   }
@@ -643,7 +651,7 @@ export class SdkRuntime implements BridgeRuntime {
   private validateResults(live: LiveSdk, results: DroidResult[]): void {
     const batch = new Map<string, string>();
     for (const result of results) {
-      if (!live.mailbox.hasCall(result.tool_use_id)) throw new BridgeError(409, "unknown_tool_use_id", result.tool_use_id);
+      if (!live.mailbox.hasCall(result.tool_use_id) && !live.desktopApprovals.has(result.tool_use_id)) throw new BridgeError(409, "unknown_tool_use_id", result.tool_use_id);
       const fingerprint = resultFingerprint(result);
       const previous = live.resultFingerprints.get(result.tool_use_id);
       const earlierInBatch = batch.get(result.tool_use_id);
@@ -678,6 +686,17 @@ export class SdkRuntime implements BridgeRuntime {
       const fresh = !live.resultFingerprints.has(result.tool_use_id);
       live.resultFingerprints.set(result.tool_use_id, resultFingerprint(result));
       live.pending.delete(result.tool_use_id);
+      const desktopApproval = live.desktopApprovals.get(result.tool_use_id);
+      if (desktopApproval) {
+        if (!fresh) return "duplicate" as const;
+        desktopApproval.fingerprint = resultFingerprint(result);
+        const resolve = desktopApproval.resolve;
+        desktopApproval.resolve = undefined;
+        resolve?.(desktopWorkflowApproved(desktopApproval.question, result)
+          ? { behavior: "allow" }
+          : { behavior: "deny", message: "The Workflow was not explicitly approved in Factory." });
+        return "accepted" as const;
+      }
       // validateResults already proved a repeat has the same fingerprint. What the
       // mailbox kept may carry host continuation text, so do not compare against it.
       if (!fresh) return "duplicate" as const;
@@ -928,7 +947,8 @@ export class SdkRuntime implements BridgeRuntime {
       allowedTools: ["mcp__droid__*"],
       env, permissionMode: this.config.desktopProfile || this.config.permissionMode === "ask" ? "default" : "bypassPermissions",
       allowDangerouslySkipPermissions: !this.config.desktopProfile && this.config.permissionMode !== "ask", abortController: abort,
-      systemPrompt: buildPresetSystemPrompt(this.config.desktopProfile, this.config.nativeWorkflows),
+      systemPrompt: { ...buildPresetSystemPrompt(this.config.desktopProfile, this.config.nativeWorkflows),
+        append: buildPresetSystemPrompt(this.config.desktopProfile, this.config.nativeWorkflows).append + desktopJobPolicy(this.config) },
       canUseTool: async (name: string, toolInput: Record<string, unknown>, context?: NativePermissionContext) => live.queryEpoch === epoch
         ? this.canUseTool(live, name, toolInput, context)
         : { behavior: "deny", message: "This native query has been retired." },
@@ -1170,9 +1190,16 @@ export class SdkRuntime implements BridgeRuntime {
     live.events.push({ at: now(), type: "permission_requested", data: { toolName: name, toolUseId: context.toolUseID, requestId: context.requestId } });
     try {
       if (approval.signal.aborted) return await aborted;
-      const decision = await Promise.race([control.requestApproval(details), aborted]);
+      const decision = await Promise.race([
+        nativeWorkflow && this.config.desktopJobs
+          ? this.requestDesktopWorkflowApproval(live, input, approval.signal)
+          : control.requestApproval(details), aborted,
+      ]);
       if (live.terminal || live.queryEpoch !== epoch || approval.signal.aborted || this.control !== control) {
         return { behavior: "deny", message: "Native approval is no longer live" };
+      }
+      if (nativeWorkflow && this.config.desktopJobs && live.turnHandoff) {
+        return { behavior: "deny", message: "The Workflow approval was superseded by new Factory steering." };
       }
       const currentDenial = nativeWorkflow
         ? (workflowAllowed(this.config, live.current?.request, this.control?.factoryPermissionMode?.(live.current?.session.bridgeSessionId ?? "") ?? live.current?.factoryPermissionMode) ? undefined : "Workflow permission changed while approval was pending")
@@ -1201,6 +1228,40 @@ export class SdkRuntime implements BridgeRuntime {
       this.notifyApprovals(live);
       approval.abort();
     }
+  }
+
+  private requestDesktopWorkflowApproval(live: LiveSdk, input: Record<string, unknown>, signal: AbortSignal): Promise<RuntimePermissionDecision> {
+    if (!live.current || live.pending.size || [...live.desktopApprovals.values()].some((item) => item.resolve)) {
+      return Promise.resolve({ behavior: "deny", message: "Finish pending Factory tools before requesting Workflow approval." });
+    }
+    const question = desktopWorkflowQuestion(live.current.request, resolveCwd(live.current, this.config), input);
+    if (!question) return Promise.resolve({ behavior: "deny", message: "A supported Factory AskUser tool is required for in-app Workflow approval." });
+    for (const [id, receipt] of live.desktopApprovals) {
+      if (live.desktopApprovals.size < 256) break;
+      if (!receipt.resolve) {
+        live.desktopApprovals.delete(id);
+        live.resultFingerprints.delete(id);
+      }
+    }
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (decision: RuntimePermissionDecision): void => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", abort);
+        const receipt = live.desktopApprovals.get(question.id);
+        if (receipt) receipt.resolve = undefined;
+        live.pending.delete(question.id);
+        resolve(decision);
+      };
+      const abort = (): void => finish({ behavior: "deny", message: "Factory Workflow approval expired or was cancelled." });
+      live.desktopApprovals.set(question.id, { question, resolve: finish });
+      live.pending.set(question.id, { id: question.id, name: "AskUser", input: question.input });
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) { abort(); return; }
+      live.events.push({ at: now(), type: "desktop_workflow_approval_requested", data: { toolUseId: question.id } });
+      this.publish(live, this.makeTurn(live, [{ type: "tool_use", id: question.id, name: "AskUser", input: question.input as Json }], "tool_use"));
+    });
   }
 
   /** Report how many approvals are pending, so the idle limit can pause while a human decides. */

@@ -8,6 +8,8 @@ export interface RuntimeRequest {
   headers: Record<string, string | string[] | undefined>;
   /** Trusted host policy supplied by the controller, never raw Messages metadata. */
   factoryPermissionMode?: string;
+  /** Bound by ControlBroker from its live opaque marker, never raw request metadata. */
+  factorySession?: { sessionId: string; cwd: string; launchId?: string; desktopLifecycle: boolean };
   /** Trusted HTTP retry receipt. Prior results become reference history, never callbacks. */
   recovery?: "cold-import";
 }

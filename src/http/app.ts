@@ -28,6 +28,7 @@ import { ControlBroker } from "../control/broker.js";
 import { controlPageHtml, controlPageHeaders } from "./control-page.js";
 import { configuredModels, providerFromModelId, resolveRequestModel, type BridgeModel, type ModelProvider } from "../models.js";
 import { ClaudePool, PERSONAL_ACCOUNT, POOL_PROFILE } from "../upstream/claude-pool.js";
+import { DesktopJobsRuntime } from "../runtime/desktop-jobs.js";
 
 export interface BridgeApp {
   server: Server;
@@ -51,11 +52,16 @@ function listenUrl(host: string, port: number): string {
 }
 
 export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath: string, runtime: BridgeRuntime = createRuntime(config, logger, canaryPath)): BridgeApp {
+  if (config.desktopJobs) runtime = new DesktopJobsRuntime(runtime, {
+    pythonExecutable: "/usr/bin/python3", runtimePackagePath: config.desktopRuntimePath!,
+    stateRoot: config.desktopStateRoot!, maxRunning: 2,
+    getBinding: (input) => input.factorySession?.desktopLifecycle ? input.factorySession : undefined,
+  });
   const store = new SessionStore(join(config.dataDir, "sessions"), config.persistSessions, config.maxSessions, logger, {
     ...DEFAULT_SESSION_RETENTION, maxRecords: config.sessionMaxRecords ?? 1000, maxAgeMs: config.sessionRetentionMs ?? DEFAULT_SESSION_RETENTION.maxAgeMs,
   });
   // Approvals wait on a person, so they get their own limit rather than the turn's idle limit.
-  const control = new ControlBroker(runtime, store, config.approvalTimeoutMs);
+  const control = new ControlBroker(runtime, store, config.approvalTimeoutMs, { desktopLifecycle: config.desktopLifecycle });
   runtime.setControl?.(control);
   const records: RedactedRequestRecord[] = [];
   let authFailureCount = 0;
@@ -379,6 +385,8 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     const role = roleFromHeaders(headers);
     const cwd = resolveRequestCwd(headers, parsed, config);
     const prepared = control.prepareRequest(parsed, cwd);
+    const factorySession = control.hostIdentity(prepared.binding);
+    if (config.desktopJobs && !factorySession?.desktopLifecycle) throw new BridgeError(409, "desktop_binding_required", "Start this session with the configured Factory Desktop lifecycle hooks before using the supervised model.");
     const request = prepared.request;
     const listed = configuredModels(config).find((model) => model.id === request.model);
     const provider: ModelProvider = listed?.provider ?? providerFromModelId(request.model);
@@ -544,7 +552,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
 
       const turn: RuntimeTurn = await Promise.race([
         interrupted,
-        runtime.handle({ request, role, session, headers, ...(resolved.reason === "upstream-retry" ? { recovery: "cold-import" as const } : {}) }, sink),
+        runtime.handle({ request, role, session, headers, ...(factorySession ? { factorySession } : {}), ...(resolved.reason === "upstream-retry" ? { recovery: "cold-import" as const } : {}) }, sink),
       ]);
       if (cancellationRequested || store.get(sessionId)?.cancelRequested) {
         throw new BridgeError(499, "cancelled", "session cancelled");

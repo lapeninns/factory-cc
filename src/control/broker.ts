@@ -21,7 +21,9 @@ interface HostBinding {
   permissionMode?: string;
   /** Remains locked until the host confirms successful ExitSpecMode. */
   specRestricted?: boolean;
+  desktopLifecycle?: boolean;
 }
+export interface FactoryHostIdentity { sessionId: string; cwd: string; launchId?: string; desktopLifecycle: boolean }
 interface PendingApproval {
   view: ObjectValue & { id: string; bridgeSessionId: string };
   finish(decision: RuntimePermissionDecision): void;
@@ -37,7 +39,8 @@ export class ControlBroker implements RuntimeControl {
   private readonly failures: string[] = [];
   private closed = false;
 
-  constructor(private readonly runtime: BridgeRuntime, private readonly store: SessionStore, private readonly approvalTimeoutMs: number) {}
+  constructor(private readonly runtime: BridgeRuntime, private readonly store: SessionStore, private readonly approvalTimeoutMs: number,
+    private readonly options: { desktopLifecycle?: boolean } = {}) {}
 
   requestApproval(request: RuntimeApprovalRequest): Promise<RuntimePermissionDecision> {
     if (this.closed || request.signal.aborted) return Promise.resolve({ behavior: "deny", message: "The native permission request has ended." });
@@ -156,6 +159,13 @@ export class ControlBroker implements RuntimeControl {
 
   hostSessionId(token: string | undefined): string | undefined { return token ? this.tokens.get(token)?.sessionId : undefined; }
 
+  /** Only an exact live generation token supplies trusted Desktop identity. */
+  hostIdentity(token: string | undefined): FactoryHostIdentity | undefined {
+    const host = token ? this.tokens.get(token) : undefined;
+    return host && !host.ended ? { sessionId: host.sessionId, cwd: host.cwd, launchId: host.launchId,
+      desktopLifecycle: host.desktopLifecycle === true } : undefined;
+  }
+
   /** The live Factory host this native session is bound to, if any. */
   private liveHost(bridgeSessionId: string): HostBinding | undefined {
     const session = this.store.get(bridgeSessionId);
@@ -178,13 +188,14 @@ export class ControlBroker implements RuntimeControl {
     const envelope = object(input);
     if (typeof envelope.eventId !== "string" || !envelope.eventId || envelope.eventId.length > 200) throw invalid("eventId required");
     const event = object(envelope.event);
-    const hash = createHash("sha256").update(canonical({ event, bindingToken: envelope.bindingToken, launchId: envelope.launchId })).digest("hex");
+    if (envelope.desktopLifecycle !== undefined && typeof envelope.desktopLifecycle !== "boolean") throw invalid("desktopLifecycle must be a boolean");
+    const hash = createHash("sha256").update(canonical({ event, bindingToken: envelope.bindingToken, launchId: envelope.launchId, desktopLifecycle: envelope.desktopLifecycle })).digest("hex");
     const existing = this.receipts.get(envelope.eventId);
     if (existing) {
       if (existing.hash !== hash) throw new BridgeError(409, "conflicting_host_event", "An event ID cannot be reused with different content.");
       return existing.result;
     }
-    const result = this.processHostEvent(event, envelope.bindingToken, envelope.launchId);
+    const result = this.processHostEvent(event, envelope.bindingToken, envelope.launchId, envelope.desktopLifecycle === true);
     this.receipts.set(envelope.eventId, { hash, result });
     // Failed events can be retried after their prerequisite reaches the bridge.
     const eventId = envelope.eventId;
@@ -193,11 +204,31 @@ export class ControlBroker implements RuntimeControl {
     return result;
   }
 
-  private async processHostEvent(event: ObjectValue, token: unknown, launchId: unknown): Promise<ObjectValue> {
+  private async processHostEvent(event: ObjectValue, token: unknown, launchId: unknown, desktopLifecycle = false): Promise<ObjectValue> {
     if (typeof event.session_id !== "string" || !event.session_id || typeof event.cwd !== "string" || !event.cwd || typeof event.hook_event_name !== "string") throw invalid("Factory session_id, cwd and hook_event_name required");
     const cwd = canonicalWorkspacePath(event.cwd);
     const key = `${cwd}\0${event.session_id}`;
     let host = this.hosts.get(key);
+    if (desktopLifecycle) {
+      if (!this.options.desktopLifecycle || event.hook_event_name !== "SessionStart" || launchId !== undefined) {
+        throw new BridgeError(409, "desktop_lifecycle_disabled", "Direct Desktop binding is not enabled for this lifecycle event.");
+      }
+      if (host?.ended && !host.drained) throw new BridgeError(409, "host_session_closing", "The prior Factory session is still draining.");
+      if (host && !host.ended) {
+        if (!host.desktopLifecycle) throw new BridgeError(409, "conflicting_host_launch", "Factory session is already owned by a wrapper launch.");
+        if (token !== undefined && token !== host.token) throw new BridgeError(409, "stale_host_event", "Desktop start supplied another session generation.");
+        launchId = host.launchId;
+      } else if (event.source === "compact" && typeof event.previous_session_id === "string" && event.previous_session_id !== event.session_id) {
+        const previous = this.hosts.get(`${cwd}\0${event.previous_session_id}`);
+        if (!previous || previous.ended || !previous.desktopLifecycle || token !== previous.token) {
+          throw new BridgeError(409, "stale_host_event", "Desktop compact handoff requires its live predecessor generation.");
+        }
+        launchId = previous.launchId;
+      } else {
+        if (token !== undefined) throw new BridgeError(409, "stale_host_event", "A new Desktop generation must not reuse a prior binding.");
+        launchId = this.createLaunch({ cwd }).launchId;
+      }
+    }
     if (event.hook_event_name === "SessionEnd" && token === undefined && launchId !== undefined) {
       // Factory's interactive client emits SessionEnd outside the agent scope
       // that loaded CLAUDE_ENV_FILE. Only the authenticated wrapper launch may
@@ -244,7 +275,8 @@ export class ControlBroker implements RuntimeControl {
       }
       if (host?.ended && !host.drained) throw new BridgeError(409, "host_session_closing", "The prior Factory session is still draining.");
       if (!host || host.ended) {
-        host = { token: randomBytes(32).toString("hex"), sessionId: event.session_id, cwd, cwdAliases: new Set([cwd, resolve(event.cwd), ...(launch?.cwdAliases ?? [])]), bridgeSessions: new Set(), ended: false, terminalResults: new Map(), launchId: typeof launchId === "string" ? launchId : undefined };
+        host = { token: randomBytes(32).toString("hex"), sessionId: event.session_id, cwd, cwdAliases: new Set([cwd, resolve(event.cwd), ...(launch?.cwdAliases ?? [])]), bridgeSessions: new Set(), ended: false, terminalResults: new Map(), launchId: typeof launchId === "string" ? launchId : undefined,
+          ...(desktopLifecycle ? { desktopLifecycle: true } : {}) };
         this.hosts.set(key, host);
         this.tokens.set(host.token, host);
         launch?.hosts.add(host);

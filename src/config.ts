@@ -12,6 +12,12 @@ import { claudeProfileModels, modelsFromIds, parseModelIds, validateModels, type
 
 export interface BridgeConfig {
   desktopProfile?: boolean;
+  /** Explicit lifecycle/job integration; does not alter legacy desktop requests. */
+  desktopJobs?: boolean;
+  desktopLifecycle?: boolean;
+  desktopRuntimePath?: string;
+  desktopStateRoot?: string;
+  desktopWorkflow?: "implement" | "investigate" | "release-prepare";
   /** Explicit API-only native workflow mode; disabled unless opted in. */
   nativeWorkflows?: boolean;
   workflowProvider?: "anthropic" | "openrouter";
@@ -169,6 +175,15 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
     } else preflightAuth("anthropic-api", process.env);
   }
   const desktopProfile = overrides.desktopProfile ?? env("BRIDGE_DESKTOP") === "1";
+  const desktopJobs = overrides.desktopJobs ?? env("BRIDGE_DESKTOP_JOBS") === "1";
+  const desktopLifecycle = overrides.desktopLifecycle ?? env("BRIDGE_DESKTOP_LIFECYCLE") === "1";
+  const desktopRuntimePath = overrides.desktopRuntimePath ?? env("BRIDGE_DESKTOP_RUNTIME_PATH");
+  const desktopStateRoot = overrides.desktopStateRoot ?? env("BRIDGE_DESKTOP_STATE_ROOT");
+  const desktopWorkflow = overrides.desktopWorkflow ?? env("BRIDGE_DESKTOP_WORKFLOW", "implement");
+  if (desktopJobs && (!desktopProfile || !desktopLifecycle || !desktopRuntimePath || !desktopStateRoot || !["implement", "investigate", "release-prepare"].includes(desktopWorkflow!))) {
+    throw new Error("Desktop jobs require the desktop profile, explicit lifecycle binding, runtime/state paths and a supported workflow.");
+  }
+  if (desktopJobs && (!desktopRuntimePath!.startsWith("/") || !desktopStateRoot!.startsWith("/"))) throw new Error("Desktop runtime and state paths must be absolute.");
   const claudeConfig = authMode === "claude-config" ? overrides.claudeConfig ?? readClaudeConfig(process.env, `${overrides.host ?? env("BRIDGE_HOST", "127.0.0.1")}:${overrides.port ?? intEnv("BRIDGE_PORT", 18787)}`, { requireSettings: desktopProfile && Boolean(process.env.CLAUDE_CONFIG_DIR) }) : undefined;
   if (claudeConfig) assertClaudeCredential(claudeConfig);
   const profileList = env("BRIDGE_CLAUDE_PROFILES");
@@ -218,12 +233,16 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
     : "ask") as "bypass" | "ask";
 
   if (nativeWorkflows && (mode !== "sdk" || !desktopProfile)) throw new Error("Native workflows require sdk mode and the guarded desktop profile.");
-  if (nativeWorkflows && (!isLoopbackHost(host) || permissionMode !== "ask" || (overrides.maxSessions ?? intEnv("BRIDGE_MAX_SESSIONS", 1)) !== 1)) {
+  const nativeSessionLimit = overrides.maxSessions ?? intEnv("BRIDGE_MAX_SESSIONS", 1);
+  if (nativeWorkflows && (!isLoopbackHost(host) || permissionMode !== "ask" || (!desktopJobs && nativeSessionLimit !== 1) || (desktopJobs && (!Number.isSafeInteger(nativeSessionLimit) || nativeSessionLimit < 1 || nativeSessionLimit > 8)))) {
     throw new Error("Native workflows require loopback binding, ask permissions and BRIDGE_MAX_SESSIONS=1.");
   }
+  if (desktopJobs && mode === "sdk" && !nativeWorkflows) throw new Error("Desktop SDK jobs require the explicit API-backed native workflow route.");
   if (desktopProfile && (permissionMode !== "ask" || !isLoopbackHost(host))) throw new Error("Desktop profile requires ask permissions and loopback binding.");
   const config: BridgeConfig = {
     desktopProfile,
+    desktopJobs, desktopLifecycle, desktopRuntimePath, desktopStateRoot,
+    desktopWorkflow: desktopWorkflow as BridgeConfig["desktopWorkflow"],
     nativeWorkflows,
     ...(nativeWorkflows ? { workflowProvider: workflowProvider as "anthropic" | "openrouter" } : {}),
     ...(nativeWorkflows ? { workflowMaxBudgetUsd, workflowMaxMs } : {}),
