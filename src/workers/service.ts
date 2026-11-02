@@ -15,6 +15,7 @@ import type { Logger } from "../logging.js";
 import type { Usage } from "../types.js";
 import { privateDirectory, readWorkers, workerId, writeWorker, type WorkerRecord, type WorkerWorkflow } from "./worker-state.js";
 import { prepareSubscription, verifyNativeSubscription, type SubscriptionIdentity } from "./subscription-auth.js";
+import type { SubscriptionProfile } from "../runtime/desktop-jobs.js";
 
 const exec = promisify(execFile);
 const TERMINAL = new Set(["completed", "failed", "cancelled", "unknown"]);
@@ -48,7 +49,7 @@ export interface APIWorkerServiceOptions {
   stateRoot: string;
   workspaceRoot: string;
   allowedRepositories: string[];
-  provider: { kind: "anthropic" | "openrouter" } | { kind: "subscription"; profile: "team1" | "team2" | "team3" | "team4"; mappingPath?: string; executable?: string };
+  provider: { kind: "anthropic" | "openrouter" } | { kind: "subscription"; profile: SubscriptionProfile; mappingPath?: string; executable?: string };
   maxConcurrent?: number;
   maxBudgetUsd?: number;
   maxMs: number;

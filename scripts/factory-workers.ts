@@ -8,14 +8,14 @@ import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { APIWorkerService } from "../src/workers/service.js";
 import { startWorkerControl } from "../src/workers/control.js";
-import { acquireDesktopJobLease, updateDesktopJobRecord } from "../src/runtime/desktop-jobs.js";
+import { acquireDesktopJobLease, updateDesktopJobRecord, SUBSCRIPTION_PROFILES, type SubscriptionProfile } from "../src/runtime/desktop-jobs.js";
 import { startWorkerMcp } from "../src/workers/http.js";
 import { prepareSubscription } from "../src/workers/subscription-auth.js";
 
 export interface WorkerServerConfig {
   enabled: boolean;
   provider: "anthropic" | "openrouter" | "subscription";
-  subscriptionProfile?: "team1" | "team2" | "team3" | "team4";
+  subscriptionProfile?: SubscriptionProfile;
   profileMappingPath?: string;
   apiKeyFile?: string;
   stateRoot: string;
@@ -46,7 +46,7 @@ export function readWorkerServerConfig(path: string): WorkerServerConfig {
   for (const key of ["stateRoot", "workspaceRoot", "nativeRuntimePath", "sharedStateRoot", "clientTokenFile"] as const) if (typeof value[key] !== "string" || !isAbsolute(value[key])) throw new Error("Worker paths must be absolute.");
   if (value.approvalCommand !== undefined && !isAbsolute(value.approvalCommand)) throw new Error("An approval helper path must be absolute.");
   if (value.provider === "subscription") {
-    if (!["team1", "team2", "team3", "team4"].includes(value.subscriptionProfile ?? "") || value.apiKeyFile !== undefined || value.maxBudgetUsd !== undefined || value.approvalCommand !== undefined) throw new Error("Subscription workers require one fixed Team profile and forbid API key/budget or shell-approval configuration.");
+    if (!SUBSCRIPTION_PROFILES.includes(value.subscriptionProfile as SubscriptionProfile) || value.apiKeyFile !== undefined || value.maxBudgetUsd !== undefined || value.approvalCommand !== undefined) throw new Error("Subscription workers require one fixed Team profile and forbid API key/budget or shell-approval configuration.");
     if (value.profileMappingPath !== undefined && !isAbsolute(value.profileMappingPath)) throw new Error("Profile mapping path must be absolute.");
   } else if (typeof value.apiKeyFile !== "string" || !isAbsolute(value.apiKeyFile) || !Number.isFinite(value.maxBudgetUsd) || value.maxBudgetUsd! <= 0) throw new Error("API workers require an explicit key file and budget.");
   if (!Number.isInteger(value.port) || value.port < 1024 || value.port > 65535 || value.port === 18787) throw new Error("Use a dedicated local worker port.");

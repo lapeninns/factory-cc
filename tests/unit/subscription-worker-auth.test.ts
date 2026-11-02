@@ -11,7 +11,7 @@ function fixture() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "subscription-auth-")));
   roots.push(root);
   const profiles: Record<string, { email: string; configDir: string }> = {};
-  for (let index = 1; index <= 4; index++) {
+  for (let index = 1; index <= 8; index++) {
     const dir = join(root, `team${index}`); mkdirSync(dir, { mode: 0o700 });
     profiles[`team${index}`] = { email: `team${index}@example.invalid`, configDir: dir };
   }
@@ -41,7 +41,7 @@ describe("fixed-seat subscription worker authentication", () => {
     expect(f.runCli.mock.calls.map(([, args]) => args)).toEqual([["--version"], ["auth", "status", "--json"]]);
   });
 
-  it.each([1, 2, 3, 4])("validates the assigned team%d identity without rotation", async (index) => {
+  it.each([1, 2, 3, 4, 5, 6, 7, 8])("validates the assigned team%d identity without rotation", async (index) => {
     const f = fixture();
     f.status.email = f.profiles[`team${index}`]!.email;
     const prepared = await prepareSubscription(`team${index}`, f);
@@ -51,7 +51,7 @@ describe("fixed-seat subscription worker authentication", () => {
 
   it("fails before invoking any CLI for unknown profiles or unsafe mappings", async () => {
     const f = fixture();
-    await expect(prepareSubscription("team5", f)).rejects.toThrow("assigned Team seat");
+    await expect(prepareSubscription("team9", f)).rejects.toThrow("assigned Team seat");
     expect(f.runCli).not.toHaveBeenCalled();
     chmodSync(f.mappingPath, 0o644);
     await expect(prepareSubscription("team1", f)).rejects.toThrow();
@@ -60,6 +60,17 @@ describe("fixed-seat subscription worker authentication", () => {
     const link = join(f.root, "mapping-link"); symlinkSync(f.mappingPath, link);
     await expect(prepareSubscription("team1", { ...f, mappingPath: link })).rejects.toThrow();
     expect(f.runCli).not.toHaveBeenCalled();
+  });
+
+  it.each([5, 6, 7, 8])("keeps the Team plan and exact-seat checks for team%d", async (index) => {
+    const f = fixture();
+    f.status.email = f.profiles[`team${index}`]!.email;
+    f.status.subscriptionType = "pro";
+    await expect(prepareSubscription(`team${index}`, f)).rejects.toThrow("Subscription authentication failed");
+    f.status.subscriptionType = "team";
+    f.status.email = f.profiles.team1!.email;
+    await expect(prepareSubscription(`team${index}`, f)).rejects.toThrow("Subscription authentication failed");
+    expect(f.runCli.mock.calls.filter(([, args]) => args[0] === "auth")).toHaveLength(2);
   });
 
   it("refuses redirected and nonprivate profile directories", async () => {

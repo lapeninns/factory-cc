@@ -9,7 +9,7 @@ import { selectionFromConfig } from "./upstream/providers.js";
 import { canonicalWorkspacePath } from "./workspace.js";
 import { parseClaudePool, POOL_PROFILE, type PoolMember } from "./upstream/claude-pool.js";
 import { claudeProfileModels, modelsFromIds, parseModelIds, validateModels, type BridgeModel } from "./models.js";
-import type { SubscriptionProfile } from "./runtime/desktop-jobs.js";
+import { SUBSCRIPTION_PROFILES, type SubscriptionProfile } from "./runtime/desktop-jobs.js";
 
 export interface BridgeConfig {
   desktopProfile?: boolean;
@@ -260,9 +260,12 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
   }
   if (desktopJobs && mode === "sdk" && !nativeWorkflows && !subscriptionDesktopJobs) throw new Error("Desktop SDK jobs require an explicit native workflow route or a fixed subscription seat.");
   if (subscriptionDesktopJobs) {
-    if (!overrides.subscriptionProfile || !["team1", "team2", "team3", "team4"].includes(overrides.subscriptionProfile)
+    if (!overrides.subscriptionProfile || !SUBSCRIPTION_PROFILES.includes(overrides.subscriptionProfile)
         || typeof overrides.subscriptionExpectedEmail !== "string" || !/^[^\s@]+@[^\s@]+$/.test(overrides.subscriptionExpectedEmail)) {
       throw new Error("Subscription Desktop jobs require a private fixed Team profile and expected account identity.");
+    }
+    if (controllerReadOnly && workerMcpPrefix !== `factory-workers-${overrides.subscriptionProfile}___`) {
+      throw new Error("The read-only controller must use its own fixed seat's worker namespace.");
     }
     if (claudeProfiles?.length || claudePool?.length || overrides.claudeExecutable || env("BRIDGE_CLAUDE_EXECUTABLE")
         || workflowRoute.baseUrl || workflowRoute.model || workflowRoute.tokenEnv || overrides.workflowProvider) {

@@ -12,10 +12,10 @@ function config(changes: Record<string, unknown> = {}) {
 }
 afterEach(()=>{for(const p of roots.splice(0))rmSync(p,{recursive:true,force:true});});
 describe('subscription-only worker entry point',()=>{
-  it.each(['team1','team2','team3','team4'])('permits one fixed %s seat',subscriptionProfile=>{
+  it.each(['team1','team2','team3','team4','team5','team6','team7','team8'])('permits one fixed %s seat',subscriptionProfile=>{
     expect(readWorkerServerConfig(config({subscriptionProfile})).subscriptionProfile).toBe(subscriptionProfile);
   });
-  it.each([{subscriptionProfile:'pool'},{subscriptionProfile:'team5'},{apiKeyFile:'/missing-api-secret'},{maxBudgetUsd:1},{approvalCommand:'/bin/approval-helper'}])('refuses mixed routes or model-callable approval %j',changes=>{
+  it.each([{subscriptionProfile:'pool'},{subscriptionProfile:'team9'},{apiKeyFile:'/missing-api-secret'},{maxBudgetUsd:1},{approvalCommand:'/bin/approval-helper'}])('refuses mixed routes or model-callable approval %j',changes=>{
     expect(()=>readWorkerServerConfig(config(changes))).toThrow(/fixed Team profile/);
   });
   it('rejects API mode before reading any key or local service token',async()=>{

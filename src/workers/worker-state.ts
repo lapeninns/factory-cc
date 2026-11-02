@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { lstatSync, mkdirSync, openSync, closeSync, readFileSync, renameSync, writeFileSync, readdirSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import type { SubscriptionProfile } from "../runtime/desktop-jobs.js";
 
 export const WORKER_STATES = ["queued", "starting", "running", "waiting_approval", "completed", "failed", "cancelled", "unknown"] as const;
 export type WorkerState = typeof WORKER_STATES[number];
@@ -32,7 +33,7 @@ export interface WorkerRecord {
   billingEstimate?: Record<string, unknown>;
   checkEvidence: Array<{ toolUseId: string; status: "succeeded" | "failed"; commandSha256: string }>;
   authentication?: "anthropic" | "openrouter" | "subscription";
-  subscriptionProfile?: "team1" | "team2" | "team3" | "team4";
+  subscriptionProfile?: SubscriptionProfile;
 }
 
 export function privateDirectory(path: string): string {

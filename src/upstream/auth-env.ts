@@ -195,6 +195,7 @@ function inheritEnv(sourceEnv: NodeJS.ProcessEnv, bridgeListen: string): Record<
     env[key] = value;
   }
   for (const key of BRIDGE_INTERNAL_NAMES) delete env[key];
+  for (const key of Object.keys(env)) if (key.startsWith("BRIDGE_FACTORY_BINDING_")) delete env[key];
   refuseBridgeLoop(env.ANTHROPIC_BASE_URL, bridgeListen);
   return env;
 }
@@ -264,7 +265,7 @@ function assertRequirements(mode: AuthMode, sourceEnv: NodeJS.ProcessEnv, select
   }
 }
 
-const PASSTHROUGH_DENIED_PREFIXES = ["ANTHROPIC_", "CLAUDE_CODE_", "_CLAUDE_CODE_", "CCR_", "AGENT_PROXY_"] as const;
+const PASSTHROUGH_DENIED_PREFIXES = ["ANTHROPIC_", "CLAUDE_CODE_", "_CLAUDE_CODE_", "CCR_", "AGENT_PROXY_", "BRIDGE_FACTORY_BINDING_"] as const;
 const PASSTHROUGH_DENIED_EXACT = new Set<string>([
   "CLAUDE_CONFIG_DIR",
   "FALLBACK_FOR_ALL_PRIMARY_MODELS",

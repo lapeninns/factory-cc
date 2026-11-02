@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DesktopJobsRuntime, acquireDesktopJobLease, updateDesktopJobRecord, type DesktopJobAcquire, type DesktopJobBinding, type DesktopJobLease, type DesktopJobsOptions } from "../../src/runtime/desktop-jobs.js";
+import { DesktopJobsRuntime, SUBSCRIPTION_PROFILES, acquireDesktopJobLease, updateDesktopJobRecord, type DesktopJobAcquire, type DesktopJobBinding, type DesktopJobLease, type DesktopJobsOptions } from "../../src/runtime/desktop-jobs.js";
 import type { BridgeRuntime, RuntimeRequest, RuntimeTurn } from "../../src/runtime/types.js";
 
 const roots: string[] = [];
@@ -77,11 +77,11 @@ describe("Factory model-phase supervision", () => {
     expect(fixture.inner.handle).toHaveBeenCalledTimes(1);
   });
 
-  it("binds the configured subscription seat and refuses a later seat change", async () => {
-    const fixture = setup(); fixture.binding.subscriptionProfile = "team1";
+  it.each(SUBSCRIPTION_PROFILES)("binds %s and refuses a later seat change", async (profile) => {
+    const fixture = setup(); fixture.binding.subscriptionProfile = profile;
     await fixture.runtime.handle(request());
-    expect(fixture.acquire).toHaveBeenCalledWith(expect.objectContaining({ subscriptionProfile: "team1" }), expect.any(AbortSignal));
-    fixture.binding.subscriptionProfile = "team2";
+    expect(fixture.acquire).toHaveBeenCalledWith(expect.objectContaining({ subscriptionProfile: profile }), expect.any(AbortSignal));
+    fixture.binding.subscriptionProfile = profile === "team1" ? "team2" : "team1";
     await expect(fixture.runtime.handle(request())).rejects.toMatchObject({ code: "desktop_job_identity" });
     expect(fixture.inner.handle).toHaveBeenCalledTimes(1);
   });
@@ -161,21 +161,21 @@ function fakeHelper(script: string) {
 }
 
 describe("private shared-lease subprocess protocol", () => {
-  it("forwards only the fixed subscription profile and allowlisted metadata", async () => {
-    const fixture = fakeHelper(`import json,sys\na=json.loads(sys.stdin.readline())\nassert set(a)=={'op','factorySessionId','bridgeSessionId','cwd','role','subscriptionProfile'}\nassert a['subscriptionProfile']=='team1'\nprint(json.dumps({'ok':True,'event':'ready','jobId':'job-fixture'}),flush=True)\nr=json.loads(sys.stdin.readline())\nassert r['op']=='release'\nprint(json.dumps({'ok':True,'event':'released','jobId':'job-fixture'}),flush=True)\n`);
-    const request = { ...fixture.acquire, subscriptionProfile: "team1" as const, secret: "must-not-cross-protocol" };
+  it.each(SUBSCRIPTION_PROFILES)("forwards only fixed %s and allowlisted metadata", async (profile) => {
+    const fixture = fakeHelper(`import json,sys\na=json.loads(sys.stdin.readline())\nassert set(a)=={'op','factorySessionId','bridgeSessionId','cwd','role','subscriptionProfile'}\nassert a['subscriptionProfile']==${JSON.stringify(profile)}\nprint(json.dumps({'ok':True,'event':'ready','jobId':'job-fixture'}),flush=True)\nr=json.loads(sys.stdin.readline())\nassert r['op']=='release'\nprint(json.dumps({'ok':True,'event':'released','jobId':'job-fixture'}),flush=True)\n`);
+    const request = { ...fixture.acquire, subscriptionProfile: profile, secret: "must-not-cross-protocol" };
     const lease = await acquireDesktopJobLease(fixture.options, request, new AbortController().signal);
     await lease.release({ state: "completed", cleanupVerified: true });
   });
 
   it("retains the fixed subscription profile in completion updates", async () => {
-    const fixture = fakeHelper(`import json,sys\na=json.loads(sys.stdin.readline())\nassert a['op']=='update' and a['subscriptionProfile']=='team4'\nprint(json.dumps({'ok':True,'event':'updated','jobId':'job-fixture'}),flush=True)\n`);
-    await updateDesktopJobRecord(fixture.options, { ...fixture.acquire, subscriptionProfile: "team4" }, { state: "completed", cleanupVerified: true });
+    const fixture = fakeHelper(`import json,sys\na=json.loads(sys.stdin.readline())\nassert a['op']=='update' and a['subscriptionProfile']=='team8'\nprint(json.dumps({'ok':True,'event':'updated','jobId':'job-fixture'}),flush=True)\n`);
+    await updateDesktopJobRecord(fixture.options, { ...fixture.acquire, subscriptionProfile: "team8" }, { state: "completed", cleanupVerified: true });
   });
 
   it("rejects unsupported or non-string subscription profiles before launching a helper", async () => {
     const fixture = fakeHelper("raise Exception('must not run')\n");
-    for (const profile of ["team5", "", "factory-api", null, { toString: () => "team1" }]) {
+    for (const profile of ["team0", "team9", "team01", "", "factory-api", null, { toString: () => "team1" }]) {
       const request = { ...fixture.acquire, subscriptionProfile: profile } as unknown as DesktopJobAcquire;
       await expect(acquireDesktopJobLease(fixture.options, request, new AbortController().signal)).rejects.toMatchObject({ code: "desktop_job_profile" });
       await expect(updateDesktopJobRecord(fixture.options, request, { state: "completed" })).rejects.toMatchObject({ code: "desktop_job_profile" });

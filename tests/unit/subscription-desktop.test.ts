@@ -40,6 +40,14 @@ function ownedState() {
 }
 
 describe("subscription Desktop launcher", () => {
+  it.each(["team1", "team2", "team3", "team4", "team5", "team6", "team7", "team8"])("accepts the fixed %s connection", profile => {
+    const selected = args.map(value => value === "team1" ? profile : value === "factory-workers-team1___" ? `factory-workers-${profile}___` : value);
+    expect(parseSubscriptionDesktop(selected).profile).toBe(profile);
+  });
+  it.each(["team0", "team9", "pool"])("rejects unsupported %s before authentication", async profile => {
+    await expect(runSubscriptionDesktop(args.map(value => value === "team1" ? profile : value))).rejects.toThrow(/assigned Team profile/);
+    expect(prepareSubscription).not.toHaveBeenCalled();
+  });
   it("requires explicit absolute shared paths and accepts an owned primary checkout for its read-only controller", () => {
     expect(parseSubscriptionDesktop(args)).toMatchObject({ profile: "team1", runtimePath: join(root, "runtime"), stateRoot: join(root, "shared-state") });
     expect(() => parseSubscriptionDesktop(args.filter((_value, index) => ![6, 7, 8, 9].includes(index)))).toThrow(/runtime and state/);

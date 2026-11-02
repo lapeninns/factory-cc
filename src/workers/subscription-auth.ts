@@ -6,16 +6,17 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { userInfo } from "node:os";
 import { promisify } from "node:util";
 import type { NativeWorkflowSupport } from "../runtime/native-workflow-support.js";
+import { SUBSCRIPTION_PROFILES, type SubscriptionProfile } from "../runtime/desktop-jobs.js";
 
 const execute = promisify(execFile);
-const PROFILES = new Set(["team1", "team2", "team3", "team4"]);
+const PROFILES = new Set<string>(SUBSCRIPTION_PROFILES);
 const EXPECTED_CLI_VERSION = "2.1.316";
 const EXPECTED_SDK_VERSION = "0.3.300";
 const BASE_ENVIRONMENT = new Set(["PATH", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "TERM", "COLORTERM", "TZ", "LANG"]);
 const NO_API_SOURCES = new Set(["", "none", "oauth"]);
 
 export interface SubscriptionIdentity {
-  profile: "team1" | "team2" | "team3" | "team4";
+  profile: SubscriptionProfile;
   /** Private comparison data. Do not log or include in public worker views. */
   email: string;
   configDir: string;

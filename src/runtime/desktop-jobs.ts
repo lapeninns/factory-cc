@@ -5,7 +5,8 @@ import { BridgeError, type Usage } from "../types.js";
 import type { BridgeRuntime, RetiredSession, RuntimeControl, RuntimeHostEnd, RuntimeRequest, RuntimeTurn, StreamSink } from "./types.js";
 
 /** Values supplied by the authenticated host controller, never request metadata. */
-export type SubscriptionProfile = "team1" | "team2" | "team3" | "team4";
+export const SUBSCRIPTION_PROFILES = ["team1", "team2", "team3", "team4", "team5", "team6", "team7", "team8"] as const;
+export type SubscriptionProfile = typeof SUBSCRIPTION_PROFILES[number];
 export type DesktopWorkspacePolicy = "controller-readonly";
 export interface DesktopJobBinding { sessionId: string; cwd: string; launchId?: string; subscriptionProfile?: SubscriptionProfile; workspacePolicy?: DesktopWorkspacePolicy }
 export type DesktopJobState = "waiting_host" | "idle" | "completed" | "failed" | "cancelled" | "unknown";
@@ -343,13 +344,13 @@ export async function updateDesktopJobRecord(options: DesktopLeaseOptions, reque
 }
 
 function validateSubscriptionProfile(profile: unknown): void {
-  if (profile !== undefined && (typeof profile !== "string" || !["team1", "team2", "team3", "team4"].includes(profile))) {
-    throw new BridgeError(400, "desktop_job_profile", "Only fixed team1 through team4 subscription profiles are supported.");
+  if (profile !== undefined && (typeof profile !== "string" || !(SUBSCRIPTION_PROFILES as readonly string[]).includes(profile))) {
+    throw new BridgeError(400, "desktop_job_profile", "Only fixed team1 through team8 subscription profiles are supported.");
   }
 }
 
 function validateWorkspacePolicy(policy: unknown, profile: unknown, role?: unknown): void {
-  if (policy !== undefined && (policy !== "controller-readonly" || !["team1", "team2", "team3", "team4"].includes(String(profile))
+  if (policy !== undefined && (policy !== "controller-readonly" || !(SUBSCRIPTION_PROFILES as readonly string[]).includes(String(profile))
       || role === "worker" || role === "validator")) {
     throw new BridgeError(400, "desktop_workspace_policy", "Primary checkout access requires the fixed-seat read-only controller policy.");
   }

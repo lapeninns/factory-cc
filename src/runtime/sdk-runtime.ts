@@ -930,6 +930,7 @@ export class SdkRuntime implements BridgeRuntime {
     // The native worker receives its provider credential, never the host
     // controller's authority or Factory lifecycle generation.
     for (const name of ["BRIDGE_ADMIN_TOKEN", "BRIDGE_FACTORY_BINDING", "BRIDGE_FACTORY_LAUNCH_ID", "BRIDGE_LAUNCH_ID"]) delete env[name];
+    for (const name of Object.keys(env)) if (name.startsWith("BRIDGE_FACTORY_BINDING_")) delete env[name];
     // Subscription, anthropic-api and inherit need the user's own Claude config/login.
     // BYOK and cloud get an empty config dir so user settings cannot reroute them.
     if (this.config.authMode === "byok" || this.config.authMode === "cloud") {

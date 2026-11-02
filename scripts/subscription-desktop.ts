@@ -7,7 +7,7 @@ import { loadConfig } from "../src/config.js";
 import { createBridgeApp, listen } from "../src/http/app.js";
 import { createLogger } from "../src/logging.js";
 import { installShutdownHandlers } from "../src/index.js";
-import { validateDesktopJobBinding } from "../src/runtime/desktop-jobs.js";
+import { SUBSCRIPTION_PROFILES, validateDesktopJobBinding, type SubscriptionProfile } from "../src/runtime/desktop-jobs.js";
 
 export function parseSubscriptionDesktop(argv: string[]) {
   const values = new Map<string, string>(); let check = false;
@@ -18,20 +18,20 @@ export function parseSubscriptionDesktop(argv: string[]) {
     values.set(name, argv[++i]!);
   }
   const profile = values.get("--profile");
-  if (!["team1", "team2", "team3", "team4"].includes(profile ?? "")) throw new Error("Select one assigned Team profile.");
+  if (!SUBSCRIPTION_PROFILES.includes(profile as SubscriptionProfile)) throw new Error("Select one assigned Team profile.");
   const project = values.get("--project"), dataDir = values.get("--data-dir");
   if (!project || !dataDir || !isAbsolute(project) || !isAbsolute(dataDir)) throw new Error("Absolute project and private data directories are required.");
   const runtimePath = values.get("--runtime-path"), stateRoot = values.get("--state-root");
   if (!runtimePath || !stateRoot || !isAbsolute(runtimePath) || !isAbsolute(stateRoot)) throw new Error("Absolute shared runtime and state paths are required.");
   const worktree = validateDesktopJobBinding({ sessionId: "subscription-desktop-preflight", cwd: project,
-    subscriptionProfile: profile as "team1" | "team2" | "team3" | "team4", workspacePolicy: "controller-readonly" }).cwd;
+    subscriptionProfile: profile as SubscriptionProfile, workspacePolicy: "controller-readonly" }).cwd;
   const port = Number(values.get("--port") ?? 18790);
   if (!Number.isInteger(port) || port < 1024 || port > 65535 || port === 18787) throw new Error("Use a separate local validation port.");
   const workerControlFile = values.get("--worker-control"), workerMcpPrefix = values.get("--worker-mcp-prefix");
   if (!workerControlFile || !isAbsolute(workerControlFile) || !workerMcpPrefix || !/^(?:mcp__[A-Za-z0-9_]+__|[A-Za-z0-9_-]+___)$/.test(workerMcpPrefix)) {
     throw new Error("The read-only controller requires its absolute worker-control path and exact MCP namespace.");
   }
-  return { check, profile: profile as "team1" | "team2" | "team3" | "team4", project: worktree, dataDir: resolve(dataDir), runtimePath: resolve(runtimePath), stateRoot: resolve(stateRoot), port, workerControlFile, workerMcpPrefix };
+  return { check, profile: profile as SubscriptionProfile, project: worktree, dataDir: resolve(dataDir), runtimePath: resolve(runtimePath), stateRoot: resolve(stateRoot), port, workerControlFile, workerMcpPrefix };
 }
 
 function privateFile(path: string): string {

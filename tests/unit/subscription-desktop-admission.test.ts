@@ -35,6 +35,9 @@ afterEach(() => {
 });
 
 describe("fixed subscription Desktop admission", () => {
+  it("refuses a read-only controller paired with another seat's worker namespace", () => {
+    expect(() => config({ controllerReadOnly: true, workerControlFile: "/fixture/control.json", workerMcpPrefix: "factory-workers-team8___" })).toThrow(/own fixed seat/);
+  });
   it("accepts the exact installed Factory MCP namespace and rejects ambiguous prefixes", () => {
     expect(config({ workerControlFile: "/fixture/control.json", workerMcpPrefix: "factory-workers-team1___" }).workerMcpPrefix).toBe("factory-workers-team1___");
     expect(() => config({ workerControlFile: "/fixture/control.json", workerMcpPrefix: "factory-workers-team1" })).toThrow(/exact MCP namespace/);
@@ -49,10 +52,16 @@ describe("fixed subscription Desktop admission", () => {
     expect(workflowAllowed(value, undefined)).toBe(false);
   });
   it.each([
-    { subscriptionProfile: undefined }, { subscriptionProfile: "team5" as never },
+    { subscriptionProfile: undefined }, { subscriptionProfile: "team9" as never },
     { subscriptionExpectedEmail: undefined }, { subscriptionExpectedEmail: " " },
   ])("requires private fixed seat and expected identity %j", changes => {
     expect(() => config(changes)).toThrow(/private fixed Team/);
+  });
+  it.each(["team1", "team2", "team3", "team4", "team5", "team6", "team7", "team8"] as const)("accepts immutable operator-selected %s", subscriptionProfile => {
+    const value = config({ subscriptionProfile });
+    expect(value.subscriptionProfile).toBe(subscriptionProfile);
+    expect(Object.keys(value)).not.toContain("subscriptionProfile");
+    expect(() => { value.subscriptionProfile = subscriptionProfile === "team1" ? "team8" : "team1"; }).toThrow();
   });
   it("does not accept a seat or identity supplied only through environment variables", () => {
     vi.stubEnv("BRIDGE_SUBSCRIPTION_PROFILE", "team1");
