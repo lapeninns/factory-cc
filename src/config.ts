@@ -5,6 +5,7 @@ import { isIPv6 } from "node:net";
 import { resolve } from "node:path";
 import type { BridgeMode } from "./types.js";
 import { parseAuthMode, preflightAuth, type AuthMode } from "./upstream/auth-env.js";
+import { selectionFromConfig } from "./upstream/providers.js";
 import { canonicalWorkspacePath } from "./workspace.js";
 import { parseClaudePool, POOL_PROFILE, type PoolMember } from "./upstream/claude-pool.js";
 import { claudeProfileModels, modelsFromIds, parseModelIds, validateModels, type BridgeModel } from "./models.js";
@@ -13,6 +14,7 @@ export interface BridgeConfig {
   desktopProfile?: boolean;
   /** Explicit API-only native workflow mode; disabled unless opted in. */
   nativeWorkflows?: boolean;
+  workflowProvider?: "anthropic" | "openrouter";
   workflowMaxBudgetUsd?: number;
   workflowMaxMs?: number;
   host: string;
@@ -146,16 +148,25 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
   const nativeRaw = env("BRIDGE_NATIVE_WORKFLOWS");
   if (nativeRaw !== undefined && nativeRaw !== "0" && nativeRaw !== "1") throw new Error("BRIDGE_NATIVE_WORKFLOWS must be 0 or 1.");
   const nativeWorkflows = overrides.nativeWorkflows ?? nativeRaw === "1";
+  const workflowProvider = overrides.workflowProvider ?? env("BRIDGE_WORKFLOW_PROVIDER", "anthropic");
+  if (nativeWorkflows && workflowProvider !== "anthropic" && workflowProvider !== "openrouter") throw new Error("BRIDGE_WORKFLOW_PROVIDER must be anthropic or openrouter.");
+  const openrouter = nativeWorkflows && workflowProvider === "openrouter";
+  const workflowRoute = { baseUrl: overrides.upstreamBaseUrl ?? env("BRIDGE_UPSTREAM_BASE_URL"), model: overrides.upstreamModel ?? env("BRIDGE_UPSTREAM_MODEL"), tokenEnv: overrides.upstreamTokenEnv ?? env("BRIDGE_UPSTREAM_TOKEN_ENV") };
   const workflowMaxBudgetUsd = overrides.workflowMaxBudgetUsd ?? (env("BRIDGE_WORKFLOW_MAX_BUDGET_USD") === undefined ? undefined : Number(env("BRIDGE_WORKFLOW_MAX_BUDGET_USD")));
   const workflowMaxMs = overrides.workflowMaxMs ?? (env("BRIDGE_WORKFLOW_MAX_MS") === undefined ? 30 * 60_000 : Number(env("BRIDGE_WORKFLOW_MAX_MS")));
   if (nativeWorkflows) {
-    if (authMode !== "anthropic-api") throw new Error("Native workflows require BRIDGE_AUTH=anthropic-api; subscription fallback is forbidden.");
+    if (!openrouter && authMode !== "anthropic-api") throw new Error("Native workflows require BRIDGE_AUTH=anthropic-api; subscription fallback is forbidden.");
     if (overrides.claudePool?.length || overrides.claudeProfiles?.length || env("BRIDGE_CLAUDE_POOL") || env("BRIDGE_CLAUDE_PROFILES")) throw new Error("Native workflows cannot use Claude profiles or an account pool.");
     if (overrides.claudeExecutable || env("BRIDGE_CLAUDE_EXECUTABLE")) throw new Error("Native workflows cannot use a custom Claude executable.");
-    if (overrides.upstreamBaseUrl || overrides.upstreamModel || overrides.upstreamTokenEnv) throw new Error("Native workflows cannot use upstream routing overrides.");
+    if (!openrouter && (overrides.upstreamBaseUrl || overrides.upstreamModel || overrides.upstreamTokenEnv)) throw new Error("Native workflows cannot use upstream routing overrides.");
     if (!Number.isFinite(workflowMaxBudgetUsd) || workflowMaxBudgetUsd! <= 0) throw new Error("Native workflows require a positive finite BRIDGE_WORKFLOW_MAX_BUDGET_USD.");
     if (!Number.isSafeInteger(workflowMaxMs) || workflowMaxMs < 1_000 || workflowMaxMs > 2 * 60 * 60_000) throw new Error("BRIDGE_WORKFLOW_MAX_MS must be an integer from 1000 to 7200000.");
-    preflightAuth("anthropic-api", process.env);
+    if (openrouter) {
+      if (authMode !== "byok" || workflowRoute.baseUrl !== "https://openrouter.ai/api" || workflowRoute.model !== "anthropic/claude-opus-5.5" || workflowRoute.tokenEnv !== "BRIDGE_OPENROUTER_API_KEY") throw new Error("OpenRouter workflows require byok with the exact approved OpenRouter endpoint, Opus model and key variable.");
+      const conflicts = Object.keys(process.env).filter(key => process.env[key] && (/^ANTHROPIC_/.test(key) || /^CLAUDE_CODE_(?:OAUTH_TOKEN|USE_|API_BASE_URL|GATEWAY_TOKEN|SUBAGENT_MODEL|WORKFLOW_SUBAGENT_MODEL)/.test(key) || key === "BRIDGE_API_KEY_HELPER" || key === "AGENT_PROXY_AUTH_TOKEN"));
+      if (conflicts.length) throw new Error("OpenRouter workflows refuse conflicting authentication or model environment variables; values are not shown.");
+      preflightAuth("byok", process.env, selectionFromConfig(workflowRoute));
+    } else preflightAuth("anthropic-api", process.env);
   }
   const desktopProfile = overrides.desktopProfile ?? env("BRIDGE_DESKTOP") === "1";
   const claudeConfig = authMode === "claude-config" ? overrides.claudeConfig ?? readClaudeConfig(process.env, `${overrides.host ?? env("BRIDGE_HOST", "127.0.0.1")}:${overrides.port ?? intEnv("BRIDGE_PORT", 18787)}`, { requireSettings: desktopProfile && Boolean(process.env.CLAUDE_CONFIG_DIR) }) : undefined;
@@ -214,6 +225,7 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
   const config: BridgeConfig = {
     desktopProfile,
     nativeWorkflows,
+    ...(nativeWorkflows ? { workflowProvider: workflowProvider as "anthropic" | "openrouter" } : {}),
     ...(nativeWorkflows ? { workflowMaxBudgetUsd, workflowMaxMs } : {}),
     host,
     port: overrides.port ?? intEnv("BRIDGE_PORT", 18787),
@@ -251,7 +263,7 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
     upstreamBaseUrl: overrides.upstreamBaseUrl ?? env("BRIDGE_UPSTREAM_BASE_URL"),
     upstreamModel: overrides.upstreamModel ?? env("BRIDGE_UPSTREAM_MODEL"),
     upstreamTokenEnv: overrides.upstreamTokenEnv ?? env("BRIDGE_UPSTREAM_TOKEN_ENV"),
-    models: overrides.models !== undefined ? validateModels(overrides.models)
+    models: openrouter && overrides.models === undefined && !env("BRIDGE_MODELS") ? [{ id: "claude-opus-5-5", model: "anthropic/claude-opus-5.5", displayName: "Opus 5.5 via OpenRouter" }] : overrides.models !== undefined ? validateModels(overrides.models)
       : mergeModelCatalog(
         withProfiles(env("BRIDGE_MODELS") ? modelsFromIds(parseModelIds(env("BRIDGE_MODELS")!), authMode) : claudeConfig ? claudeConfigModels(claudeConfig).models : undefined,
           [...(claudeProfiles ?? []), ...(claudePool ? [{ id: POOL_PROFILE }] : [])]),
@@ -265,7 +277,8 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
   ] as const) {
     if (value === undefined || !Number.isSafeInteger(value) || value < minimum) throw new Error(`${name} must be an integer >= ${minimum}.`);
   }
-  if (nativeWorkflows && config.models?.some((model) => model.id.includes("/") || model.model.includes("/") || model.claudeProfile || model.provider === "cursor" || !/^(?:claude-[a-z0-9.-]+|opus|sonnet|haiku)$/.test(model.model))) {
+  if (openrouter && (config.models?.length !== 1 || config.models[0]?.id !== "claude-opus-5-5" || config.models[0]?.model !== "anthropic/claude-opus-5.5" || config.models[0]?.claudeProfile || config.models[0]?.provider === "cursor")) throw new Error("OpenRouter workflows require the exact approved Opus model catalog.");
+  if (nativeWorkflows && !openrouter && config.models?.some((model) => model.id.includes("/") || model.model.includes("/") || model.claudeProfile || model.provider === "cursor" || !/^(?:claude-[a-z0-9.-]+|opus|sonnet|haiku)$/.test(model.model))) {
     throw new Error("Native workflows require unprefixed Anthropic model routes, without account or Cursor selection.");
   }
   if (claudeConfig) Object.defineProperty(config, "claudeConfig", { value: claudeConfig });

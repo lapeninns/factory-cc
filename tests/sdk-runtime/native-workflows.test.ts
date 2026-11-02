@@ -3,8 +3,9 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig } from '../../src/config.js';
-import { WorkflowPermits, validateWorkflowInput, workflowAllowed } from '../../src/runtime/native-workflows.js';
+import { WorkflowPermits, validateWorkflowInput, workflowAllowed, workflowProviderAllowed } from '../../src/runtime/native-workflows.js';
 import { SdkRuntime, type SdkHandle, type SdkUserInput } from '../../src/runtime/sdk-runtime.js';
+import { MODEL_SLOT_NAMES } from '../../src/upstream/auth-env.js';
 import type { RuntimeRequest } from '../../src/runtime/types.js';
 
 vi.mock('../../src/runtime/native-workflow-support.js',()=>({assertNativeWorkflowSupport:()=>({executable:'/offline-fixture/claude'})}));
@@ -129,4 +130,47 @@ it('requires exactly one Factory approval in the launch hook even if native perm
  const approve=vi.fn(async()=>({behavior:'allow' as const}));runtime.setControl({requestApproval:approve});
  expect(await hook(fake)(input)).toMatchObject({hookSpecificOutput:{permissionDecision:'allow',updatedInput:input.tool_input}});
  expect(approve).toHaveBeenCalledTimes(1);expect(approve).toHaveBeenCalledWith(expect.objectContaining({toolName:'Workflow',toolUseId:'workflow'}));
+});
+
+const openrouterConfig = {
+ workflowProvider: 'openrouter' as const, authMode: 'byok' as const,
+ upstreamBaseUrl: 'https://openrouter.ai/api', upstreamModel: 'anthropic/claude-opus-5.5', upstreamTokenEnv: 'BRIDGE_OPENROUTER_API_KEY',
+};
+it('admits only the exact explicitly selected OpenRouter workflow contract',()=>{
+ vi.stubEnv('ANTHROPIC_API_KEY','');vi.stubEnv('BRIDGE_OPENROUTER_API_KEY','offline-openrouter-fixture');
+ const {c}=setup(new Fake(async function*(){yield success();}),openrouterConfig);
+ expect(workflowProviderAllowed(c)).toBe(true);expect(workflowAllowed(c,request().request)).toBe(true);
+ expect(workflowAllowed(c,request().request,'spec')).toBe(false);expect(workflowAllowed(c,{...request().request,tools:[]})).toBe(false);
+ for(const changed of [
+  {workflowProvider:undefined},{authMode:'anthropic-api' as const},{authMode:'subscription' as const},
+  {upstreamBaseUrl:'https://openrouter.ai.evil.invalid/api'},{upstreamBaseUrl:'https://openrouter.ai/api/'},
+  {upstreamModel:'anthropic/claude-sonnet-5.5'},{upstreamTokenEnv:'ANOTHER_API_KEY'},
+  {models:[{id:'claude-opus-5-5',model:'different-model',displayName:'test'}]},
+  {models:[{id:'claude-opus-5-5',model:'anthropic/claude-opus-5.5',displayName:'test',claudeProfile:'shared'}]},
+ ]) expect(workflowProviderAllowed({...c,...changed})).toBe(false);
+});
+it('routes OpenRouter workflows through isolated BYOK auth with every model slot pinned',async()=>{
+ vi.stubEnv('ANTHROPIC_API_KEY','');vi.stubEnv('BRIDGE_OPENROUTER_API_KEY','offline-openrouter-fixture');
+ const fake=new Fake(async function*(){yield success();});const {runtime,c}=setup(fake,openrouterConfig);
+ vi.stubEnv('CLAUDE_CODE_OAUTH_TOKEN','offline-ambient-oauth');vi.stubEnv('ANTHROPIC_AUTH_TOKEN','offline-ambient-token');
+ vi.stubEnv('CLAUDE_CONFIG_DIR','/offline/ambient-login');vi.stubEnv('CLAUDE_CODE_USE_BEDROCK','1');
+ for(const name of MODEL_SLOT_NAMES) vi.stubEnv(name,'unwanted-ambient-model');
+ await runtime.handle(request());const options=fake.calls[0].options;const env=options.env as Record<string,string>;
+ expect(options.model).toBe('anthropic/claude-opus-5.5');expect(options.effort).toBe('medium');
+ expect(options.maxBudgetUsd).toBe(1);expect(options.settings).toMatchObject({enableWorkflows:true,ultracode:true});
+ expect(env.ANTHROPIC_BASE_URL).toBe('https://openrouter.ai/api');expect(env.ANTHROPIC_API_KEY).toBe('');
+ expect(env.ANTHROPIC_AUTH_TOKEN).toBe('offline-openrouter-fixture');
+ for(const name of MODEL_SLOT_NAMES) expect(env[name]).toBe('anthropic/claude-opus-5.5');
+ for(const name of ['CLAUDE_CODE_OAUTH_TOKEN','CLAUDE_CODE_USE_BEDROCK','BRIDGE_OPENROUTER_API_KEY']) expect(env).not.toHaveProperty(name);
+ expect(env.CLAUDE_CONFIG_DIR).toBe(join(c.dataDir,'native-workflow-config'));expect(options.settingSources).toEqual([]);
+ const approve=vi.fn(async()=>({behavior:'allow' as const}));runtime.setControl({requestApproval:approve});
+ expect(await hook(fake)({tool_name:'Workflow',tool_use_id:'openrouter-workflow',tool_input:{script:"await agent('bounded')"}})).toMatchObject({hookSpecificOutput:{permissionDecision:'allow'}});
+ expect(approve).toHaveBeenCalledTimes(1);
+ expect(await hook(fake)({tool_name:'Bash',tool_input:{command:'false'}})).toMatchObject({hookSpecificOutput:{permissionDecision:'deny'}});
+});
+it('rejects a mutated BYOK workflow route before starting the SDK',async()=>{
+ vi.stubEnv('ANTHROPIC_API_KEY','');vi.stubEnv('BRIDGE_OPENROUTER_API_KEY','offline-openrouter-fixture');
+ const fake=new Fake(async function*(){yield success();});const {runtime,c}=setup(fake,openrouterConfig);
+ c.upstreamBaseUrl='https://other-provider.invalid/api';
+ await expect(runtime.handle(request())).rejects.toMatchObject({code:'workflow_provider_rejected'});expect(fake.calls).toHaveLength(0);
 });

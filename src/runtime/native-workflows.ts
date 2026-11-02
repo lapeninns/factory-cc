@@ -3,8 +3,21 @@ import type { MessagesRequest } from '../types.js';
 import { BridgeError } from '../types.js';
 import { hostAllowsAnyTools } from './native-tool-policy.js';
 
+/** Provider selection is explicit: generic BYOK routes never gain workflow authority. */
+export function workflowProviderAllowed(config: BridgeConfig): boolean {
+  if ((config.workflowProvider ?? "anthropic") === "anthropic") return config.authMode === "anthropic-api";
+  if (config.workflowProvider !== "openrouter") return false;
+  const model = config.models?.[0];
+  return config.authMode === "byok"
+    && config.upstreamBaseUrl === "https://openrouter.ai/api"
+    && config.upstreamModel === "anthropic/claude-opus-5.5"
+    && config.upstreamTokenEnv === "BRIDGE_OPENROUTER_API_KEY"
+    && config.models?.length === 1 && model?.id === "claude-opus-5-5"
+    && model.model === "anthropic/claude-opus-5.5" && model.provider !== "cursor" && !model.claudeProfile;
+}
+
 export function workflowAllowed(config: BridgeConfig, request: MessagesRequest | undefined, mode?: string): boolean {
-  return config.nativeWorkflows === true && config.authMode === 'anthropic-api' && mode !== 'spec' && hostAllowsAnyTools(request);
+  return config.nativeWorkflows === true && workflowProviderAllowed(config) && mode !== 'spec' && hostAllowsAnyTools(request);
 }
 
 /** Reject alternate script-loading and remote launch entry points. Inline script

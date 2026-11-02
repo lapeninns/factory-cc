@@ -1,4 +1,4 @@
-import { WorkflowPermits, workflowAllowed, validateWorkflowInput } from './native-workflows.js';
+import { WorkflowPermits, workflowAllowed, workflowProviderAllowed, validateWorkflowInput } from './native-workflows.js';
 import { assertNativeWorkflowSupport } from './native-workflow-support.js';
 import { DESKTOP_DISALLOWED_TOOLS, DESKTOP_APPROVAL_DENIAL, DESKTOP_READ_DENIAL } from "./desktop-policy.js";
 import { mkdirSync } from "node:fs";
@@ -817,6 +817,7 @@ export class SdkRuntime implements BridgeRuntime {
   }
 
   private async startQueryImpl(input: RuntimeRequest, live: LiveSdk): Promise<void> {
+    if (this.config.nativeWorkflows && !workflowProviderAllowed(this.config)) throw new BridgeError(400, "workflow_provider_rejected", "Native workflows require an explicitly approved provider configuration.");
     const sdk = await this.loadSdk();
     const route = live.modelRoute;
     const selection = route ? route.selection : await this.ensureSelection();

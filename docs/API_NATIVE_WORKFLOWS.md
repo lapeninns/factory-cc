@@ -6,9 +6,11 @@ and its subscription routes are not changed by building or testing this branch.
 
 ## Identity and authority
 
-- The new path requires explicit `anthropic-api` authentication and an
-  organisation-owned API credential. It must not use a member's subscription,
-  a pooled account or automatic cross-account fallback.
+- The default path requires explicit `anthropic-api` authentication and an
+  organisation-owned API credential. An explicit `openrouter` provider option
+  permits the separately approved OpenRouter API credential and exact Opus route.
+  Neither path uses a member's subscription, pooled accounts or automatic
+  cross-account fallback.
 - Run a dedicated loopback instance with its own private data directory and
   an explicit API budget. Do not reuse the current bridge's session database.
 - Factory owns the requested outcome, approval boundaries, repository tools,
@@ -28,7 +30,8 @@ Factory settings. The existing mode defaults to off.
 | Option | Meaning |
 | --- | --- |
 | `BRIDGE_NATIVE_WORKFLOWS=1` | Explicit API-backed workflow mode |
-| `BRIDGE_AUTH=anthropic-api` | Required billing/authentication path |
+| `BRIDGE_WORKFLOW_PROVIDER=anthropic` | Default provider; explicit `openrouter` enables only the approved route below |
+| `BRIDGE_AUTH=anthropic-api` | Default direct API authentication; the OpenRouter path requires `byok` |
 | `BRIDGE_WORKFLOW_MAX_BUDGET_USD` | Required finite positive SDK estimated-spend stopping threshold per query |
 | `BRIDGE_WORKFLOW_MAX_MS` | Absolute deadline from workflow launch, including tool round trips |
 | `BRIDGE_MAX_SESSIONS=1` | One root workflow session in the dedicated instance |
@@ -115,6 +118,42 @@ no server; it creates isolated state directories and an ownership marker.
 It does not prove that the key works or that billing is available. Launching
 without `--check` starts the separate service. Do not switch the live Factory
 route until the native child, permission, cancellation and budget checks pass.
+
+## Explicit OpenRouter API option
+
+The separate launcher also accepts `--provider openrouter`. It selects only
+`https://openrouter.ai/api`, model `anthropic/claude-opus-5.5`, and the dedicated
+`BRIDGE_OPENROUTER_API_KEY` variable. Its Factory-visible model ID remains
+`claude-opus-5-5`. Arbitrary BYOK providers, model substitutions and endpoint
+variations are rejected in native workflow mode. The direct Anthropic provider
+remains the default.
+
+```sh
+BRIDGE_WORKFLOW_MAX_BUDGET_USD=0.25 npm run api-workflows -- \
+  --check --provider openrouter \
+  --project /absolute/path/to/disposable-project \
+  --data-dir /absolute/path/to/new-private-openrouter-state \
+  --api-key-file /absolute/path/to/private-openrouter-key-file
+```
+
+The file value is assigned only to `BRIDGE_OPENROUTER_API_KEY`; it is not placed
+in `ANTHROPIC_API_KEY`. The existing BYOK environment builder passes the selected
+credential as bearer authentication to the selected endpoint, pins all model
+slots, and excludes subscription credentials. Conflicting direct API/OAuth
+credentials and model-routing environment variables are rejected. The native
+runtime still uses its private Claude configuration directory, the verified
+binary, medium effort, one root session, the declared budget/deadline, and host
+tool approval boundaries.
+
+State markers include the provider. Reusing an Anthropic state directory for
+OpenRouter, or vice versa, is refused; create a separate directory. Check mode
+restores the prior credential environment, including on validation failure, and
+never validates the key against a provider or makes a paid request.
+
+OpenRouter billing may use a linked upstream provider account. An OpenRouter
+credit balance alone therefore does not establish whether a request can run
+or where its cost will be charged. Any live validation must account for both
+OpenRouter and upstream provider usage within the owner's existing approval.
 
 ## Backups and rollback
 

@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { buildChildEnv } from "../../src/upstream/auth-env.js";
+import { selectionFromConfig } from "../../src/upstream/providers.js";
 import { loadConfig, type BridgeConfig } from "../../src/config.js";
 import { parseApiWorkflowArgs, runApiWorkflows } from "../../scripts/api-workflows.js";
 
@@ -90,6 +92,59 @@ describe("explicit API native workflow admission", () => {
   it("rejects non-Anthropic and prefixed upstream model values", () => {
     expect(() => cfg({ models: [{ id: "friendly", model: "gpt-5", displayName: "fixture" }] })).toThrow(/unprefixed Anthropic/);
     expect(() => cfg({ models: [{ id: "friendly", model: "team1/opus", displayName: "fixture" }] })).toThrow(/unprefixed Anthropic/);
+  });
+
+  function openrouter(overrides: Partial<BridgeConfig> = {}) {
+    vi.stubEnv("ANTHROPIC_API_KEY", undefined);
+    vi.stubEnv("BRIDGE_OPENROUTER_API_KEY", "fixture-router-key-not-sent");
+    return cfg({ workflowProvider: "openrouter", authMode: "byok", upstreamBaseUrl: "https://openrouter.ai/api", upstreamModel: "anthropic/claude-opus-5.5", upstreamTokenEnv: "BRIDGE_OPENROUTER_API_KEY", ...overrides });
+  }
+  it("pins approved OpenRouter endpoint/model/key and emits only selected API credentials", () => {
+    const c = openrouter();
+    expect(c.models).toEqual([{ id: "claude-opus-5-5", model: "anthropic/claude-opus-5.5", displayName: "Opus 5.5 via OpenRouter" }]);
+    const child = buildChildEnv("byok", process.env, selectionFromConfig({ baseUrl: c.upstreamBaseUrl, model: c.upstreamModel, tokenEnv: c.upstreamTokenEnv }));
+    expect(child.ANTHROPIC_BASE_URL).toBe("https://openrouter.ai/api");
+    expect(child.ANTHROPIC_MODEL).toBe("anthropic/claude-opus-5.5");
+    expect(child.ANTHROPIC_AUTH_TOKEN).toBe("fixture-router-key-not-sent");
+    expect(child.ANTHROPIC_API_KEY).toBe("");
+    expect(child.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    expect(child.CLAUDE_CONFIG_DIR).toBeUndefined();
+  });
+  it.each([
+    { upstreamBaseUrl: "https://openrouter.ai.evil.invalid/api" },
+    { upstreamBaseUrl: "https://openrouter.ai/api/" },
+    { upstreamModel: "anthropic/claude-sonnet-4" },
+    { upstreamTokenEnv: "ANOTHER_ROUTER_KEY" },
+    { authMode: "anthropic-api" as const },
+    { models: [{ id: "alias", model: "anthropic/claude-opus-5.5", displayName: "fixture" }] },
+  ])("rejects OpenRouter route drift %j", (overrides) => { expect(() => openrouter(overrides)).toThrow(/exact approved|OpenRouter workflows/); });
+  it("keeps direct Anthropic as default and rejects provider ambiguity", () => {
+    expect(cfg().workflowProvider).toBe("anthropic");
+    vi.stubEnv("BRIDGE_WORKFLOW_PROVIDER", "arbitrary"); expect(() => cfg()).toThrow(/anthropic or openrouter/);
+    vi.stubEnv("BRIDGE_WORKFLOW_PROVIDER", "openrouter"); expect(() => cfg()).toThrow(/OpenRouter workflows/);
+  });
+  it("refuses conflicting OAuth, direct API keys and missing router keys", () => {
+    openrouter(); vi.stubEnv("ANTHROPIC_API_KEY", "direct-api-secret");
+    expect(() => cfg({ workflowProvider: "openrouter", authMode: "byok", upstreamBaseUrl: "https://openrouter.ai/api", upstreamModel: "anthropic/claude-opus-5.5", upstreamTokenEnv: "BRIDGE_OPENROUTER_API_KEY" })).toThrow(/conflicting/);
+    vi.stubEnv("ANTHROPIC_API_KEY", undefined); vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "never-print-secret"); expect(() => openrouter()).toThrow(/conflicting/);
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", undefined); vi.stubEnv("ANTHROPIC_AUTH_TOKEN", "never-print-secret"); expect(() => openrouter()).toThrow(/conflicting/);
+    vi.stubEnv("ANTHROPIC_AUTH_TOKEN", undefined); vi.stubEnv("BRIDGE_OPENROUTER_API_KEY", undefined);
+    expect(() => cfg({ workflowProvider: "openrouter", authMode: "byok", upstreamBaseUrl: "https://openrouter.ai/api", upstreamModel: "anthropic/claude-opus-5.5", upstreamTokenEnv: "BRIDGE_OPENROUTER_API_KEY" })).toThrow(/missing or empty/);
+  });
+  it("OpenRouter check reads only its private file and restores its credential environment", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", undefined);
+    vi.stubEnv("BRIDGE_OPENROUTER_API_KEY", undefined);
+    const project = mkdtempSync(join(tmpdir(), "router-file-project-")); dirs.push(project);
+    const dataDir = project + "-state"; dirs.push(dataDir);
+    const keyFile = join(project, "api-key"); writeFileSync(keyFile, "router-secret-never-sent", { mode: 0o600 });
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await runApiWorkflows(["--check", "--provider", "openrouter", "--project", project, "--data-dir", dataDir, "--api-key-file", keyFile]);
+      expect(process.env.ANTHROPIC_API_KEY).toBeUndefined(); expect(process.env.BRIDGE_OPENROUTER_API_KEY).toBeUndefined();
+      expect(JSON.parse(log.mock.calls[0]![0]).provider).toBe("openrouter");
+      expect(JSON.stringify(log.mock.calls)).not.toContain("router-secret");
+      await expect(runApiWorkflows(["--check", "--project", project, "--data-dir", dataDir, "--api-key-file", keyFile])).rejects.toThrow(/another target/);
+    } finally { log.mockRestore(); }
   });
 
 });
