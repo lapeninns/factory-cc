@@ -12,6 +12,8 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "build:workers": "tsc -p tsconfig.workers.json",
+    "typecheck": "tsc --noEmit --pretty false",
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
     "doctor": "tsx scripts/doctor.ts",
@@ -22,6 +24,7 @@
     "run-droid": "tsx scripts/run-droid.ts",
     "local": "tsx scripts/local.ts",
     "test": "vitest run",
+    "test:native": "cd native-runtime && PYTHONPATH=. PYTHONDONTWRITEBYTECODE=1 python3 -W error::ResourceWarning -m unittest discover -s tests -v",
     "test:unit": "vitest run tests/unit",
     "test:protocol": "vitest run tests/protocol",
     "test:sdk-probes": "vitest run tests/sdk-probes",

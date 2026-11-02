@@ -1,84 +1,163 @@
-# Factory Workstream controller with isolated workers
+# Factory Workstream controllers and supervised workers
 
-This is the selected integration architecture. Factory's built-in Workstream
-agents currently inherit the orchestrator's directory. The controller instead
-delegates independent implementation tasks to the `factory-workers` MCP server.
-Each supervised worker gets its own native session, Git branch and worktree.
-Progress and final results return through the Workstream's tool calls; these
-workers are not entries in Factory's built-in Agents list.
+Factory remains the controller. Independent tasks run through the
+`factory_worker_start` MCP tool in separate Git worktrees, and progress, pending
+permissions and results return to the originating Workstream. These workers do
+not appear in Factory's built-in Agents list. Ordinary folders can be used for
+controller operations when the explicit host-tools policy is enabled.
 
-## Execution path
+## Connection choices
 
-1. Start a Workstream in Factory Desktop and describe the outcome normally.
-2. The shared controller instructions select `factory_worker_start` for
-   independent implementation. The configured repository allowlist is checked.
-3. The service creates a worktree from committed source, preserving dirty source
-   edits. It starts the official Claude Agent SDK with an unmodified pinned
-   Claude binary, Opus 5.5, medium effort and Ultracode.
-4. Workers share the two-slot admission limit with the existing native job
-   runtime. The controller uses status/wait/list/cancel tools to manage them.
-5. Results, reported usage and observed command outcomes return to the Workstream.
-   An exit code or successful command is not proof of acceptance or deployment.
+| Connection | Account selection | Workspace policy |
+| --- | --- | --- |
+| Fixed subscription controller | One configured `team1`–`team8` seat | Read-only controller; its own worker namespace |
+| Subscription pool controller | Eight preflighted accounts, weighted selection for new sessions | Pool workers; optional approved host operations |
+| Legacy desktop bridge | Existing `claude-config` profiles and optional weighted pool | Legacy tool bridge and lifecycle compatibility |
+| Explicit API workers | Direct Anthropic or OpenRouter credentials | Separate opt-in provider configuration |
 
-The `implement`, `investigate` and `release-prepare` guides and shared team policy
-are loaded into the worker preset. Production operations retain their required
-user authority. No member-account rotation or subscription fallback is used.
+The subscription entrypoints reject API keys, API budgets and shell approval
+helpers in subscription worker configuration. There is no automatic fallback
+from a subscription to a paid API route. Each selected account is checked through
+the official CLI and again through SDK account information before its first
+prompt. Private mappings bind profile names to expected account identities and
+separate Claude configuration directories.
 
-## Configuration and readiness
+The pooled controller currently assigns weights of 5 to `team1`–`team4` and 1 to
+`team5`–`team8`. Worker-pool weights are specified in its private configuration.
+These are scheduling preferences, not measurements of plan allowances. Pooling
+does not grant additional account rights; operators must establish permission
+and provider eligibility for every configured account.
 
-The shared daemon starts with `node workers-dist/scripts/factory-workers.js
---serve --config /absolute/private/worker-config.json`. Factory's stdio MCP entry
-uses the same command without `--serve`; it connects to the shared loopback
-daemon. Separate Workstreams do not create competing worker-service owners.
-The config must be a private regular file
-owned by the operator. It contains paths, provider selection, the repository
-allowlist, finite execution limits and an API-key **file path**, never a key
-copied into Factory's MCP JSON. `--check` validates configuration without a model
-request. `enabled` and `approvalGuardVerified` must remain false until the actual
-provider and Desktop permission checks below pass.
+## Execution and recovery
 
-The provider is either direct `anthropic` or the explicitly selected
-`openrouter` route. API credits, key validity and prompt limits must be verified
-for that provider. `maxBudgetUsd` is an SDK estimate checked after requests;
-it is not a hard shared billing cap. The existing US$1 validation permission
-does not authorise an unlimited production spend policy.
+1. A Factory lifecycle hook binds the Workstream to its real workspace and
+   controller connection. An exact worker MCP namespace prevents crossing into
+   another connection.
+2. The controller delegates an independent task. A fixed connection uses its
+   own seat; a pool selects a healthy configured worker backend. An uncertain
+   start is retained for reconciliation instead of automatically replayed.
+3. The worker creates a new Git branch and linked worktree from committed
+   source, leaving dirty changes in the original checkout in place. It runs the
+   official Claude Agent SDK with Opus 5.5, medium effort and Ultracode.
+4. The Python lease helper shares admission with standalone native jobs:
+   at most two active jobs in total and one active job per subscription seat.
+   Paused model phases release capacity as appropriate; an outstanding host
+   operation or uncertain cleanup retains its lease.
+5. The pooled connection scopes status, wait, list and cancel calls to the
+   owning Workstream. Fixed-seat connections share their seat service's worker
+   ledger. A worker remains pinned to its selected backend. New work can use
+   other healthy seats; a partially executed worker is not migrated.
 
-## Pending permissions
+A limited pooled controller can change accounts only after the previous native
+process has been cleaned up and there is no unsafe pending tool action. The
+replacement starts from reference history; it does not resume another account's
+native session. Permanent workspace and policy failures return 400/422 instead
+of a retryable 503. Existing eligible idle or pre-inference failed sessions can
+recover their trusted lifecycle binding; pending, ended and cancelled sessions
+are not eligible for that recovery.
 
-The service uses native permission checks and keeps permission requests pending
-under unique single-use IDs. It does not expose an MCP approval tool. Pending
-actions include their tool, redacted input and an action digest. A separate
-local decision command can deliver a matching decision; its use must be guarded
-by a verified Factory `ask` command rule before activation.
+## Folder and repository policies
 
-**This is an activation gate, not a claim of a proved human-authority boundary.**
-The installed Factory MCP client does not support elicitation forms, and a
-PreToolUse hook's `ask` output is not verified to force confirmation in this
-version. The live test must show allow and deny behaviour at the actual autonomy
-level and check alternate invocation routes. A private control token or a
-configuration boolean alone is not proof. Keep workers disabled if this test
-does not establish the required boundary; do not silently auto-approve requests.
+The fixed-seat controller defaults to `controller-readonly`, which requires a
+Git checkout and blocks host mutations. The pool can explicitly enable
+`--host-tools` with `--controller-pool --worker-pool`. That policy accepts an
+existing canonical directory owned by the operator, including a non-Git folder.
+Factory Execute, Create and Edit actions then require an exact native AskUser
+decision before dispatch. Native direct writes, native Bash, built-in agent
+spawning and unrelated MCP tools remain blocked in this controller path.
 
-The alternative direct-model bridge has an independently tested synthetic
-Factory AskUser path for its own native Workflow permission. That path is opt-in
-and is not evidence that MCP worker decisions have the same protection.
+Workers default to an explicit repository allowlist. Subscription workers can
+instead opt into `"repositoryPolicy": "owned-git"`: each request must identify
+a canonical, owned, non-bare Git repository with a commit. This supports new
+repositories without editing an allowlist. A plain directory is not a worker
+repository. Native scheduling rejects conflicting parent/child host workspaces
+and worker worktrees while retaining conservative cleanup accounting.
 
-## Acceptance before activation
+## Source package and build
 
-- Two worker tasks create different worktrees; the source checkout stays intact.
-- Queue admission is shared with native jobs, and a cancelled queued task makes
-  no model request.
-- The intended provider, model, medium effort and native workflow are observed.
-- Workflow permissions cannot bypass the broker merely because the native engine
-  classifies a tool as safe. Child failure and pending background work cannot
-  become successful parent completion.
-- Factory Desktop displays progress/results and the real permission decisions.
-- Cancellation closes only owned work and retains capacity when cleanup is
-  uncertain. Missing or expired approval never grants permission.
-- Usage is deduplicated; source revision, observed checks and unknowns are shown.
-- Reopen the Workstream and verify the intended configuration loads without a
-  terminal command. Existing unrelated Workstreams are not modified.
+The accompanying [native runtime](../native-runtime/README.md) is included in
+this repository. It supplies the lease helper, standalone native launchers,
+shared workflow instructions, recovery commands and deterministic Python tests.
+The standalone native launchers cover `team1`–`team4`; Factory lease accounting
+supports all eight seats.
 
-The current source is a candidate until this acceptance is recorded. Keep the
-working bridge, Team launchers and backups intact. No binary patch, login-token
-copying, automatic top-up or silent provider fallback is part of this design.
+```sh
+npm ci
+npm run typecheck
+npm run build
+npm run build:workers
+npm test -- --configLoader runner --no-cache
+npm run test:native
+```
+
+Use an absolute `nativeRuntimePath` (worker config) or `--runtime-path`
+(controller) pointing to `<checkout>/native-runtime`, or to an immutable release
+created from that directory. Keep source and installed releases separate. The
+native release installer takes `native-runtime` as its source root, not the
+top-level bridge directory.
+
+## Private configuration and startup
+
+Provision the official CLI login for each intended seat separately. The default
+mapping is `~/.factory/config/native-ultracode-profiles.json`, a private regular
+file owned by the operator. Its `profiles` object maps `team1`–`team8` to `email`
+and absolute `configDir` fields. Do not commit the mapping, OAuth state or private
+runtime configuration. The current compatibility pins are Claude Code 2.1.316
+and Agent SDK 0.3.300; other versions fail preflight until separately validated.
+
+Each fixed worker service has a private config with `provider: "subscription"`,
+its exact `subscriptionProfile`, `stateRoot`, `workspaceRoot`, `nativeRuntimePath`,
+`sharedStateRoot`, `clientTokenFile`, `port`, finite `maxMs`/`maxTurns`, and
+`allowedRepositories`. `repositoryPolicy` defaults to `allowlist`; select
+`owned-git` explicitly if appropriate. Start with `enabled: false` and
+`approvalGuardVerified: false` until authentication and actual Desktop
+permission handling have been validated.
+
+```sh
+node workers-dist/scripts/subscription-workers.js --check --config /absolute/private/team1.json
+node workers-dist/scripts/subscription-workers.js --serve --config /absolute/private/team1.json
+```
+
+Factory's stdio MCP entry uses the same command without `--serve`. It connects to
+the existing loopback service rather than creating another worker owner. A
+pooled MCP service uses `subscription-pool.js` with a separate private config:
+`version: 1`, `enabled`, `stateRoot`, `port`, `clientTokenFile`, and eight `seats`
+entries containing distinct `profile`, `weight` and fixed-worker `configFile`.
+
+The subscription controller entrypoint is
+`workers-dist/scripts/subscription-desktop.js`. Required options are `--profile`,
+`--project`, `--data-dir`, `--port`, `--runtime-path`, `--state-root`,
+`--worker-control`, and `--worker-mcp-prefix`. A fixed connection uses the exact
+namespace `factory-workers-teamN___`; the pool uses `factory-workers-pool___`
+and `--worker-pool --controller-pool`. Add `--host-tools` only for the approved
+folder-operation policy. `--check` performs preflight without a model request.
+
+These are service entrypoints, not an automatic installer for global Factory
+settings, lifecycle hooks, launch agents or account logins. Deployment must wire
+the matching private tokens, hook bindings, model connection and MCP namespace
+without replacing unrelated settings. The legacy `npm run desktop -- install`
+command remains the installer for the separate legacy bridge.
+
+## Validation boundaries
+
+Automated checks cover account and namespace isolation, protocol and approval
+contracts, workspace policies, capacity sharing, cancellation, uncertain-start
+handling, quota recovery and the actual TypeScript-to-Python lease protocol.
+They use fixtures and do not spend API credit or subscription allowance.
+
+The development installation was also exercised in Factory Desktop: an existing
+Workstream in a non-Git home folder completed an approved read-only command; a
+worker read a newly created repository outside the old allowlist; and an older
+Git Workstream recovered its binding and completed a read. These observations
+apply to that installation and do not establish every account's entitlement or
+every future CLI version's behavior. Native macOS Desktop is not a browser/mobile
+journey; no browser/mobile e2e runner coverage is claimed for it.
+
+Before enabling another installation, verify actual allow and deny behavior,
+worker isolation, results, cancellation and reopening in that Desktop version.
+A configuration boolean or passing mock test alone is not proof of the human
+approval boundary. Keep worker starts disabled until that check succeeds.
+Successful command execution is not acceptance, a merge or a deployment.
+
+Optional API-native workflow configuration is documented separately in
+[API_NATIVE_WORKFLOWS.md](API_NATIVE_WORKFLOWS.md).
