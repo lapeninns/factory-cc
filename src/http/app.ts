@@ -65,7 +65,8 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     ...DEFAULT_SESSION_RETENTION, maxRecords: config.sessionMaxRecords ?? 1000, maxAgeMs: config.sessionRetentionMs ?? DEFAULT_SESSION_RETENTION.maxAgeMs,
   });
   // Approvals wait on a person, so they get their own limit rather than the turn's idle limit.
-  const control = new ControlBroker(runtime, store, config.approvalTimeoutMs, { desktopLifecycle: config.desktopLifecycle });
+  const control = new ControlBroker(runtime, store, config.approvalTimeoutMs, { desktopLifecycle: config.desktopLifecycle,
+    ignoreUnknownSessionMarkers: config.ignoreUnknownSessionMarkers });
   runtime.setControl?.(control);
   const records: RedactedRequestRecord[] = [];
   let authFailureCount = 0;

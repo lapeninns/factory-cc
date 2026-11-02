@@ -40,7 +40,9 @@ export class ControlBroker implements RuntimeControl {
   private closed = false;
 
   constructor(private readonly runtime: BridgeRuntime, private readonly store: SessionStore, private readonly approvalTimeoutMs: number,
-    private readonly options: { desktopLifecycle?: boolean } = {}) {}
+    private readonly options: { desktopLifecycle?: boolean; ignoreUnknownSessionMarkers?: boolean } = {}) {
+    if (options.desktopLifecycle && options.ignoreUnknownSessionMarkers) throw new Error("Desktop lifecycle cannot ignore unknown session markers.");
+  }
 
   requestApproval(request: RuntimeApprovalRequest): Promise<RuntimePermissionDecision> {
     if (this.closed || request.signal.aborted) return Promise.resolve({ behavior: "deny", message: "The native permission request has ended." });
@@ -116,9 +118,11 @@ export class ControlBroker implements RuntimeControl {
     const request = structuredClone(original);
     const found = new Set<HostBinding>();
     let markers = 0;
+    let recognizedMarkers = 0;
     const clean = (text: string): string => text.replace(/\[factory-cc-session:([a-f0-9]{64})\]/g, (marker, token: string) => {
       markers += 1;
       const host = this.tokens.get(token);
+      if (host) recognizedMarkers += 1;
       if (host && !host.ended) found.add(host);
       return "";
     });
@@ -140,7 +144,9 @@ export class ControlBroker implements RuntimeControl {
         ? [] : [{ ...message, content }];
     });
     if (found.size > 1) throw new BridgeError(409, "ambiguous_host_binding", "Multiple live Factory session markers in this request.");
-    if (markers > 0 && found.size === 0) throw new BridgeError(409, "stale_host_binding", "This Factory session has ended or its generation is no longer registered.");
+    if (markers > 0 && found.size === 0 && (!this.options.ignoreUnknownSessionMarkers || recognizedMarkers > 0)) {
+      throw new BridgeError(409, "stale_host_binding", "This Factory session has ended or its generation is no longer registered.");
+    }
     const host = [...found][0];
     if (host && host.cwd !== canonicalWorkspacePath(cwd)) throw new BridgeError(409, "host_workspace_mismatch", "Factory hook and native workspace differ.");
     return { request, binding: host?.token };
@@ -412,7 +418,8 @@ export class ControlBroker implements RuntimeControl {
   }
 
   describe(): ObjectValue {
-    return { pendingApprovals: this.approvals.size, failures: [...this.failures], activeHostSessions: [...this.hosts.values()].filter((host) => !host.ended).length, boundNativeSessions: [...this.hosts.values()].filter((host) => !host.ended).reduce((n, host) => n + host.bridgeSessions.size, 0) };
+    return { ignoreUnknownSessionMarkers: this.options.ignoreUnknownSessionMarkers === true,
+      pendingApprovals: this.approvals.size, failures: [...this.failures], activeHostSessions: [...this.hosts.values()].filter((host) => !host.ended).length, boundNativeSessions: [...this.hosts.values()].filter((host) => !host.ended).reduce((n, host) => n + host.bridgeSessions.size, 0) };
   }
 }
 

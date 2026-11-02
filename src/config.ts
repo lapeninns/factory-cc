@@ -16,6 +16,8 @@ export interface BridgeConfig {
   /** Explicit lifecycle/job integration; does not alter legacy desktop requests. */
   desktopJobs?: boolean;
   desktopLifecycle?: boolean;
+  /** Opt-in compatibility for legacy unbound claude-config requests only. */
+  ignoreUnknownSessionMarkers?: boolean;
   desktopRuntimePath?: string;
   desktopStateRoot?: string;
   desktopWorkflow?: "implement" | "investigate" | "release-prepare";
@@ -187,6 +189,13 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
   const desktopProfile = overrides.desktopProfile ?? env("BRIDGE_DESKTOP") === "1";
   const desktopJobs = overrides.desktopJobs ?? env("BRIDGE_DESKTOP_JOBS") === "1";
   const desktopLifecycle = overrides.desktopLifecycle ?? env("BRIDGE_DESKTOP_LIFECYCLE") === "1";
+  const ignoreMarkersRaw = env("BRIDGE_IGNORE_UNKNOWN_SESSION_MARKERS");
+  if (ignoreMarkersRaw !== undefined && !["0", "1"].includes(ignoreMarkersRaw)) throw new Error("BRIDGE_IGNORE_UNKNOWN_SESSION_MARKERS must be 0 or 1.");
+  if (overrides.ignoreUnknownSessionMarkers !== undefined && typeof overrides.ignoreUnknownSessionMarkers !== "boolean") throw new Error("Unknown session marker compatibility must be a boolean.");
+  const ignoreUnknownSessionMarkers = overrides.ignoreUnknownSessionMarkers ?? ignoreMarkersRaw === "1";
+  if (ignoreUnknownSessionMarkers && (authMode !== "claude-config" || desktopJobs || desktopLifecycle)) {
+    throw new Error("Unknown session marker compatibility is restricted to legacy claude-config bridges without Desktop lifecycle or jobs.");
+  }
   const desktopRuntimePath = overrides.desktopRuntimePath ?? env("BRIDGE_DESKTOP_RUNTIME_PATH");
   const desktopStateRoot = overrides.desktopStateRoot ?? env("BRIDGE_DESKTOP_STATE_ROOT");
   const desktopWorkflow = overrides.desktopWorkflow ?? env("BRIDGE_DESKTOP_WORKFLOW", "implement");
@@ -280,7 +289,7 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
   if (desktopProfile && (permissionMode !== "ask" || !isLoopbackHost(host))) throw new Error("Desktop profile requires ask permissions and loopback binding.");
   const config: BridgeConfig = {
     desktopProfile,
-    desktopJobs, desktopLifecycle, desktopRuntimePath, desktopStateRoot,
+    desktopJobs, desktopLifecycle, ignoreUnknownSessionMarkers, desktopRuntimePath, desktopStateRoot,
     desktopWorkflow: desktopWorkflow as BridgeConfig["desktopWorkflow"],
     workerControlFile, workerMcpPrefix,
     nativeWorkflows,
