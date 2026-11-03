@@ -12,7 +12,8 @@ import { buildChildEnv, MODEL_SLOT_NAMES } from "../upstream/auth-env.js";
 import type { UpstreamSelection } from "../upstream/providers.js";
 import { redactJson, redactValue } from "../security/redact.js";
 import type { Logger } from "../logging.js";
-import type { Usage } from "../types.js";
+import { BridgeError, type Usage } from "../types.js";
+import { WorkerStartRejected, type WorkerStartRejectionCode } from "./start-rejection.js";
 import { privateDirectory, readWorkers, workerId, writeWorker, type WorkerRecord, type WorkerWorkflow } from "./worker-state.js";
 import { prepareSubscription, verifyNativeSubscription, type SubscriptionIdentity } from "./subscription-auth.js";
 import type { SubscriptionProfile } from "../runtime/desktop-jobs.js";
@@ -156,7 +157,7 @@ export class APIWorkerService {
   }
 
   start(input: { repository: string; task: string; workflow: WorkerWorkflow }): Promise<WorkerView> {
-    if (this.closed) return Promise.reject(new Error("Worker service is closed."));
+    if (this.closed) return Promise.reject(new WorkerStartRejected("service_unavailable", "Worker service is closed."));
     const creating = this.startImpl(input);
     this.creating.add(creating);
     void creating.finally(() => this.creating.delete(creating)).catch(() => undefined);
@@ -164,31 +165,46 @@ export class APIWorkerService {
   }
 
   private async startImpl(input: { repository: string; task: string; workflow: WorkerWorkflow }): Promise<WorkerView> {
-    if (typeof input.task !== "string" || !input.task.trim() || input.task.length > 100_000) throw new Error("A bounded nonempty worker task is required.");
-    if (!["implement", "investigate", "release-prepare"].includes(input.workflow)) throw new Error("Unknown worker workflow.");
-    const repository = canonicalRepository(input.repository, this.repositoryPolicy === "owned-git");
-    if (this.repositoryPolicy === "allowlist" && !this.repositories.has(repository)) throw new Error("Repository is not in the worker allowlist.");
-    if (this.repositoryPolicy === "allowlist") await this.prepareRuntime();
-    if (this.repositoryPolicy === "owned-git") {
-      const marker = lstatSync(join(repository, ".git"));
-      if ((!marker.isDirectory() && !marker.isFile()) || marker.isSymbolicLink() || marker.uid !== process.getuid?.()) {
-        throw new Error("Owned Git repository metadata is required.");
+    let repository: string, sourceCommit: string, sourceDirty: boolean;
+    let rejectionCode: WorkerStartRejectionCode = "invalid_request";
+    try {
+      if (typeof input.task !== "string" || !input.task.trim() || input.task.length > 100_000) throw new Error("A bounded nonempty worker task is required.");
+      if (!["implement", "investigate", "release-prepare"].includes(input.workflow)) throw new Error("Unknown worker workflow.");
+      rejectionCode = "repository_rejected";
+      repository = canonicalRepository(input.repository, this.repositoryPolicy === "owned-git");
+      if (this.repositoryPolicy === "allowlist" && !this.repositories.has(repository)) throw new Error("Repository is not in the worker allowlist.");
+      if (this.repositoryPolicy === "allowlist") {
+        rejectionCode = this.options.provider.kind === "subscription" ? "subscription_preflight_failed" : "runtime_unverified";
+        await this.prepareRuntime();
+        rejectionCode = "repository_rejected";
       }
-      if (await git(repository, ["rev-parse", "--is-bare-repository"]) !== "false") throw new Error("Use a non-bare Git repository.");
-      const gitDir = realpathSync(await git(repository, ["rev-parse", "--absolute-git-dir"]));
-      const gitInfo = lstatSync(gitDir);
-      if (!gitInfo.isDirectory() || gitInfo.uid !== process.getuid?.()) throw new Error("Owned Git repository metadata is required.");
+      if (this.repositoryPolicy === "owned-git") {
+        const marker = lstatSync(join(repository, ".git"));
+        if ((!marker.isDirectory() && !marker.isFile()) || marker.isSymbolicLink() || marker.uid !== process.getuid?.()) {
+          throw new Error("Owned Git repository metadata is required.");
+        }
+        if (await git(repository, ["rev-parse", "--is-bare-repository"]) !== "false") throw new Error("Use a non-bare Git repository.");
+        const gitDir = realpathSync(await git(repository, ["rev-parse", "--absolute-git-dir"]));
+        const gitInfo = lstatSync(gitDir);
+        if (!gitInfo.isDirectory() || gitInfo.uid !== process.getuid?.()) throw new Error("Owned Git repository metadata is required.");
+      }
+      const sourceRoot = await git(repository, ["rev-parse", "--show-toplevel"]);
+      if (realpathSync(sourceRoot) !== repository) throw new Error("Use the repository root.");
+      sourceCommit = await git(repository, ["rev-parse", "--verify", "HEAD^{commit}"]);
+      if (!/^[a-f0-9]{40,64}$/.test(sourceCommit)) throw new Error("An exact committed source revision is required.");
+      sourceDirty = Boolean(await git(repository, ["status", "--porcelain", "--untracked-files=normal"]));
+      if (this.repositoryPolicy === "owned-git") {
+        rejectionCode = this.options.provider.kind === "subscription" ? "subscription_preflight_failed" : "runtime_unverified";
+        await this.prepareRuntime();
+        rejectionCode = "repository_rejected";
+        canonicalRepository(repository, true);
+      }
+      if (this.closed) throw new WorkerStartRejected("service_unavailable", "Worker service is closed.");
+    } catch (error) {
+      if (error instanceof WorkerStartRejected) throw error;
+      if (error instanceof BridgeError && error.code === "workflow_runtime_unverified") rejectionCode = "runtime_unverified";
+      throw new WorkerStartRejected(rejectionCode, error instanceof Error ? error.message : undefined);
     }
-    const sourceRoot = await git(repository, ["rev-parse", "--show-toplevel"]);
-    if (realpathSync(sourceRoot) !== repository) throw new Error("Use the repository root.");
-    const sourceCommit = await git(repository, ["rev-parse", "--verify", "HEAD^{commit}"]);
-    if (!/^[a-f0-9]{40,64}$/.test(sourceCommit)) throw new Error("An exact committed source revision is required.");
-    const sourceDirty = Boolean(await git(repository, ["status", "--porcelain", "--untracked-files=normal"]));
-    if (this.repositoryPolicy === "owned-git") {
-      await this.prepareRuntime();
-      canonicalRepository(repository, true);
-    }
-    if (this.closed) throw new Error("Worker service is closed.");
     const id = "worker-" + randomUUID(), worktree = join(this.workspaces, id), branch = "factory-workers/" + id;
     await git(repository, ["worktree", "add", "-b", branch, worktree, sourceCommit]);
     const timestamp = now();

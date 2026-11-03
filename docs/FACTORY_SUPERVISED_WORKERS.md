@@ -28,6 +28,11 @@ These are scheduling preferences, not measurements of plan allowances. Pooling
 does not grant additional account rights; operators must establish permission
 and provider eligibility for every configured account.
 
+The supervised worker path is an explicit connection choice. Keep the legacy
+connection as the normal Workstream default until an installed release has
+completed worker launch, execution, result collection and recovery checks.
+Selecting this path does not establish a throughput improvement over legacy.
+
 ## Execution and recovery
 
 1. A Factory lifecycle hook binds the Workstream to its real workspace and
@@ -36,6 +41,10 @@ and provider eligibility for every configured account.
 2. The controller delegates an independent task. A fixed connection uses its
    own seat; a pool selects a healthy configured worker backend. An uncertain
    start is retained for reconciliation instead of automatically replayed.
+   A confirmed rejection before workspace creation returns a failed result
+   with a bounded reason code and `retrySafe: true`. A missing response or an
+   error after workspace creation remains uncertain. Neither case retries
+   automatically.
 3. The worker creates a new Git branch and linked worktree from committed
    source, leaving dirty changes in the original checkout in place. It runs the
    official Claude Agent SDK with Opus 5.5, medium effort and Ultracode.
@@ -108,8 +117,12 @@ Provision the official CLI login for each intended seat separately. The default
 mapping is `~/.factory/config/native-ultracode-profiles.json`, a private regular
 file owned by the operator. Its `profiles` object maps `team1`–`team8` to `email`
 and absolute `configDir` fields. Do not commit the mapping, OAuth state or private
-runtime configuration. The current compatibility pins are Claude Code 2.1.316
-and Agent SDK 0.3.300; other versions fail preflight until separately validated.
+runtime configuration. Authentication uses the version-specific official CLI
+at `~/.local/share/claude/versions/2.1.316`. Updating the ordinary
+`~/.local/bin/claude` launcher does not change that selection. The pinned
+installation must remain available. The native workflow executable is verified
+separately against the Agent SDK 0.3.300 bundled CLI 2.1.300 and its recorded
+digest. Other versions require separate validation.
 
 Each fixed worker service has a private config with `provider: "subscription"`,
 its exact `subscriptionProfile`, `stateRoot`, `workspaceRoot`, `nativeRuntimePath`,

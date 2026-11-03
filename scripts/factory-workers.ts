@@ -11,6 +11,7 @@ import { startWorkerControl } from "../src/workers/control.js";
 import { acquireDesktopJobLease, updateDesktopJobRecord, SUBSCRIPTION_PROFILES, type SubscriptionProfile } from "../src/runtime/desktop-jobs.js";
 import { startWorkerMcp } from "../src/workers/http.js";
 import { prepareSubscription } from "../src/workers/subscription-auth.js";
+import { WorkerStartRejected } from "../src/workers/start-rejection.js";
 
 export interface WorkerServerConfig {
   enabled: boolean;
@@ -110,7 +111,10 @@ export async function runFactoryWorkers(argv = process.argv.slice(2), options: {
   let service: APIWorkerService;
   const guarded = {
     start: (input: Parameters<APIWorkerService["start"]>[0]) => {
-      if (!config.enabled || !config.approvalGuardVerified || (config.provider === "subscription" ? !subscriptionLoginVerified : !key)) throw new Error("Workers remain disabled until authentication and Factory approval verification complete.");
+      if (!config.enabled || !config.approvalGuardVerified) throw new WorkerStartRejected("service_unavailable");
+      if (config.provider === "subscription" ? !subscriptionLoginVerified : !key) {
+        throw new WorkerStartRejected(config.provider === "subscription" ? "subscription_preflight_failed" : "service_unavailable");
+      }
       return service.start(input);
     },
     status: (id: string) => service.status(id), list: () => service.list(), cancel: (id: string) => service.cancel(id),

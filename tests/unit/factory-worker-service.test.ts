@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { APIWorkerService, type APIWorkerServiceOptions, type WorkerRunContext } from "../../src/workers/service.js";
+import { BridgeError } from "../../src/types.js";
+import { WorkerStartRejected } from "../../src/workers/start-rejection.js";
 import { startWorkerControl } from "../../src/workers/control.js";
 import { decideWorkerApproval, readPendingWorkerApprovals } from "../../src/runtime/worker-permission-client.js";
 
@@ -36,6 +38,25 @@ describe("Factory supervised API workers", () => {
       run: async (context) => success(context), ...changes });
     services.push(result); return result;
   }
+  it("classifies read-only preflight rejection before creating a worktree", async () => {
+    const runtime = service({ verifyRuntime: () => { throw new BridgeError(503, "workflow_runtime_unverified", "private runtime detail"); } });
+    await expect(runtime.start({ repository: repo, task: "fixture", workflow: "investigate" })).rejects.toMatchObject({ code: "runtime_unverified" });
+    expect(runtime.list()).toEqual([]);
+    expect(readdirSync(join(folder, "workspaces"))).toEqual([]);
+    const blocked = service();
+    await blocked.close();
+    await expect(blocked.start({ repository: repo, task: "fixture", workflow: "investigate" })).rejects.toMatchObject({ code: "service_unavailable" });
+  });
+
+  it("keeps a failure after worktree creation begins outside the preflight classification", async () => {
+    const runtime = service();
+    writeFileSync(join(repo, ".git", "worktrees"), "fixture obstruction");
+    const error = await runtime.start({ repository: repo, task: "fixture", workflow: "investigate" }).catch(error => error);
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(WorkerStartRejected);
+    expect(runtime.list()).toEqual([]);
+  });
+
   it("uses distinct worktrees, preserves dirty source and secrets, and records only observed evidence", async () => {
     writeFileSync(join(repo, "file.txt"), "dirty original\n");
     writeFileSync(join(repo, ".env"), "FIXTURE_SECRET=not-for-worker\n");

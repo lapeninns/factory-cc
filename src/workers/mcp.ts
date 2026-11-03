@@ -2,6 +2,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { createHash } from "node:crypto";
 import { approvalSummary } from "./control.js";
+import { WorkerStartRejected } from "./start-rejection.js";
 
 export interface WorkerController {
   start(input: { repository: string; task: string; workflow: "implement" | "investigate" | "release-prepare" }): Promise<unknown>;
@@ -51,7 +52,12 @@ export function createWorkerMcp(controller: WorkerController, options: { approva
       if (request.params.name === "factory_worker_start") {
         const workflow = args.workflow ?? "implement";
         if (!["implement", "investigate", "release-prepare"].includes(String(workflow))) throw new Error("Unknown workflow.");
-        result = await controller.start({ repository: string(args.repository), task: string(args.task), workflow: workflow as "implement" | "investigate" | "release-prepare" });
+        const input = { repository: string(args.repository), task: string(args.task), workflow: workflow as "implement" | "investigate" | "release-prepare" };
+        try { result = await controller.start(input); }
+        catch (error) {
+          if (!(error instanceof WorkerStartRejected)) throw error;
+          return { isError: true, content: [{ type: "text", text: JSON.stringify({ type: "worker_start_rejected", code: error.code, executionStarted: false }) }] };
+        }
       } else if (request.params.name === "factory_worker_status") result = controller.status(string(args.id));
       else if (request.params.name === "factory_worker_list") result = controller.list();
       else if (request.params.name === "factory_worker_cancel") result = await controller.cancel(string(args.id));

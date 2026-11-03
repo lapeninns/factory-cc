@@ -7,10 +7,12 @@ import { SUBSCRIPTION_PROFILES } from "../../src/runtime/desktop-jobs.js";
 import { serveWorkerMcp } from "../../src/workers/http.js";
 import { startWorkerControl, approvalDigest, approvalSummary } from "../../src/workers/control.js";
 import { createPoolBackends, SubscriptionWorkerPool, type PoolConfig } from "../../src/workers/pool.js";
+import { WorkerStartRejected } from "../../src/workers/start-rejection.js";
 
 it("routes through actual SDK MCP clients into eight fake fixed worker services and their private approval endpoint", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "pool-backend-")));
   const close: Array<() => Promise<void>> = [], starts: string[] = [], decisions: unknown[] = [];
+  let failure: "preflight" | "generic" | "serialization" | "false-proof" | undefined;
   const config: PoolConfig = { version: 1, enabled: true, port: 65530, stateRoot: join(root, "pool"),
     clientTokenFile: join(root, "pool-token"), seats: [] };
   const approval = { id: "fixture-action", toolName: "Bash", input: { command: "printf fixture" } };
@@ -20,6 +22,10 @@ it("routes through actual SDK MCP clients into eight fake fixed worker services 
       const workers = new Map<string, Record<string, unknown>>(), token = String(index + 1).repeat(64);
       const controller = {
         start: async () => {
+          if (failure === "preflight") throw new WorkerStartRejected("subscription_preflight_failed", "private account detail");
+          if (failure === "generic") throw new Error("private uncertain failure");
+          if (failure === "serialization") return { toJSON: () => { throw new WorkerStartRejected("runtime_unverified"); } };
+          if (failure === "false-proof") return { type: "worker_start_rejected", code: "runtime_unverified", executionStarted: false };
           starts.push(profile);
           const worker = { id: "worker-" + randomUUID(), state: "waiting_approval", subscriptionProfile: profile, approvals: [approval] };
           workers.set(worker.id, worker); return worker;
@@ -57,6 +63,19 @@ it("routes through actual SDK MCP clients into eight fake fixed worker services 
     expect(decisions[0]).toMatchObject({ profile: "team1", input: { approvalId: approval.id, decision: "allow" } });
     expect((decisions[0] as { input: { id: string } }).input.id).not.toBe(publicIds[0]);
     expect((await pool.cancel(scope, publicIds[1]!)).state).toBe("cancelled");
+    failure = "preflight";
+    const rejected = await pool.start(scope, { repository: "/fixture/repo", task: "Rejected before execution", workflow: "investigate" });
+    expect(rejected).toMatchObject({ state: "failed", subscriptionProfile: "team1", errorCode: "subscription_preflight_failed", executionStarted: false, retrySafe: true });
+    expect(JSON.stringify(rejected)).not.toContain("private");
+    const restored = new SubscriptionWorkerPool(config.stateRoot, backends);
+    expect(await restored.status(scope, String(rejected.id))).toEqual(rejected);
+    for (const kind of ["generic", "serialization", "false-proof"] as const) {
+      failure = kind;
+      const uncertain = await restored.start(scope, { repository: "/fixture/repo", task: "Uncertain fixture", workflow: "investigate" });
+      expect(uncertain.state).toBe("unknown");
+      expect(uncertain.retrySafe).toBeUndefined();
+    }
+    expect(starts).toHaveLength(8);
   } finally {
     for (const finish of close.reverse()) await finish();
     rmSync(root, { recursive: true, force: true });

@@ -8,6 +8,7 @@ import { decideWorkerApproval, readPendingWorkerApprovals, type PendingWorkerApp
 import { approvalDigest, approvalSummary } from "./control.js";
 import { MAX_WORKER_APPROVAL_SUMMARY_CHARS } from "./approval.js";
 import { privateDirectory } from "./worker-state.js";
+import { isWorkerStartRejection, isWorkerStartRejectionCode, workerStartRejectionReason, type WorkerStartRejectionCode } from "./start-rejection.js";
 
 export interface PoolSeatConfig { profile: SubscriptionProfile; weight: number; configFile: string }
 export interface PoolConfig { version: 1; enabled: boolean; stateRoot: string; port: number; clientTokenFile: string; seats: PoolSeatConfig[] }
@@ -27,6 +28,7 @@ interface PoolRoute {
   id: string; ownerHash: string; profile: SubscriptionProfile; backendId?: string;
   phase: "dispatching" | "attached" | "unknown"; createdAt: string; updatedAt: string; requestDigest: string;
   cooldownApplied?: boolean;
+  rejectionCode?: WorkerStartRejectionCode;
 }
 interface PoolState {
   version: 1;
@@ -117,9 +119,16 @@ export function createPoolBackends(config: PoolConfig): PoolBackend[] {
           }), { signal, timeout: 5000 });
           const timeout = name === "factory_worker_start" ? 90_000 : name === "factory_worker_cancel" ? 45_000 : name === "factory_worker_wait" ? 25_000 : 10_000;
           const response = await client.callTool({ name, arguments: args }, undefined, { signal, timeout });
-          if (response.isError || !Array.isArray(response.content) || response.content.length !== 1 || response.content[0]?.type !== "text"
+          if (!Array.isArray(response.content) || response.content.length !== 1 || response.content[0]?.type !== "text"
               || typeof response.content[0].text !== "string" || response.content[0].text.length > 2 * 1024 * 1024) throw new Error();
-          return JSON.parse(response.content[0].text);
+          const value: unknown = JSON.parse(response.content[0].text);
+          if (response.isError) {
+            if (name === "factory_worker_start" && isWorkerStartRejection(value)) return value;
+            throw new Error();
+          }
+          // A rejection must come from the fixed service's explicit error path.
+          if (isWorkerStartRejection(value)) throw new Error();
+          return value;
         } catch { throw new Error("Fixed subscription worker operation was not confirmed."); }
         finally { await client.close().catch(() => {}); }
       },
@@ -154,7 +163,8 @@ export class SubscriptionWorkerPool {
             || !["dispatching", "attached", "unknown"].includes(String(route.phase)) || !hex(route.requestDigest)
             || typeof route.createdAt !== "string" || typeof route.updatedAt !== "string"
             || (route.cooldownApplied !== undefined && typeof route.cooldownApplied !== "boolean")
-            || (route.phase === "attached" ? !validWorker(route.backendId) : route.backendId !== undefined)) throw new Error("Invalid pool route record.");
+            || (route.phase === "attached" ? !validWorker(route.backendId) : route.backendId !== undefined)
+            || (route.rejectionCode !== undefined && (route.phase !== "unknown" || !isWorkerStartRejectionCode(route.rejectionCode)))) throw new Error("Invalid pool route record.");
         ids.add(route.id);
       }
       for (const [key, counter] of Object.entries(value.current)) if (!this.backends.has(key as SubscriptionProfile) || typeof counter !== "number" || !Number.isSafeInteger(counter)) throw new Error("Invalid pool scheduler state.");
@@ -187,6 +197,11 @@ export class SubscriptionWorkerPool {
     return { id: route.id, state: "unknown", subscriptionProfile: route.profile, createdAt: route.createdAt,
       reason: "Worker start delivery was not confirmed. Do not retry automatically; inspect the assigned fixed-seat service before starting replacement work.",
       cleanupVerified: null, pendingApprovalCount: 0, approvals: [], poolRoute: "pinned" };
+  }
+  private rejected(route: PoolRoute): Record<string, unknown> {
+    return { id: route.id, state: "failed", subscriptionProfile: route.profile, createdAt: route.createdAt,
+      endedAt: route.updatedAt, reason: workerStartRejectionReason(route.rejectionCode!), errorCode: route.rejectionCode,
+      executionStarted: false, retrySafe: true, cleanupVerified: true, pendingApprovalCount: 0, approvals: [], poolRoute: "pinned" };
   }
   private view(route: PoolRoute, value: unknown): Record<string, unknown> {
     if (!object(value) || value.id !== route.backendId || (value.subscriptionProfile !== undefined && value.subscriptionProfile !== route.profile)) throw new Error("Fixed worker identity did not match its pinned route.");
@@ -243,18 +258,24 @@ export class SubscriptionWorkerPool {
     } finally { release(); }
     try {
       const result = await backend.call("factory_worker_start", input as unknown as Record<string, unknown>, signal);
+      if (isWorkerStartRejection(result)) {
+        route.phase = "unknown"; route.rejectionCode = result.code; route.updatedAt = new Date(this.now()).toISOString(); this.save();
+        return this.rejected(route);
+      }
+      if (object(result) && result.type === "worker_start_rejected") throw new Error("Malformed worker rejection.");
       if (!object(result) || !validWorker(result.id) || (result.subscriptionProfile !== undefined && result.subscriptionProfile !== backend.profile)) throw new Error("Unconfirmed worker identity.");
       if (this.state.routes.some(item => item !== route && item.profile === backend.profile && item.backendId === result.id)) throw new Error("Worker was already routed to another request.");
       route.backendId = result.id; route.phase = "attached"; route.updatedAt = new Date(this.now()).toISOString(); this.save();
       return this.view(route, result);
     } catch {
       // Do not move to a new account, even if the exception was a connection timeout.
-      route.phase = "unknown"; delete route.backendId; route.updatedAt = new Date(this.now()).toISOString(); this.save();
+      route.phase = "unknown"; delete route.backendId; delete route.rejectionCode; route.updatedAt = new Date(this.now()).toISOString(); this.save();
       return this.unknown(route);
     }
   }
   async status(scope: string, id: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
     const route = this.route(id, scope);
+    if (route.rejectionCode !== undefined) return this.rejected(route);
     if (route.phase !== "attached") return this.unknown(route);
     return this.view(route, await this.backends.get(route.profile)!.call("factory_worker_status", { id: route.backendId! }, signal));
   }
@@ -267,6 +288,7 @@ export class SubscriptionWorkerPool {
   }
   async cancel(scope: string, id: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
     const route = this.route(id, scope);
+    if (route.rejectionCode !== undefined) return this.rejected(route);
     if (route.phase !== "attached") return this.unknown(route);
     return this.view(route, await this.backends.get(route.profile)!.call("factory_worker_cancel", { id: route.backendId! }, signal));
   }

@@ -114,6 +114,44 @@ describe("subscription worker pool routing", () => {
     expect(f.calls).toHaveLength(1);
   });
 
+  it("persists confirmed rejection without contacting the backend again or retrying", async () => {
+    const f = fixture(), path = root();
+    f.backends[0]!.call = async (name, args) => {
+      f.calls.push({ profile: "team1", name, args });
+      return { type: "worker_start_rejected", code: "subscription_preflight_failed", executionStarted: false };
+    };
+    const pool = new SubscriptionWorkerPool(path, f.backends), item = await pool.start(scopeA, input);
+    expect(item).toMatchObject({ state: "failed", errorCode: "subscription_preflight_failed", executionStarted: false, retrySafe: true, cleanupVerified: true });
+    expect(String(item.reason)).toContain("pinned authentication runtime");
+    const restored = new SubscriptionWorkerPool(path, f.backends);
+    expect(await restored.status(scopeA, String(item.id))).toEqual(item);
+    expect(await restored.cancel(scopeA, String(item.id))).toEqual(item);
+    expect((await restored.list(scopeA))[0]).toEqual(item);
+    expect(f.calls).toHaveLength(1);
+    expect(JSON.parse(readFileSync(join(path, "pool-state.json"), "utf8")).routes[0]).toMatchObject({ phase: "unknown", rejectionCode: "subscription_preflight_failed" });
+  });
+
+  it.each([
+    { type: "worker_start_rejected", code: "subscription_preflight_failed", executionStarted: true },
+    { type: "worker_start_rejected", code: "unknown_private_error", executionStarted: false },
+    { type: "worker_start_rejected", code: "subscription_preflight_failed", executionStarted: false, id: "worker-" + randomUUID() },
+  ])("keeps malformed rejection proof uncertain", async rejection => {
+    const f = fixture(); f.backends[0]!.call = async () => rejection;
+    const item = await new SubscriptionWorkerPool(root(), f.backends).start(scopeA, input);
+    expect(item.state).toBe("unknown");
+    expect(item.executionStarted).toBeUndefined();
+    expect(item.retrySafe).toBeUndefined();
+  });
+
+  it("rejects persisted rejection records with contradictory execution identity", async () => {
+    const f = fixture(), path = root(), pool = new SubscriptionWorkerPool(path, f.backends);
+    await pool.start(scopeA, input);
+    const file = join(path, "pool-state.json"), saved = JSON.parse(readFileSync(file, "utf8"));
+    saved.routes[0].phase = "unknown"; saved.routes[0].rejectionCode = "runtime_unverified";
+    writeFileSync(file, JSON.stringify(saved), { mode: 0o600 });
+    expect(() => new SubscriptionWorkerPool(path, f.backends)).toThrow("Invalid pool route");
+  });
+
   it("recovers interrupted dispatch records as unknown without sending a start", async () => {
     const f = fixture(), path = root(), pool = new SubscriptionWorkerPool(path, f.backends);
     const item = await pool.start(scopeA, input);
