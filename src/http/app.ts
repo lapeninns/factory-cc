@@ -9,7 +9,7 @@ import { parseMessagesRequest } from "../protocol/validate.js";
 import { apiError } from "../protocol/messages.js";
 import { explicitSessionId, historyMessageHashes, historyPrefixHash, resolveSession, roleFromHeaders, sessionContextHash } from "../sessions/correlate.js";
 import { droidReasoningLevel } from "../runtime/reasoning.js";
-import { isEnded } from "../sessions/state.js";
+import { isEnded, type SessionRecord } from "../sessions/state.js";
 import { HUMAN_WAIT_TOOLS, MISSION_SPAWN_TOOLS, MISSION_WORKER_END_TOOL } from "../runtime/mission-tools.js";
 import { compactedSummaryText, lastSummarizedToolCall, sameToolInput, summaryQuote } from "../sessions/compaction.js";
 import { hostAllowsAnyTools } from "../runtime/native-tool-policy.js";
@@ -26,7 +26,10 @@ import { statusPageHtml } from "./status-page.js";
 import { messageId } from "../protocol/messages.js";
 import { ControlBroker } from "../control/broker.js";
 import { controlPageHtml, controlPageHeaders } from "./control-page.js";
-import { configuredModels, providerFromModelId, resolveRequestModel, type ModelProvider } from "../models.js";
+import { configuredModels, providerFromModelId, resolveRequestModel, type BridgeModel, type ModelProvider } from "../models.js";
+import { ClaudePool, PERSONAL_ACCOUNT, POOL_PROFILE } from "../upstream/claude-pool.js";
+import { DesktopJobsRuntime, type DesktopJobBinding } from "../runtime/desktop-jobs.js";
+import type { RuntimeRequest } from "../runtime/types.js";
 
 export interface BridgeApp {
   server: Server;
@@ -49,15 +52,84 @@ function listenUrl(host: string, port: number): string {
   return `http://${formatListenHost(host)}:${port}`;
 }
 
+/** Only persisted, privately selected controller identities reach the lease. */
+export function controllerJobBinding(config: BridgeConfig, input: RuntimeRequest): DesktopJobBinding | undefined {
+  if (!input.factorySession?.desktopLifecycle) return undefined;
+  let profile = config.subscriptionProfile;
+  if (config.controllerPool) {
+    const selected = config.subscriptionAccounts?.find(account => account.profile === input.session.claudeAccount);
+    if (!selected || !Number.isSafeInteger(input.session.nativeGeneration) || input.session.nativeGeneration! < 0
+        || input.session.nativeGeneration! > 1_000_000) {
+      throw new BridgeError(503, "subscription_pool_unassigned", "The native controller has no valid selected subscription generation.");
+    }
+    profile = selected.profile;
+  }
+  return {
+    sessionId: input.factorySession.sessionId, cwd: input.factorySession.cwd, launchId: input.factorySession.launchId,
+    ...(profile === undefined ? {} : { subscriptionProfile: profile }),
+    ...(config.controllerReadOnly ? { workspacePolicy: config.controllerHostTools ? "controller-host" as const : "controller-readonly" as const } : {}),
+    ...(config.controllerPool ? { nativeGeneration: input.session.nativeGeneration } : {}),
+  };
+}
+
+/** Existing native checkpoints cannot inherit newly enabled host capabilities.
+ * A controlled restart may migrate an idle persisted conversation to a fresh
+ * generation, importing its supplied history without replaying callbacks. */
+export async function prepareControllerWorkspaceMigration(config: BridgeConfig, session: SessionRecord,
+  runtime: BridgeRuntime): Promise<Partial<SessionRecord> | undefined> {
+  if (!config.controllerHostTools || session.controllerWorkspacePolicy === "controller-host") return undefined;
+  if (session.controllerWorkspacePolicy !== undefined && session.controllerWorkspacePolicy !== "controller-readonly") {
+    throw new BridgeError(422, "controller_workspace_policy_invalid", "This session has an unsupported workspace capability.");
+  }
+  const unsafe = (): boolean => !["IDLE", "FAILED"].includes(session.state) || session.pendingToolIds.length > 0
+    || Boolean(session.endedToolIds?.length) || session.cancelRequested || session.hostEnded !== undefined
+    || runtime.isSessionUsable?.(session.bridgeSessionId) !== false
+    || Boolean(runtime.pendingHostCalls?.(session.bridgeSessionId).length)
+    || Boolean(runtime.protectedSessionIds?.().includes(session.bridgeSessionId));
+  if (unsafe()) throw new BridgeError(409, "controller_workspace_migration_busy", "Finish or safely restart this Workstream before enabling host operations; pending work cannot be migrated.");
+  const generation = (session.nativeGeneration ?? 0) + 1;
+  if (!Number.isSafeInteger(generation) || generation < 1 || generation > 1_000_000) {
+    throw new BridgeError(422, "native_generation_exhausted", "Start a new Workstream after its native generation limit.");
+  }
+  await runtime.forget?.(session);
+  if (unsafe()) throw new BridgeError(409, "controller_workspace_migration_busy", "This Workstream became active while preparing its workspace capability change.");
+  return { controllerWorkspacePolicy: "controller-host", nativeGeneration: generation, sdkSessionId: undefined,
+    retryableRequestHash: undefined, state: "IDLE" };
+}
+
 export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath: string, runtime: BridgeRuntime = createRuntime(config, logger, canaryPath)): BridgeApp {
+  if (config.desktopJobs) runtime = new DesktopJobsRuntime(runtime, {
+    pythonExecutable: "/usr/bin/python3", runtimePackagePath: config.desktopRuntimePath!,
+    stateRoot: config.desktopStateRoot!, maxRunning: 2,
+    getBinding: (input) => controllerJobBinding(config, input),
+  });
   const store = new SessionStore(join(config.dataDir, "sessions"), config.persistSessions, config.maxSessions, logger, {
     ...DEFAULT_SESSION_RETENTION, maxRecords: config.sessionMaxRecords ?? 1000, maxAgeMs: config.sessionRetentionMs ?? DEFAULT_SESSION_RETENTION.maxAgeMs,
   });
   // Approvals wait on a person, so they get their own limit rather than the turn's idle limit.
-  const control = new ControlBroker(runtime, store, config.approvalTimeoutMs);
+  const control = new ControlBroker(runtime, store, config.approvalTimeoutMs, { desktopLifecycle: config.desktopLifecycle,
+    ignoreUnknownSessionMarkers: config.ignoreUnknownSessionMarkers, restoreIdleDesktopBindings: config.controllerHostTools });
   runtime.setControl?.(control);
   const records: RedactedRequestRecord[] = [];
   let authFailureCount = 0;
+  const claudePool = config.controllerPool
+    ? new ClaudePool((config.subscriptionAccounts ?? []).map(account => ({ id: account.profile, weight: account.weight })))
+    : config.claudePool ? new ClaudePool(config.claudePool) : undefined;
+  /** Pool entries always take a pool account. Other Claude entries keep their own account unless it is sitting out a limit. */
+  const claudeAccountFor = (listed: BridgeModel | undefined): string | undefined => {
+    if (!claudePool || listed?.provider === "cursor") return undefined;
+    if (config.controllerPool) {
+      const states = claudePool.status();
+      if (!states.length || states.every(account => claudePool.isCooling(account.id))) {
+        const earliest = Math.min(...states.map(account => Date.parse(account.coolingUntil ?? "")));
+        throw new BridgeError(429, "rate_limit_error", "All configured controller accounts are cooling; retry after the earliest recovery.",
+          { retry_after: Math.max(1, Math.ceil((earliest - Date.now()) / 1000)), usage_limit: true });
+      }
+      return claudePool.pick();
+    }
+    const own = listed?.claudeProfile ?? PERSONAL_ACCOUNT;
+    return own === POOL_PROFILE || claudePool.isCooling(own) ? claudePool.pick() : undefined;
+  };
   let indexTimer: ReturnType<typeof setTimeout> | undefined;
   let indexDirty = false;
   mkdirSync(config.logDir, { recursive: true });
@@ -371,13 +443,15 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     const role = roleFromHeaders(headers);
     const cwd = resolveRequestCwd(headers, parsed, config);
     const prepared = control.prepareRequest(parsed, cwd);
+    const factorySession = control.hostIdentity(prepared.binding);
+    if (config.desktopJobs && !factorySession?.desktopLifecycle) throw new BridgeError(409, "desktop_binding_required", "Start this session with the configured Factory Desktop lifecycle hooks before using the supervised model.");
     const request = prepared.request;
     const listed = configuredModels(config).find((model) => model.id === request.model);
     const provider: ModelProvider = listed?.provider ?? providerFromModelId(request.model);
     // Before this conversation takes a slot, free the one it replaces.
     releaseCompacted(request);
     const summarized = summarizedSession(request);
-    const contextHash = sessionContextHash(headers, request, cwd, provider);
+    const contextHash = sessionContextHash(headers, request, cwd, provider, listed?.claudeProfile);
     const incomingHashes = historyMessageHashes(request.messages);
     const requestFingerprint = createHash("sha256").update(JSON.stringify({ request, role, cwd, provider, contextHash, host: control.hostSessionId(prepared.binding) ?? null })).digest("hex");
     const explicit = explicitSessionId(headers, request);
@@ -385,14 +459,22 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       && session.retryableRequestHash === requestFingerprint && (!explicit || session.bridgeSessionId === explicit || session.droidSessionId === explicit));
     if (retries.length > 1) throw new BridgeError(409, "ambiguous_session", "Multiple failed requests match; supply X-Bridge-Session");
     const resolved = retries[0] ? { match: retries[0], reason: "upstream-retry" } : resolveSession(store.list(), headers, request, {
-      cwd, hostSessionId: control.hostSessionId(prepared.binding), allowModelSwitch: config.models !== undefined, provider,
+      cwd, hostSessionId: control.hostSessionId(prepared.binding), allowModelSwitch: config.models !== undefined, provider, claudeProfile: listed?.claudeProfile,
       // Droid desktop has no conversation ID header or hooks to disambiguate.
       continueIdenticalTranscripts: config.desktopProfile,
     });
+    const retryNeedsAccount = config.controllerPool && resolved.reason === "upstream-retry"
+      && resolved.match?.claudeAccount && claudePool?.isCooling(resolved.match.claudeAccount);
+    const claudeAccount = !resolved.match || retryNeedsAccount ? claudeAccountFor(listed) : undefined;
+    if (resolved.match && claudeAccount) store.update(resolved.match.bridgeSessionId, { claudeAccount });
+    if (claudeAccount) logger.info("claude_account_assigned", { model: request.model, account: claudeAccount });
     const session = resolved.match
       ?? withSlot(() => store.create({
         role,
         model: request.model,
+        ...(claudeAccount ? { claudeAccount } : {}),
+        ...(config.controllerPool ? { nativeGeneration: 0 } : {}),
+        ...(config.controllerReadOnly ? { controllerWorkspacePolicy: config.controllerHostTools ? "controller-host" as const : "controller-readonly" as const } : {}),
         ...(provider === "cursor" ? { provider } : {}),
         droidSessionId: explicitSessionId(headers, request),
         historyHash: historyPrefixHash(request),
@@ -406,13 +488,16 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     if (activeRequests.has(sessionId)) {
       throw new BridgeError(409, "session_busy", "another request is already running for this session");
     }
-    if (isEnded(session)) {
-      throw new BridgeError(409, "session_unavailable", "this session has ended; start a new session");
-    }
     const owner = Symbol(sessionId);
-    const previous = structuredClone(session);
+    let previous = structuredClone(session);
+    let workspaceMigrated = false;
     activeRequests.set(sessionId, owner);
     try {
+      if (resolved.match) {
+        const migration = await prepareControllerWorkspaceMigration(config, session, runtime);
+        if (migration) { store.update(sessionId, migration); workspaceMigrated = true; previous = structuredClone(session); }
+      }
+      if (isEnded(session)) throw new BridgeError(409, "session_unavailable", "this session has ended; start a new session");
       // The state write can be refused (session limit); the binding cannot be
       // undone. So write the state first and bind last, and if only the bind is
       // refused give the session back exactly as it was.
@@ -533,7 +618,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
 
       const turn: RuntimeTurn = await Promise.race([
         interrupted,
-        runtime.handle({ request, role, session, headers, ...(resolved.reason === "upstream-retry" ? { recovery: "cold-import" as const } : {}) }, sink),
+        runtime.handle({ request, role, session, headers, ...(factorySession ? { factorySession } : {}), ...(resolved.reason === "upstream-retry" || workspaceMigrated ? { recovery: "cold-import" as const } : {}) }, sink),
       ]);
       if (cancellationRequested || store.get(sessionId)?.cancelRequested) {
         throw new BridgeError(499, "cancelled", "session cancelled");
@@ -574,12 +659,50 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         && !cancellationRequested && current && !current.cancelRequested && current.hostEnded === undefined
         && (current.state === "GENERATING" || current.state === "RESUMING")
         && (previous.historyMessageHashes ?? []).every((hash, index) => incomingHashes[index] === hash);
+      // A limited account sits out its cooldown; the conversation continues on another account.
+      const limitedAccount = claudePool && error instanceof BridgeError && error.code === "rate_limit_error" && current && provider !== "cursor"
+        ? current.claudeAccount ?? listed?.claudeProfile ?? PERSONAL_ACCOUNT : undefined;
+      if (limitedAccount && limitedAccount !== POOL_PROFILE) {
+        const retryAfter = typeof (error as BridgeError).extra.retry_after === "number" ? (error as BridgeError).extra.retry_after as number : undefined;
+        const seconds = Math.max(60, retryAfter ?? ((error as BridgeError).extra.usage_limit ? 3600 : 60));
+        claudePool!.cool(limitedAccount, seconds);
+        logger.warn("claude_account_cooling", { sessionId, account: limitedAccount, seconds, usageLimit: (error as BridgeError).extra.usage_limit === true });
+      }
       if (retryableUpstream) {
-        await runtime.cancel(sessionId, "upstream-backoff").catch(() => logger.error("runtime_cancel_failed", { sessionId, reason: "upstream-backoff" }));
-        if (!current.cancelRequested && current.hostEnded === undefined && activeRequests.get(sessionId) === owner
+        let retired = true;
+        try {
+          if (config.controllerPool) {
+            if (!runtime.prepareColdRetry) throw new Error("Verified native retry is unavailable");
+            await runtime.prepareColdRetry(sessionId);
+          } else await runtime.cancel(sessionId, "upstream-backoff");
+        } catch {
+          logger.error("runtime_cancel_failed", { sessionId, reason: "upstream-backoff" });
+          if (config.controllerPool) retired = false;
+        }
+        if (retired && !current.cancelRequested && current.hostEnded === undefined && activeRequests.get(sessionId) === owner
             && (current.state === "GENERATING" || current.state === "RESUMING")) {
-          store.update(sessionId, { pendingToolIds: [], sdkSessionId: undefined, retryableRequestHash: requestFingerprint });
-          store.setState(sessionId, "IDLE");
+          // The retry imports this conversation's history, so it can start on a different account.
+          let next: string | undefined;
+          try { next = limitedAccount ? claudeAccountFor(listed) : undefined; }
+          catch (coolingError) { error = coolingError; }
+          const nextAccount = next && !claudePool!.isCooling(next) ? next : undefined;
+          const nextGeneration = (current.nativeGeneration ?? 0) + 1;
+          if (config.controllerPool && nextGeneration > 1_000_000) {
+            store.setState(sessionId, "FAILED");
+            error = new BridgeError(503, "native_generation_exhausted", "Start a new Workstream after its native generation limit.");
+          } else {
+            store.update(sessionId, { pendingToolIds: [], sdkSessionId: undefined, retryableRequestHash: requestFingerprint,
+              ...(config.controllerPool ? { nativeGeneration: nextGeneration } : {}), ...(nextAccount ? { claudeAccount: nextAccount } : {}) });
+            store.setState(sessionId, "IDLE");
+            if (nextAccount) {
+              logger.info("claude_account_failover", { sessionId, from: limitedAccount, to: nextAccount });
+              // Another account is ready now: ask Droid to retry at once instead of waiting out this account's limit.
+              error = new BridgeError(429, "rate_limit_error", `Claude account ${limitedAccount} hit its limit; retry continues on ${nextAccount}.`, { retry_after: 1, retry_from_history: true });
+            }
+          }
+        } else if (!retired) {
+          store.setState(sessionId, "FAILED");
+          error = new BridgeError(503, "native_cleanup_incomplete", "The old native generation could not be verified stopped; account failover was refused.");
         }
       } else if (recoverableSwitch || rejectedInput) {
         if (!cancellationRequested && current && !current.cancelRequested && current.hostEnded === undefined
@@ -711,6 +834,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
 
   function runtimeStatus(): Record<string, unknown> {
     return { ...runtime.describe?.(), control: control.describe(), authFailureCount, activeRequests: activeRequests.size,
+      ...(config.controllerPool ? { controllerPool: { enabled: true, accounts: claudePool!.status() } } : {}),
       retainedSessions: store.list().length, workerEndTimers: workerEndTimers.size, compactionLinks: compactions.size,
       memory: { rss: process.memoryUsage().rss, heapUsed: process.memoryUsage().heapUsed }, closing };
   }

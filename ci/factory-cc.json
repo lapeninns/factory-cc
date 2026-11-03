@@ -1,0 +1,22 @@
+{
+  "repo": "lapeninns/factory-cc",
+  "account": "lapeninns",
+  "defaultBranch": "main",
+  "node": "24",
+  "install": "npm ci",
+  "env": {},
+  "watch": false,
+  "vercel": false,
+  "jobs": [
+    { "name": "typecheck", "run": "npm run typecheck" },
+    { "name": "build", "run": "npm run build" },
+    { "name": "build-workers", "run": "npm run build:workers" },
+    { "name": "test", "run": "npm test -- --configLoader runner --no-cache", "timeoutMin": 30 },
+    { "name": "test-native", "run": "npm run test:native", "timeoutMin": 15 },
+    { "name": "gate", "type": "gate", "needs": ["typecheck", "build", "build-workers", "test", "test-native"] }
+  ],
+  "notRunLocally": [
+    "Live Claude subscription/model probes require explicit execution scope and do not run in this deterministic CI profile.",
+    "Native macOS Factory Desktop journeys are validated separately; this packaging change has no applicable browser/mobile e2e journey."
+  ]
+}

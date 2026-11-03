@@ -21,6 +21,8 @@ export interface BridgeModel {
   provider?: ModelProvider;
   /** Full explicit Cursor selection. Required when provider is cursor. */
   cursor?: { id: string; params: CursorModelParameter[]; parameters?: CursorParameterValues[] };
+  /** Claude entry that runs under an extra account profile instead of the default Claude Code login. */
+  claudeProfile?: string;
 }
 
 /** Allowed values copied from the catalog so a later request can map a reasoning level. */
@@ -43,6 +45,7 @@ export interface RequestModel {
   selection?: UpstreamSelection;
   provider: ModelProvider;
   cursor?: { id: string; params: CursorModelParameter[]; parameters?: CursorParameterValues[] };
+  claudeProfile?: string;
   routeKey: string;
 }
 
@@ -75,11 +78,26 @@ export function validateModels(models: BridgeModel[]): BridgeModel[] {
     if (item.provider !== undefined && item.provider !== "claude" && item.provider !== "cursor") {
       throw new BridgeError(400, "invalid_model_catalog", "Each model provider must be claude or cursor.");
     }
+    if (item.claudeProfile !== undefined && (item.provider === "cursor" || typeof item.claudeProfile !== "string" || !/^[a-z0-9][a-z0-9_-]{0,31}$/.test(item.claudeProfile))) {
+      throw new BridgeError(400, "invalid_model_catalog", "A Claude profile must be a short lowercase id on a Claude model.");
+    }
     const cursor = item.provider === "cursor" ? normalizeCursorSelection(item.cursor) : undefined;
     seen.add(item.id);
     return { id: item.id, model: item.model, displayName: item.displayName.trim(),
-      ...(item.provider === "cursor" ? { provider: "cursor" as const, cursor } : item.provider === "claude" ? { provider: "claude" as const } : {}) };
+      ...(item.provider === "cursor" ? { provider: "cursor" as const, cursor } : item.provider === "claude" ? { provider: "claude" as const } : {}),
+      ...(item.claudeProfile ? { claudeProfile: item.claudeProfile } : {}) };
   });
+}
+
+/** One copy of each Claude entry per extra account: `team1/claude-opus-5-5` runs claude-opus-5-5 as team1. */
+export function claudeProfileModels(base: BridgeModel[], profiles: ReadonlyArray<{ id: string }>): BridgeModel[] {
+  const claude = base.filter((model) => model.provider !== "cursor" && !model.claudeProfile);
+  return profiles.flatMap((profile) => claude.map((model) => ({
+    id: `${profile.id}/${model.id}`, model: model.model, claudeProfile: profile.id,
+    displayName: model.displayName.startsWith("Claude Code · ")
+      ? model.displayName.replace("Claude Code · ", `Claude Code · ${profile.id} · `)
+      : `${model.displayName} · ${profile.id}`,
+  })));
 }
 
 function normalizeCursorSelection(selection: BridgeModel["cursor"]): { id: string; params: CursorModelParameter[]; parameters?: CursorParameterValues[] } {
@@ -141,9 +159,11 @@ export function resolveRequestModel(config: BridgeConfig, requestedModel: string
     selection,
     provider,
     ...(profile?.cursor ? { cursor: profile.cursor } : {}),
+    ...(profile?.claudeProfile ? { claudeProfile: profile.claudeProfile } : {}),
     // Claude route keys stay the historical shape. Cursor keys also pin the parameter list.
     routeKey: JSON.stringify({ authMode: config.authMode, model: model ?? null,
       baseUrl: selection?.provider.baseUrl ?? null, tokenEnv: selection?.provider.tokenEnv ?? null,
-      ...(provider === "cursor" ? { provider, cursor: profile?.cursor ?? null } : {}) }),
+      ...(provider === "cursor" ? { provider, cursor: profile?.cursor ?? null } : {}),
+      ...(profile?.claudeProfile ? { claudeProfile: profile.claudeProfile } : {}) }),
   };
 }

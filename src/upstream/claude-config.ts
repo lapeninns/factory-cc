@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { z } from "zod";
 import { modelsFromIds, validateModels, type BridgeModel } from "../models.js";
 import { isAnthropicHost, MODEL_SLOT_NAMES, refuseBridgeLoop } from "./auth-env.js";
@@ -67,6 +67,48 @@ export function readClaudeConfig(source: NodeJS.ProcessEnv, bridgeListen = "", o
   const result = { path, env, helper, literalNames, ignored: ignored.sort(), credentialSource };
   guardClaudeKey(result);
   return result;
+}
+
+/** An extra Claude Code account, e.g. a second login under its own CLAUDE_CONFIG_DIR. */
+export interface ClaudeProfile {
+  id: string;
+  dir: string;
+  config: ClaudeConfig;
+  /** The account Claude Code recorded for this directory; each new process must report the same one. */
+  email?: string;
+}
+
+const PROFILE_ID = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+
+/** `team1=/abs/dir,team2=/abs/dir` -> ids and directories, validated but not read. */
+export function parseClaudeProfileList(raw: string): Array<{ id: string; dir: string }> {
+  const entries = raw.split(",").map((entry) => entry.trim()).filter(Boolean).map((entry) => {
+    const at = entry.indexOf("=");
+    const id = entry.slice(0, at).trim(), dir = entry.slice(at + 1).trim();
+    if (at < 1 || !PROFILE_ID.test(id) || ["pool", "personal"].includes(id) || !isAbsolute(dir)) throw new Error("Claude profiles must be id=/absolute/dir pairs; ids use a-z, 0-9, _ and -.");
+    return { id, dir };
+  });
+  if (!entries.length) throw new Error("Claude profile list is empty.");
+  if (new Set(entries.map((entry) => entry.id)).size !== entries.length || new Set(entries.map((entry) => entry.dir)).size !== entries.length) {
+    throw new Error("Claude profile ids and directories must be unique.");
+  }
+  return entries;
+}
+
+/** Reads each profile's own settings.json exactly as the default profile is read. */
+export function loadClaudeProfiles(entries: Array<{ id: string; dir: string }>, source: NodeJS.ProcessEnv, bridgeListen = ""): ClaudeProfile[] {
+  return entries.map(({ id, dir }) => {
+    let config: ClaudeConfig;
+    try { config = readClaudeConfig({ ...source, CLAUDE_CONFIG_DIR: dir }, bridgeListen, { requireSettings: true }); }
+    catch (error) { throw new Error(`Claude profile ${id}: ${error instanceof Error ? error.message : "settings could not be read."}`); }
+    assertClaudeCredential(config);
+    let email: string | undefined;
+    try {
+      const account = (JSON.parse(readFileSync(join(dir, ".claude.json"), "utf8")) as { oauthAccount?: { emailAddress?: unknown } }).oauthAccount?.emailAddress;
+      if (typeof account === "string" && account) email = account.toLowerCase();
+    } catch { /* Not logged in through OAuth; the login check still applies. */ }
+    return { id, dir, config, ...(email ? { email } : {}) };
+  });
 }
 
 export function needsClaudeCredential(config: ClaudeConfig): boolean {

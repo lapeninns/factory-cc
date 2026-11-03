@@ -7,9 +7,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 export const FACTORY_HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd", "Notification", "Stop", "SubagentStop"] as const;
 const MAX_HOOK_BYTES = 4 * 1024 * 1024;
 const CONFIG_FLAG = "--factory-cc-hook-config";
+const DESKTOP_FLAG = "--factory-cc-desktop-lifecycle";
+const DEFAULT_BINDING_ENV = "BRIDGE_FACTORY_BINDING";
+const BINDING_ENV_NAMES = new Set([DEFAULT_BINDING_ENV, "BRIDGE_FACTORY_BINDING_POOL", ...Array.from({ length: 8 }, (_, index) => `BRIDGE_FACTORY_BINDING_TEAM${index + 1}`)]);
 
 type JsonObject = Record<string, unknown>;
-interface HookConfig { url: string; hookToken?: string; command?: string }
+interface HookConfig { url: string; hookToken?: string; command?: string; desktopLifecycle?: boolean; bindingEnv?: string }
 export interface FactoryHookInstallOptions {
   hooksPath: string;
   configPath: string;
@@ -17,10 +20,21 @@ export interface FactoryHookInstallOptions {
   hookToken: string;
   /** Override only for packaged installations with their own executable. No credentials belong here. */
   command?: string;
+  /** Explicitly bind sessions started by Factory Desktop without a CLI wrapper. */
+  desktopLifecycle?: boolean;
+  /** Keep each fixed-seat controller's lifecycle generation separate. */
+  bindingEnv?: string;
 }
 
 function object(value: unknown): value is JsonObject {
   return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function bindingEnvironment(value: unknown = DEFAULT_BINDING_ENV): string {
+  if (typeof value !== "string" || !BINDING_ENV_NAMES.has(value)) {
+    throw new Error("Invalid Factory binding environment name");
+  }
+  return value;
 }
 
 export function factoryHookEndpoint(base: string): string {
@@ -44,14 +58,14 @@ function privateWrite(path: string, data: string): void {
 
 function quote(value: string): string { return `'${value.replaceAll("'", "'\\''")}'`; }
 
-function defaultCommand(configPath: string): string {
+function defaultCommand(configPath: string, desktopLifecycle = false): string {
   const current = fileURLToPath(import.meta.url);
   // A built distribution runs this module directly; source checkout commands
   // use the installed TS loader and the small documented script entrypoint.
   const invocation = current.endsWith(".ts")
     ? [process.execPath, "--import", createRequire(import.meta.url).resolve("tsx"), resolve(dirname(current), "../../scripts/factory-hook.ts")]
     : [process.execPath, current];
-  return [...invocation, CONFIG_FLAG, configPath].map(quote).join(" ");
+  return [...invocation, CONFIG_FLAG, configPath, ...(desktopLifecycle ? [DESKTOP_FLAG] : [])].map(quote).join(" ");
 }
 
 function readHooks(path: string): JsonObject {
@@ -82,11 +96,12 @@ function withoutCommand(groups: unknown[], command: string): unknown[] {
 /** Merge the adapter into official hook configuration without replacing user hooks. */
 export function installFactoryHooks(options: FactoryHookInstallOptions): { hooksPath: string; configPath: string; events: readonly string[] } {
   factoryHookEndpoint(options.url);
+  const bindingEnv = bindingEnvironment(options.bindingEnv);
   if (!options.hookToken.trim()) throw new Error("Factory hooks require a nonempty hook token");
   if (!isAbsolute(options.hooksPath) || !isAbsolute(options.configPath)) throw new Error("Factory hook paths must be absolute");
   if (resolve(options.hooksPath) === resolve(options.configPath)) throw new Error("Factory hooks and private configuration require separate paths");
   const hooks = readHooks(options.hooksPath);
-  const command = options.command ?? defaultCommand(options.configPath);
+  const command = options.command ?? defaultCommand(options.configPath, options.desktopLifecycle);
   let previousCommand: string | undefined;
   if (existsSync(options.configPath)) {
     const previous = readConfig(options.configPath);
@@ -99,7 +114,9 @@ export function installFactoryHooks(options: FactoryHookInstallOptions): { hooks
     hooks[event] = [...groups, { hooks: [{ type: "command", command, timeout: 15 }] }];
   }
   // Credentials never occur in hooks.json, process argv, or the return value.
-  privateWrite(options.configPath, `${JSON.stringify({ url: options.url, hookToken: options.hookToken, command })}\n`);
+  privateWrite(options.configPath, `${JSON.stringify({ url: options.url, hookToken: options.hookToken, command,
+    ...(options.bindingEnv === undefined ? {} : { bindingEnv }),
+    ...(options.desktopLifecycle ? { desktopLifecycle: true } : {}) })}\n`);
   privateWrite(options.hooksPath, `${JSON.stringify(hooks, null, 2)}\n`);
   return { hooksPath: options.hooksPath, configPath: options.configPath, events: FACTORY_HOOK_EVENTS };
 }
@@ -124,9 +141,11 @@ export function removeFactoryHooks(options: { hooksPath: string; configPath: str
 function readConfig(path: string): HookConfig {
   let config: unknown;
   try { config = JSON.parse(readFileSync(path, "utf8")); } catch { throw new Error("Cannot read private Factory hook configuration"); }
-  if (!object(config) || typeof config.url !== "string" || (config.command !== undefined && typeof config.command !== "string")) {
+  if (!object(config) || typeof config.url !== "string" || (config.command !== undefined && typeof config.command !== "string")
+      || (config.desktopLifecycle !== undefined && typeof config.desktopLifecycle !== "boolean")) {
     throw new Error("Invalid private Factory hook configuration");
   }
+  if (config.bindingEnv !== undefined) bindingEnvironment(config.bindingEnv);
   const hookToken = typeof config.hookToken === "string" && config.hookToken.trim() ? config.hookToken : undefined;
   const legacyAdmin = typeof config.adminToken === "string" && config.adminToken.trim();
   const command = typeof config.command === "string" ? config.command : undefined;
@@ -135,18 +154,20 @@ function readConfig(path: string): HookConfig {
   factoryHookEndpoint(config.url);
   // Keep existing installations private even if an external editor broadened permissions.
   chmodSync(path, 0o600);
-  return { url: config.url, hookToken, command };
+  return { url: config.url, hookToken, command, desktopLifecycle: config.desktopLifecycle === true,
+    ...(config.bindingEnv === undefined ? {} : { bindingEnv: config.bindingEnv as string }) };
 }
 
 export async function forwardFactoryHook(
   config: { url: string; hookToken: string }, event: unknown,
-  options: { fetch?: typeof fetch; eventId?: string; timeoutMs?: number; bindingToken?: string; launchId?: string } = {},
+  options: { fetch?: typeof fetch; eventId?: string; timeoutMs?: number; bindingToken?: string; launchId?: string; desktopLifecycle?: boolean } = {},
 ): Promise<{ additionalContext?: string; bindingToken?: string }> {
   if (!object(event) || typeof event.hook_event_name !== "string" || typeof event.session_id !== "string" || !event.session_id
       || !FACTORY_HOOK_EVENTS.includes(event.hook_event_name as typeof FACTORY_HOOK_EVENTS[number])) throw new Error("Invalid Factory lifecycle hook event");
   if (!config.hookToken.trim()) throw new Error("Factory hooks require a nonempty hook token");
   const url = factoryHookEndpoint(config.url);
   const body = JSON.stringify({ eventId: options.eventId ?? randomUUID(), event, ...(options.bindingToken !== undefined ? { bindingToken: options.bindingToken } : {}),
+    ...(event.hook_event_name === "SessionStart" && options.desktopLifecycle ? { desktopLifecycle: true } : {}),
     ...(["SessionStart", "SessionEnd"].includes(event.hook_event_name) && options.launchId ? { launchId: options.launchId } : {}) });
   if (Buffer.byteLength(body) > MAX_HOOK_BYTES) throw new Error("Factory lifecycle hook event exceeds size limit");
   const send = options.fetch ?? fetch;
@@ -180,25 +201,29 @@ export function factoryHookFailureMessage(_error: unknown): string {
 }
 
 /** Factory loads this official SessionStart environment file for later hooks. */
-export function persistFactoryBinding(event: unknown, bindingToken: string): void {
+export function persistFactoryBinding(event: unknown, bindingToken: string, bindingEnv = DEFAULT_BINDING_ENV): void {
+  const name = bindingEnvironment(bindingEnv);
   if (!object(event) || event.hook_event_name !== "SessionStart" || typeof event.CLAUDE_ENV_FILE !== "string"
       || !isAbsolute(event.CLAUDE_ENV_FILE) || !/^[a-f0-9]{64}$/.test(bindingToken)) {
     throw new Error("Factory SessionStart requires its official environment file and generation binding");
   }
   const fd = openSync(event.CLAUDE_ENV_FILE, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
-  try { writeFileSync(fd, `\nexport BRIDGE_FACTORY_BINDING='${bindingToken}'\n`); }
+  try { writeFileSync(fd, `\nexport ${name}='${bindingToken}'\n`); }
   finally { closeSync(fd); }
 }
 
 export async function factoryHookMain(argv = process.argv.slice(2), env: NodeJS.ProcessEnv = process.env): Promise<void> {
-  // Project hooks fire for every Droid session in the project. Only a Droid started by
-  // run-droid / local carries the launch ID; any other session must send nothing to the bridge.
+  // Unconfigured hooks still ignore sessions outside run-droid/local. Direct
+  // Desktop binding needs an explicit command flag plus private config opt-in.
   const launchId = env.BRIDGE_FACTORY_LAUNCH_ID;
-  if (!launchId?.trim()) return;
+  const desktopFlag = argv.includes(DESKTOP_FLAG);
+  if (!launchId?.trim() && !desktopFlag) return;
   const index = argv.indexOf(CONFIG_FLAG);
   const path = index < 0 ? undefined : argv[index + 1];
   if (!path || !isAbsolute(path)) throw new Error("Factory hook requires an absolute private configuration path");
   const config = readConfig(path);
+  if (desktopFlag && !config.desktopLifecycle) throw new Error("Direct Desktop lifecycle is not enabled in private hook configuration");
+  const desktopLifecycle = desktopFlag && !launchId?.trim();
   if (!config.hookToken) throw new Error("Factory hooks require a nonempty hook token");
   const hookToken = config.hookToken;
   let bytes = 0;
@@ -211,15 +236,21 @@ export async function factoryHookMain(argv = process.argv.slice(2), env: NodeJS.
   }
   let event: unknown;
   try { event = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { throw new Error("Invalid Factory lifecycle hook JSON"); }
-  const bindingToken = env.BRIDGE_FACTORY_BINDING;
-  const clientSessionEnd = object(event) && event.hook_event_name === "SessionEnd" && bindingToken === undefined;
+  const bindingEnv = bindingEnvironment(config.bindingEnv);
+  const bindingToken = env[bindingEnv];
+  if (desktopLifecycle && object(event) && event.hook_event_name === "SessionStart"
+      && (typeof event.CLAUDE_ENV_FILE !== "string" || !isAbsolute(event.CLAUDE_ENV_FILE))) {
+    throw new Error("Direct Desktop SessionStart requires its official environment file");
+  }
+  const clientSessionEnd = !desktopLifecycle && object(event) && event.hook_event_name === "SessionEnd" && bindingToken === undefined;
   if (object(event) && event.hook_event_name !== "SessionStart" && !clientSessionEnd && (!bindingToken || !/^[a-f0-9]{64}$/.test(bindingToken))) {
     throw new Error("Factory lifecycle event has no SessionStart generation binding");
   }
-  const result = await forwardFactoryHook({ url: config.url, hookToken }, event, { bindingToken, launchId });
+  const result = await forwardFactoryHook({ url: config.url, hookToken }, event, { bindingToken,
+    ...(launchId?.trim() ? { launchId } : {}), desktopLifecycle });
   if (object(event) && event.hook_event_name === "SessionStart") {
     if (!result.bindingToken || !result.additionalContext) throw new Error("Factory SessionStart received no generation binding");
-    persistFactoryBinding(event, result.bindingToken);
+    persistFactoryBinding(event, result.bindingToken, bindingEnv);
   }
   if (result.additionalContext) process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: object(event) ? event.hook_event_name : "SessionStart", additionalContext: result.additionalContext }, suppressOutput: true })}\n`);
 }

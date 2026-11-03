@@ -40,6 +40,9 @@ export class SessionStore {
     role: RoleTag;
     model: string;
     provider?: ModelProvider;
+    claudeAccount?: string;
+    nativeGeneration?: number;
+    controllerWorkspacePolicy?: SessionRecord["controllerWorkspacePolicy"];
     droidSessionId?: string;
     historyHash?: string;
     contextHash?: string;
@@ -56,6 +59,9 @@ export class SessionStore {
       state: "NEW",
       model: input.model,
       ...(input.provider ? { provider: input.provider } : {}),
+      ...(input.claudeAccount ? { claudeAccount: input.claudeAccount } : {}),
+      ...(input.nativeGeneration === undefined ? {} : { nativeGeneration: input.nativeGeneration }),
+      ...(input.controllerWorkspacePolicy === undefined ? {} : { controllerWorkspacePolicy: input.controllerWorkspacePolicy }),
       historyHash: input.historyHash,
       contextHash: input.contextHash,
       ...(input.reasoning ? { reasoning: input.reasoning } : {}),
