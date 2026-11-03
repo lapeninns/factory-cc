@@ -17,6 +17,7 @@ import { privateDirectory, readWorkers, workerId, writeWorker, type WorkerRecord
 import { prepareSubscription, verifyNativeSubscription, type SubscriptionIdentity } from "./subscription-auth.js";
 import type { SubscriptionProfile } from "../runtime/desktop-jobs.js";
 import { upstreamError } from "../runtime/upstream-error.js";
+import { approvalSummary, MAX_WORKER_APPROVAL_SUMMARY_CHARS } from "./approval.js";
 
 const exec = promisify(execFile);
 const TERMINAL = new Set(["completed", "failed", "cancelled", "unknown"]);
@@ -406,9 +407,21 @@ export class APIWorkerService {
   }
   private requestPermission(live: LiveWorker, tool: string, input: Record<string, unknown>, signal: AbortSignal, toolUseId?: string): ReturnType<CanUseTool> {
     if (live.controller.signal.aborted || signal.aborted || TERMINAL.has(live.record.state)) return Promise.resolve({ behavior: "deny", message: "The worker is no longer accepting actions." });
-    if (this.options.provider.kind === "subscription" && this.options.acquireLease) return this.subscriptionPermission(live, tool, input, signal, toolUseId);
     const id = randomUUID(), snapshot = structuredClone(input);
     const view: WorkerApproval = { id, toolName: tool.slice(0, 160), input: redactJson(snapshot), requestedAt: now(), ...(toolUseId ? { toolUseId } : {}) };
+    // Apply the exact display/decision bound before creating a pending action or
+    // parking a subscription lease. An unreadable action must return a denial
+    // to the SDK so it can continue with a smaller operation.
+    if (approvalSummary(view).length > MAX_WORKER_APPROVAL_SUMMARY_CHARS) {
+      const message = "This action exceeds the Factory approval display limit. Retry with a smaller action.";
+      // Another concurrent action may already have parked this worker's lease.
+      // Its automatic denial must respect that handoff before native work resumes.
+      if (this.options.provider.kind === "subscription" && this.options.acquireLease && live.approvalBatch) {
+        return this.subscriptionPermission(live, snapshot, view, signal, message);
+      }
+      return Promise.resolve({ behavior: "deny", message });
+    }
+    if (this.options.provider.kind === "subscription" && this.options.acquireLease) return this.subscriptionPermission(live, snapshot, view, signal);
     return new Promise((resolvePermission) => {
       let settled = false;
       const abort = () => settle("deny");
@@ -427,7 +440,7 @@ export class APIWorkerService {
       if (signal.aborted || live.controller.signal.aborted) abort();
     });
   }
-  private subscriptionPermission(live: LiveWorker, tool: string, input: Record<string, unknown>, signal: AbortSignal, toolUseId?: string): ReturnType<CanUseTool> {
+  private subscriptionPermission(live: LiveWorker, snapshot: Record<string, unknown>, view: WorkerApproval, signal: AbortSignal, denialMessage?: string): ReturnType<CanUseTool> {
     let batch = live.approvalBatch;
     if (!batch) {
       const controller = new AbortController(), abort = () => controller.abort();
@@ -441,15 +454,14 @@ export class APIWorkerService {
       // A failed handoff cannot authorize more work. Final cleanup resolves the shared record.
       void batch.parked.catch(() => live.controller.abort());
     }
-    const current = batch, id = randomUUID(), snapshot = structuredClone(input);
-    const view: WorkerApproval = { id, toolName: tool.slice(0, 160), input: redactJson(snapshot), requestedAt: now(), ...(toolUseId ? { toolUseId } : {}) };
+    const current = batch, id = view.id;
     return new Promise(resolvePermission => {
       const abort = () => settle("deny");
-      const pending = { decision: undefined as "allow" | "deny" | undefined, finish: (allowed: boolean) => {
+      const pending = { decision: (denialMessage ? "deny" : undefined) as "allow" | "deny" | undefined, finish: (allowed: boolean) => {
         signal.removeEventListener("abort", abort);
         live.controller.signal.removeEventListener("abort", abort);
         resolvePermission(allowed && !signal.aborted ? { behavior: "allow", updatedInput: snapshot }
-          : { behavior: "deny", message: "Denied by the Factory controller or worker cancellation." });
+          : { behavior: "deny", message: denialMessage ?? "Denied by the Factory controller or worker cancellation." });
       } };
       const settle = (decision: "allow" | "deny") => {
         if (pending.decision !== undefined) return;
@@ -461,12 +473,15 @@ export class APIWorkerService {
         this.resumeApprovedBatch(live, current);
       };
       current.requests.set(id, pending);
-      live.approvals.set(id, { view, settle });
-      live.record.pendingApprovalCount = live.approvals.size;
-      live.record.state = "waiting_approval"; this.save(live);
+      if (!denialMessage) {
+        live.approvals.set(id, { view, settle });
+        live.record.pendingApprovalCount = live.approvals.size;
+        live.record.state = "waiting_approval"; this.save(live);
+      }
       signal.addEventListener("abort", abort, { once: true });
       live.controller.signal.addEventListener("abort", abort, { once: true });
       if (signal.aborted || live.controller.signal.aborted) abort();
+      if (denialMessage) this.resumeApprovedBatch(live, current);
     });
   }
   private resumeApprovedBatch(live: LiveWorker, batch: SubscriptionApprovalBatch): void {

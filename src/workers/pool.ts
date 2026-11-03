@@ -6,6 +6,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { SUBSCRIPTION_PROFILES, type SubscriptionProfile } from "../runtime/desktop-jobs.js";
 import { decideWorkerApproval, readPendingWorkerApprovals, type PendingWorkerApproval } from "../runtime/worker-permission-client.js";
 import { approvalDigest, approvalSummary } from "./control.js";
+import { MAX_WORKER_APPROVAL_SUMMARY_CHARS } from "./approval.js";
 import { privateDirectory } from "./worker-state.js";
 
 export interface PoolSeatConfig { profile: SubscriptionProfile; weight: number; configFile: string }
@@ -279,7 +280,7 @@ export class SubscriptionWorkerPool {
     if (route.phase !== "attached" || !["allow", "deny"].includes(input.decision)) throw new Error("Worker is not ready for a decision.");
     const backend = this.backends.get(route.profile)!, pending = await backend.pending(route.backendId!, signal);
     const approval = pending.find(item => item.id === input.approvalId);
-    if (!approval || approvalDigest(approval.input) !== input.actionDigest || approvalSummary(approval) !== input.summary || input.summary.length > 4000) throw new Error("Worker approval changed or is no longer pending.");
+    if (!approval || approvalDigest(approval.input) !== input.actionDigest || approvalSummary(approval) !== input.summary || input.summary.length > MAX_WORKER_APPROVAL_SUMMARY_CHARS) throw new Error("Worker approval changed or is no longer pending.");
     await backend.decide(route.backendId!, approval, input.decision, signal);
   }
 }

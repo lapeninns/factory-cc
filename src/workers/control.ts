@@ -1,15 +1,15 @@
 import { timingSafeEqual, createHash, randomBytes } from "node:crypto";
 import { createServer } from "node:http";
 import { closeSync, lstatSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { approvalSummary, MAX_WORKER_APPROVAL_SUMMARY_CHARS } from "./approval.js";
+
+export { approvalSummary } from "./approval.js";
 
 export interface ApprovalController {
   status(id: string): unknown;
   approve(input: { id: string; approvalId: string; decision: "allow" | "deny" }): unknown;
 }
 export function approvalDigest(input: unknown): string { return createHash("sha256").update(JSON.stringify(input)).digest("hex"); }
-export function approvalSummary(approval: { toolName?: string; input: unknown }): string {
-  return `${approval.toolName ?? "Worker action"}: ${JSON.stringify(approval.input)}`;
-}
 
 /** Separate from MCP tools so a model cannot grant its own approval with tools/call. */
 export async function startWorkerControl(controller: ApprovalController, path: string): Promise<{ close(): Promise<void> }> {
@@ -36,7 +36,7 @@ export async function startWorkerControl(controller: ApprovalController, path: s
       const pending = status.approvals?.find(item => item.id === body.approvalId);
       if (!pending || approvalDigest(pending.input) !== body.actionDigest) { response.writeHead(409).end(); return; }
       const summary = approvalSummary(pending);
-      if (body.summary !== summary || summary.length > 4000) { response.writeHead(409).end(); return; }
+      if (body.summary !== summary || summary.length > MAX_WORKER_APPROVAL_SUMMARY_CHARS) { response.writeHead(409).end(); return; }
       controller.approve({ id: body.id, approvalId: body.approvalId, decision: body.decision });
       response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ ok: true, decision: body.decision }));
     } catch { response.writeHead(400).end(JSON.stringify({ ok: false })); }

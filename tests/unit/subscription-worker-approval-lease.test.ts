@@ -92,6 +92,81 @@ describe("subscription approval seat handoff", () => {
     expect(value.finalize).not.toHaveBeenCalled();
   });
 
+  it("denies oversized actions without parking the lease and still permits a smaller reviewed action", async () => {
+    const decisions: unknown[] = [];
+    let smallerDecision: unknown;
+    const value = fixture(async context => {
+      for (const tool of ["Write", "Edit", "Workflow"]) {
+        if (tool === "Workflow") {
+          const hook = context.options.hooks!.PreToolUse![0]!.hooks[0]! as (...args: unknown[]) => Promise<unknown>;
+          decisions.push(await hook({ hook_event_name: "PreToolUse", tool_name: tool, tool_use_id: "large-workflow",
+            tool_input: { script: "export default async () => 1; //" + "x".repeat(5000) } }, "large-workflow", { signal: context.options.abortController!.signal }));
+        } else {
+          decisions.push(await context.options.canUseTool!(tool, { file_path: join(context.worker.worktree, "large.txt"), content: "x".repeat(5000) },
+            { signal: context.options.abortController!.signal, toolUseID: "large-" + tool, requestId: "large-" + tool }));
+        }
+        expect(value.runtime.status(context.worker.id)).toMatchObject({ state: "running", pendingApprovalCount: 0, approvals: [] });
+        expect(value.requests).toHaveLength(1);
+        expect(value.leases[0]!.release).not.toHaveBeenCalled();
+      }
+      smallerDecision = await permission(context, "smaller");
+      success(context);
+    });
+    const worker = await value.start();
+    await until(() => value.runtime.status(worker.id).approvals.length === 1);
+    expect(decisions).toMatchObject([
+      { behavior: "deny", message: expect.stringContaining("smaller") },
+      { behavior: "deny", message: expect.stringContaining("smaller") },
+      { hookSpecificOutput: { permissionDecision: "deny", permissionDecisionReason: expect.stringContaining("smaller") } },
+    ]);
+    expect(value.leases[0]!.release).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ state: "waiting_host" }));
+    value.runtime.approve({ id: worker.id, approvalId: value.runtime.status(worker.id).approvals[0]!.id, decision: "allow" });
+    await until(() => value.requests.length === 2);
+    const resumed = value.newLease(); value.requests[1]!.gate.resolve(resumed);
+    await until(() => value.runtime.status(worker.id).state === "completed");
+    expect(smallerDecision).toMatchObject({ behavior: "allow" });
+    expect(value.runtime.status(worker.id)).toMatchObject({ pendingApprovalCount: 0, approvals: [], cleanupVerified: true });
+    expect(value.leases[0]!.release).toHaveBeenCalledOnce();
+    expect(resumed.release).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ state: "completed", cleanupVerified: true }));
+  });
+
+  it.each(["waiting for approval", "reacquiring the seat"])("holds an oversized denial while another action is %s", async phase => {
+    const addLarge = deferred<void>();
+    let largeStarted = false, largeDecision: unknown, decisions: unknown;
+    const value = fixture(async context => {
+      const small = permission(context, "small");
+      await addLarge.promise;
+      const large = context.options.canUseTool!("Write", { file_path: join(context.worker.worktree, "large.txt"), content: "x".repeat(5000) },
+        { signal: context.options.abortController!.signal, toolUseID: "large", requestId: "large" });
+      largeStarted = true;
+      void large.then(decision => { largeDecision = decision; });
+      decisions = await Promise.all([small, large]);
+      success(context);
+    });
+    const worker = await value.start();
+    await until(() => value.runtime.status(worker.id).approvals.length === 1);
+    const approveSmall = () => value.runtime.approve({ id: worker.id, approvalId: value.runtime.status(worker.id).approvals[0]!.id, decision: "allow" });
+    if (phase === "reacquiring the seat") {
+      approveSmall();
+      await until(() => value.requests.length === 2);
+    }
+    addLarge.resolve();
+    await until(() => largeStarted);
+    expect(value.runtime.status(worker.id).approvals).toHaveLength(phase === "waiting for approval" ? 1 : 0);
+    expect(largeDecision).toBeUndefined();
+    expect(value.leases[0]!.release).toHaveBeenCalledOnce();
+    if (phase === "waiting for approval") approveSmall();
+    await until(() => value.requests.length === 2);
+    expect(largeDecision).toBeUndefined();
+    const resumed = value.newLease(); value.requests[1]!.gate.resolve(resumed);
+    await until(() => value.runtime.status(worker.id).state === "completed");
+    expect(decisions).toMatchObject([{ behavior: "allow" }, { behavior: "deny", message: expect.stringContaining("smaller") }]);
+    expect(value.runtime.status(worker.id)).toMatchObject({ pendingApprovalCount: 0, approvals: [], cleanupVerified: true });
+    expect(value.requests).toHaveLength(2);
+    expect(value.leases[0]!.release).toHaveBeenCalledOnce();
+    expect(resumed.release).toHaveBeenCalledOnce();
+  });
+
   it("coalesces concurrent approvals and waits for the seat before returning a denial too", async () => {
     let decisions: unknown;
     const value = fixture(async context => { decisions = await Promise.all([permission(context, "one"), permission(context, "two")]); success(context); });

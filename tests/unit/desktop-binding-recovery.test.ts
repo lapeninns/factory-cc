@@ -1,12 +1,17 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { loadConfig, type BridgeConfig } from "../../src/config.js";
 import { ControlBroker } from "../../src/control/broker.js";
+import { controllerJobBinding } from "../../src/http/app.js";
+import { DesktopJobsRuntime, acquireDesktopJobLease } from "../../src/runtime/desktop-jobs.js";
 import { SessionStore } from "../../src/sessions/store.js";
 import type { SessionRecord } from "../../src/sessions/state.js";
-import type { BridgeRuntime } from "../../src/runtime/types.js";
+import type { BridgeRuntime, RuntimeRequest, RuntimeTurn } from "../../src/runtime/types.js";
 import type { MessagesRequest, SessionState } from "../../src/types.js";
 
 const directories: string[] = [];
@@ -59,6 +64,76 @@ describe("explicit idle Desktop binding recovery", () => {
     expect(f.broker.describe().restoredDesktopBindings).toBe(1);
     expect(f.runtime.handle).not.toHaveBeenCalled();
     expect(f.runtime.cancel).not.toHaveBeenCalled();
+  });
+
+  it("persists a fresh generation once per recovered host and advances again after another restart", async () => {
+    const f = fixture([{ nativeGeneration: 7 }, { nativeGeneration: 12, state: "FAILED" }]);
+    await f.send();
+    expect(f.records.map(record => f.store.require(record.bridgeSessionId).nativeGeneration)).toEqual([8, 13]);
+    await f.send();
+    expect(f.records.map(record => f.store.require(record.bridgeSessionId).nativeGeneration)).toEqual([8, 13]);
+    const reloaded = new SessionStore(join(f.cwd, "private-state"), true, 16);
+    const restarted = new ControlBroker(f.runtime, reloaded, 1000, { desktopLifecycle: true, restoreIdleDesktopBindings: true });
+    await restarted.hostEvent({ eventId: randomUUID(), event: f.event(), bindingToken: f.token });
+    const durable = new SessionStore(join(f.cwd, "private-state"), true, 16);
+    expect(f.records.map(record => durable.require(record.bridgeSessionId).nativeGeneration)).toEqual([9, 14]);
+  });
+
+  it.each([-1, 1.5, Number.NaN, "0", null, 1_000_000, Number.MAX_SAFE_INTEGER])(
+    "rejects invalid or exhausted generation %j before changing any matching record", async generation => {
+      const f = fixture([{ nativeGeneration: 3 }, { nativeGeneration: generation as number }]);
+      const before = f.store.list().map(record => structuredClone(record));
+      await expect(f.send()).rejects.toMatchObject({ code: "host_not_registered" });
+      expect(f.store.list()).toEqual(before);
+      expect(f.broker.describe().restoredDesktopBindings).toBe(0);
+    });
+
+  it("uses a new real Python lease after the prior bridge process released an idle phase", async () => {
+    const f = fixture([{ nativeGeneration: 0, claudeAccount: "team1", controllerWorkspacePolicy: "controller-host" }]);
+    const record = f.records[0]!;
+    const options = {
+      pythonExecutable: execFileSync("python3", ["-c", "import sys; print(sys.executable)"], { encoding: "utf8" }).trim(),
+      runtimePackagePath: resolve("native-runtime"), stateRoot: join(f.cwd, "leases"),
+      admissionTimeoutMs: 10_000, releaseTimeoutMs: 5_000,
+    };
+    const oldRequest = { factorySessionId: "existing-workstream", bridgeSessionId: `${record.bridgeSessionId}:g0`,
+      cwd: f.cwd, role: "orchestrator", subscriptionProfile: "team1", workspacePolicy: "controller-host" };
+    // The first helper must be owned by a different, now exited Node process.
+    const old = JSON.parse(execFileSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", `
+      const { acquireDesktopJobLease } = await import(${JSON.stringify(pathToFileURL(resolve("src/runtime/desktop-jobs.ts")).href)});
+      const lease = await acquireDesktopJobLease(${JSON.stringify(options)}, ${JSON.stringify(oldRequest)}, new AbortController().signal);
+      await lease.release({state: "idle", cleanupVerified: true});
+      console.log(JSON.stringify({jobId: lease.jobId}));
+    `], { cwd: process.cwd(), encoding: "utf8", timeout: 15_000 }));
+    await expect(acquireDesktopJobLease(options, oldRequest as Parameters<typeof acquireDesktopJobLease>[1],
+      new AbortController().signal)).rejects.toMatchObject({ code: "desktop_job_protocol" });
+
+    await f.send();
+    const config: BridgeConfig = { ...loadConfig({ mode: "mock", dataDir: join(f.cwd, "config"),
+      clientToken: "client", adminToken: "admin", hookToken: "hook" }),
+      controllerPool: true, controllerReadOnly: true, controllerHostTools: true,
+      subscriptionAccounts: [{ profile: "team1", expectedEmail: "fixture@example.invalid", weight: 1, env: {} }] };
+    const turn: RuntimeTurn = { response: { id: "message-fixture", type: "message", role: "assistant", model: "claude-opus-5-5",
+      content: [{ type: "text", text: "continued" }], stop_reason: "end_turn", stop_sequence: null,
+      usage: { input_tokens: 1, output_tokens: 1 } }, pendingToolIds: [] };
+    vi.mocked(f.runtime.handle).mockResolvedValue(turn);
+    const managed = new DesktopJobsRuntime(f.runtime, { ...options, getBinding: input => controllerJobBinding(config, input) });
+    let completed = false;
+    try {
+      const input: RuntimeRequest = { role: "orchestrator", headers: {}, session: f.store.require(record.bridgeSessionId),
+        factorySession: f.broker.hostIdentity(f.token),
+        request: { model: "claude-opus-5-5", max_tokens: 16, messages: [{ role: "user", content: "Continue" }] } };
+      expect(await managed.handle(input)).toEqual(turn);
+      expect(f.runtime.handle).toHaveBeenCalledOnce();
+      const jobs = readdirSync(join(options.stateRoot, "jobs")).map(name => JSON.parse(readFileSync(join(options.stateRoot, "jobs", name), "utf8")));
+      expect(jobs).toHaveLength(2);
+      expect(jobs.find(job => job.id !== old.jobId)).toMatchObject({ bridgeSessionId: `${record.bridgeSessionId}:g1`, state: "idle" });
+      completed = true;
+    } finally {
+      const closed = managed.close();
+      if (completed) await closed;
+      else await closed.catch(() => undefined);
+    }
   });
 
   it.each(["PreToolUse", "PostToolUse", "Notification", "SessionEnd", "Stop"])("does not recover from %s", async name => {
@@ -153,5 +228,15 @@ describe("explicit idle Desktop binding recovery", () => {
     const response = approval.broker.requestApproval({ bridgeSessionId: approval.records[0]!.bridgeSessionId, toolName: "Execute", input: {}, signal: abort.signal });
     await expect(approval.send()).rejects.toMatchObject({ code: "host_not_registered" });
     abort.abort(); await response;
+  });
+
+  it("does not advance a generation while a native session remains usable or protected", async () => {
+    for (const method of ["isSessionUsable", "protectedSessionIds"] as const) {
+      const f = fixture([{ nativeGeneration: 2 }]);
+      if (method === "isSessionUsable") f.runtime.isSessionUsable = () => true;
+      else f.runtime.protectedSessionIds = () => [f.records[0]!.bridgeSessionId];
+      await expect(f.send()).rejects.toMatchObject({ code: "host_not_registered" });
+      expect(f.store.require(f.records[0]!.bridgeSessionId).nativeGeneration).toBe(2);
+    }
   });
 });

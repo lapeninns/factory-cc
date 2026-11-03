@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { APIWorkerService, type APIWorkerServiceOptions, type WorkerRunContext } from "../../src/workers/service.js";
+import { startWorkerControl } from "../../src/workers/control.js";
+import { decideWorkerApproval, readPendingWorkerApprovals } from "../../src/runtime/worker-permission-client.js";
 
 const support = () => ({ executable: "/fixture/unmodified-claude", sdkVersion: "0.3.300", cliVersion: "2.1.300", sha256: "fixture" });
 const sleep = (ms: number) => new Promise<void>((done) => setTimeout(done, ms));
@@ -101,6 +103,46 @@ describe("Factory supervised API workers", () => {
     runtime.approve({ id: item.id, approvalId: runtime.status(item.id).approvals[0]!.id, decision: "allow" });
     await until(() => runtime.status(item.id).state === "completed");
     expect(decision).toMatchObject({ behavior: "allow", updatedInput: { content: "fixture" } });
+  });
+  it.each(["Write", "Edit", "Workflow"])("denies an oversized %s before parking it for approval", async (tool) => {
+    let decision: unknown;
+    const runtime = service({ run: async (context) => {
+      const input = tool === "Workflow" ? { script: "export default async () => 1; //" + "x".repeat(5000) }
+        : { file_path: join(context.worker.worktree, "large.txt"), content: "x".repeat(5000) };
+      decision = await context.options.canUseTool!(tool, input, { signal: context.options.abortController!.signal, toolUseID: "large-action", requestId: "large-request" });
+      success(context);
+    } });
+    const item = await runtime.start({ repository: repo, task: "Attempt a large action.", workflow: "implement" });
+    await until(() => decision !== undefined);
+    await until(() => runtime.status(item.id).state === "completed");
+    expect(decision).toMatchObject({ behavior: "deny", message: expect.stringContaining("smaller") });
+    expect(runtime.status(item.id)).toMatchObject({ pendingApprovalCount: 0, approvals: [], cleanupVerified: true });
+  });
+  it.each([4000, 4001])("enforces the %i-character summary boundary through the real approval channel", async (length) => {
+    let decision: unknown, input: { file_path: string; content: string } | undefined;
+    const runtime = service({ run: async (context) => {
+      input = { file_path: join(context.worker.worktree, "boundary.txt"), content: "" };
+      input.content = "x".repeat(length - `Write: ${JSON.stringify(input)}`.length);
+      expect(`Write: ${JSON.stringify(input)}`).toHaveLength(length);
+      decision = await context.options.canUseTool!("Write", input, { signal: context.options.abortController!.signal, toolUseID: "boundary-action", requestId: "boundary-request" });
+      success(context);
+    } });
+    const item = await runtime.start({ repository: repo, task: "Exercise the approval boundary.", workflow: "implement" });
+    if (length === 4000) {
+      await until(() => runtime.status(item.id).state === "waiting_approval");
+      const controlPath = join(folder, "boundary-control.json"), control = await startWorkerControl(runtime, controlPath);
+      try {
+        const signal = new AbortController().signal;
+        const pending = await readPendingWorkerApprovals(controlPath, item.id, signal);
+        expect(pending).toHaveLength(1);
+        expect(pending[0]!.input).toEqual(input);
+        await decideWorkerApproval(controlPath, item.id, pending[0]!, "allow", signal);
+      } finally { await control.close(); }
+    }
+    await until(() => runtime.status(item.id).state === "completed");
+    expect(decision).toMatchObject(length === 4000 ? { behavior: "allow", updatedInput: input }
+      : { behavior: "deny", message: expect.stringContaining("smaller") });
+    expect(runtime.status(item.id)).toMatchObject({ pendingApprovalCount: 0, approvals: [], cleanupVerified: true });
   });
   it("requires explicit Workflow approval in PreToolUse even without a native permission callback", async () => {
     let hookResult: unknown;

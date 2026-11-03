@@ -371,12 +371,21 @@ export class ControlBroker implements RuntimeControl {
           || ["bridge-restarted-during-generation", "bridge-restarted-while-waiting-for-tool", "request-timeout-interrupted"].includes(note))
         || (record.sdkSessionId !== undefined && (typeof record.sdkSessionId !== "string" || !record.sdkSessionId.trim()
           || record.sdkSessionId.length > 256))
+        || (record.nativeGeneration !== undefined && (!Number.isSafeInteger(record.nativeGeneration)
+          || record.nativeGeneration < 0 || record.nativeGeneration >= 1_000_000))
         // A failed native process is not a resumable checkpoint. Pre-inference
         // workspace rejection has no SDK session or provider token usage.
         || (record.state === "FAILED" && (record.sdkSessionId !== undefined
           || record.usage?.input_tokens !== 0 || record.usage?.output_tokens !== 0))
         || this.hasApprovals(record.bridgeSessionId) || Boolean(this.runtime.pendingHostCalls?.(record.bridgeSessionId).length)
+        || this.runtime.isSessionUsable?.(record.bridgeSessionId) === true
+        || Boolean(this.runtime.protectedSessionIds?.().includes(record.bridgeSessionId))
         || [...this.hosts.values()].some(other => other.bridgeSessions.has(record.bridgeSessionId)))) return;
+    // Python leases belong to the bridge process that acquired them. Keep its
+    // strict owner check and allocate a new durable identity before publishing
+    // the recovered host. Another restart advances again, including if this
+    // process exits after persistence but before its first model request.
+    for (const record of records) this.store.update(record.bridgeSessionId, { nativeGeneration: (record.nativeGeneration ?? 0) + 1 });
     const host: HostBinding = { token, sessionId: event.session_id as string, cwd,
       cwdAliases: new Set([cwd, resolve(event.cwd as string)]),
       bridgeSessions: new Set(records.map(record => record.bridgeSessionId)), ended: false,

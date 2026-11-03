@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { closeSync, constants, fstatSync, openSync, readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
+import { approvalSummary, MAX_WORKER_APPROVAL_SUMMARY_CHARS } from "../workers/approval.js";
 
 export interface PendingWorkerApproval {
   id: string;
@@ -40,8 +41,8 @@ export async function readPendingWorkerApprovals(path: string, workerId: string,
   if (!object(value) || value.id !== workerId || !Array.isArray(value.approvals) || value.approvals.length > 16) throw new Error("Invalid worker permission status.");
   return value.approvals.map((item: unknown) => {
     if (!object(item) || !validId(item.id) || typeof item.toolName !== "string" || !item.toolName || item.toolName.length > 256 || !object(item.input)) throw new Error("Invalid pending worker permission.");
-    const summary = `${item.toolName}: ${JSON.stringify(item.input)}`;
-    if (summary.length > 4000) throw new Error("Worker action exceeds the reviewable bound.");
+    const summary = approvalSummary({ toolName: item.toolName, input: item.input });
+    if (summary.length > MAX_WORKER_APPROVAL_SUMMARY_CHARS) throw new Error("Worker action exceeds the reviewable bound.");
     return { id: item.id, toolName: item.toolName, input: structuredClone(item.input) };
   });
 }
@@ -53,7 +54,7 @@ export async function decideWorkerApproval(path: string, workerId: string, appro
   const action = JSON.stringify(approval.input);
   const response = await fetch(new URL("/decision", url), { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
     body: JSON.stringify({ id: workerId, approvalId: approval.id, actionDigest: createHash("sha256").update(action).digest("hex"),
-      summary: `${approval.toolName}: ${action}`, decision }),
+      summary: approvalSummary(approval), decision }),
     signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]), redirect: "error" });
   if (!response.ok) throw new Error("Worker decision was not accepted.");
   const value: unknown = await response.json();
