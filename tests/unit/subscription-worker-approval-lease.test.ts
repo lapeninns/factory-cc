@@ -167,6 +167,44 @@ describe("subscription approval seat handoff", () => {
     expect(resumed.release).toHaveBeenCalledOnce();
   });
 
+  it.each(["waiting for approval", "reacquiring the seat"])("holds an automatic approval behind an existing handoff while %s", async phase => {
+    const addAutomatic = deferred<void>();
+    let automaticStarted = false, automaticDecision: unknown, decisions: unknown;
+    const value = fixture(async context => {
+      const original = permission(context, "original");
+      await addAutomatic.promise;
+      const automatic = permission(context, "automatic");
+      automaticStarted = true;
+      void automatic.then(decision => { automaticDecision = decision; });
+      decisions = await Promise.all([original, automatic]);
+      success(context);
+    });
+    const worker = await value.start();
+    await until(() => value.runtime.status(worker.id).approvals.length === 1);
+    const approveOriginal = () => value.runtime.approve({ id: worker.id, approvalId: value.runtime.status(worker.id).approvals[0]!.id, decision: "allow" });
+    if (phase === "reacquiring the seat") {
+      approveOriginal();
+      await until(() => value.requests.length === 2);
+    }
+    // Production policy is fixed when the service is constructed. Inject the
+    // pre-existing-batch condition to verify its defensive admission boundary.
+    Object.defineProperty(value.runtime, "approvalPolicy", { value: "bypass" });
+    addAutomatic.resolve();
+    await until(() => automaticStarted);
+    expect(automaticDecision).toBeUndefined();
+    expect(value.runtime.status(worker.id).approvals).toHaveLength(phase === "waiting for approval" ? 1 : 0);
+    expect(value.leases[0]!.release).toHaveBeenCalledOnce();
+    if (phase === "waiting for approval") approveOriginal();
+    await until(() => value.requests.length === 2);
+    expect(automaticDecision).toBeUndefined();
+    const resumed = value.newLease(); value.requests[1]!.gate.resolve(resumed);
+    await until(() => value.runtime.status(worker.id).state === "completed");
+    expect(decisions).toMatchObject([{ behavior: "allow" }, { behavior: "allow" }]);
+    expect(value.runtime.status(worker.id)).toMatchObject({ pendingApprovalCount: 0, approvals: [], cleanupVerified: true });
+    expect(value.requests).toHaveLength(2);
+    expect(resumed.release).toHaveBeenCalledOnce();
+  });
+
   it("coalesces concurrent approvals and waits for the seat before returning a denial too", async () => {
     let decisions: unknown;
     const value = fixture(async context => { decisions = await Promise.all([permission(context, "one"), permission(context, "two")]); success(context); });

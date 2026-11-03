@@ -33,4 +33,14 @@ describe('subscription-only worker entry point',()=>{
   it.each(['anthropic','openrouter'])('does not grant owned-git access to an API route: %s',provider=>{
     expect(()=>readWorkerServerConfig(config({provider,repositoryPolicy:'owned-git',subscriptionProfile:undefined,apiKeyFile:'/missing-api-secret',maxBudgetUsd:1}))).toThrow(/subscription authentication/);
   });
+  it('requires an explicit subscription-only approval bypass',()=>{
+    expect(readWorkerServerConfig(config()).approvalPolicy).toBeUndefined();
+    expect(readWorkerServerConfig(config({approvalPolicy:'ask'})).approvalPolicy).toBe('ask');
+    expect(readWorkerServerConfig(config({approvalPolicy:'bypass'})).approvalPolicy).toBe('bypass');
+    for(const approvalPolicy of ['',true,null,'always']) expect(()=>readWorkerServerConfig(config({approvalPolicy}))).toThrow(/approval/);
+    for(const provider of ['anthropic','openrouter']) {
+      expect(()=>readWorkerServerConfig(config({provider,subscriptionProfile:undefined,apiKeyFile:'/missing-api-secret',maxBudgetUsd:1,approvalPolicy:'bypass'}))).toThrow(/subscription policy/);
+      expect(readWorkerServerConfig(config({provider,subscriptionProfile:undefined,apiKeyFile:'/missing-api-secret',maxBudgetUsd:1,approvalPolicy:'ask'})).approvalPolicy).toBe('ask');
+    }
+  });
 });

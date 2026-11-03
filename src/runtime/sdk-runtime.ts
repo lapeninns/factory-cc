@@ -261,6 +261,8 @@ export class SdkRuntime implements BridgeRuntime {
   describe(): Record<string, unknown> {
     return {
       kind: "sdk", authMode: this.config.authMode, permissionMode: this.config.permissionMode,
+      controllerHostTools: this.config.controllerHostTools === true,
+      controllerApprovalPolicy: this.config.controllerApprovalPolicy ?? "ask",
       ...(this.config.claudeConfig ? { claudeProfile: {
         settingsPath: this.config.claudeConfig.path,
         upstreamOrigin: this.config.claudeConfig.env.ANTHROPIC_BASE_URL ? new URL(this.config.claudeConfig.env.ANTHROPIC_BASE_URL).origin : "https://api.anthropic.com",
@@ -998,7 +1000,11 @@ export class SdkRuntime implements BridgeRuntime {
       systemPrompt: { ...buildPresetSystemPrompt(this.config.desktopProfile, this.config.nativeWorkflows),
         append: buildPresetSystemPrompt(this.config.desktopProfile, this.config.nativeWorkflows).append + desktopJobPolicy(this.config)
           + (this.config.controllerHostTools
-            ? "\nThis Factory controller supports ordinary folders and repositories. Use the allowed host read tools for inspection. General filesystem operations may use Factory Execute, Create or Edit only through the exact-action human approval; never bypass it with native tools. Delegate code implementation to the configured supervised workers in isolated worktrees. Never use Task, SpawnAgent, unrelated MCP tools or native side effects. Keep the user's requested scope and permissions; a folder task does not authorize deletion or production changes."
+            ? "\nThis Factory controller supports ordinary folders and repositories. Use the allowed host read tools for inspection. "
+              + (this.config.controllerApprovalPolicy === "bypass"
+                ? "The operator disabled this bridge's extra confirmation for Factory Execute, Create and Edit. Use those advertised host tools within the user's task scope; Factory's own permissions still apply. "
+                : "General filesystem operations may use Factory Execute, Create or Edit only through the exact-action human approval; never bypass it with native tools. ")
+              + "Delegate code implementation to the configured supervised workers in isolated worktrees. Never use Task, SpawnAgent, unrelated MCP tools or native side effects. Keep the user's requested scope and permissions; a folder task does not authorize deletion or production changes."
             : this.config.controllerReadOnly ? "\nThis Factory controller is read-only. Inspect with the allowed read tools, discover only allowed tools with ToolSearch, and ask the user with AskUser. Delegate all implementation to the configured supervised worker tools. Never use Execute, Create, Edit, Task, SpawnAgent, unrelated MCP tools or native side effects." : "") },
       canUseTool: async (name: string, toolInput: Record<string, unknown>, context?: NativePermissionContext) => live.queryEpoch === epoch
         ? this.canUseTool(live, name, toolInput, context)
@@ -1313,21 +1319,30 @@ export class SdkRuntime implements BridgeRuntime {
     return this.requestDesktopActionApproval(live, question, signal);
   }
 
-  /** Host filesystem actions use the same native AskUser handshake as workers.
-   * Native Claude tools remain disabled: only the exact reviewed Factory call
-   * can be published after approval, in the same live query and workspace. */
+  /** Host filesystem actions use the trusted operator approval policy.
+   * Native Claude tools remain disabled; both policies enforce the same live
+   * query, workspace, Factory mode and advertised-call checks. */
   private async requestControllerHostActionApproval(live: LiveSdk, original: string, input: unknown, mcpName: string): Promise<boolean> {
     if (!this.config.controllerHostTools || !controllerHostAction(original) || !live.current || !this.control) return false;
     const epoch = live.queryEpoch, control = this.control, cwd = resolveCwd(live.current, this.config);
     const approval = new AbortController();
-    const timer = setTimeout(() => approval.abort(), this.config.approvalTimeoutMs);
-    timer.unref();
-    live.approvals.add(approval); this.notifyApprovals(live);
     const current = (): boolean => !approval.signal.aborted && !live.terminal && !live.hostEnding && !live.turnHandoff
       && live.queryEpoch === epoch && this.control === control && !!live.current
       && resolveCwd(live.current, this.config) === cwd
       && (control.factoryPermissionMode?.(live.current.session.bridgeSessionId) ?? live.current.factoryPermissionMode) !== "spec"
       && !this.toolAccessDenial(live, `mcp__droid__${mcpName}`, control.factoryPermissionMode?.(live.current.session.bridgeSessionId));
+    if (this.config.controllerApprovalPolicy === "bypass") {
+      // Bypass only this bridge-owned question. Factory still receives the
+      // exact snapshotted action and applies its own native permissions.
+      const allowed = current() && !!live.catalog?.accepts(original, input);
+      live.events.push({ at: now(), type: "controller_host_action_decision", data: {
+        toolName: original, decision: allowed ? "allow" : "deny", approvalPolicy: "bypass",
+      } });
+      return allowed;
+    }
+    const timer = setTimeout(() => approval.abort(), this.config.approvalTimeoutMs);
+    timer.unref();
+    live.approvals.add(approval); this.notifyApprovals(live);
     let allowed = false;
     try {
       if (!current()) return false;

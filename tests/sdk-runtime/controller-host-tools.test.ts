@@ -55,7 +55,7 @@ class Fake implements SdkHandle {
   }
 }
 
-function setup(options: { original?: keyof typeof actions; hostTools?: boolean; askTool?: boolean; invoke?: boolean } = {}) {
+function setup(options: { original?: keyof typeof actions; hostTools?: boolean; askTool?: boolean; invoke?: boolean; approvalPolicy?: "ask" | "bypass" } = {}) {
   const root = mkdtempSync(join(tmpdir(), "controller-host-tools-")); roots.push(root);
   mkdirSync(join(root, "policies")); mkdirSync(join(root, "workflows"));
   writeFileSync(join(root, "policies/team-policy.md"), "Fixture policy.\n");
@@ -64,7 +64,8 @@ function setup(options: { original?: keyof typeof actions; hostTools?: boolean; 
   vi.stubEnv("BRIDGE_SDK_CWD", root);
   const config = loadConfig({ mode: "sdk", authMode: "subscription", desktopProfile: true, desktopJobs: true, desktopLifecycle: true,
     desktopRuntimePath: root, desktopStateRoot: join(root, "state"), controllerReadOnly: true, workerPool: true, controllerPool: true,
-    controllerHostTools: options.hostTools !== false, workerControlFile: join(root, "control.json"), workerMcpPrefix: "factory-workers-pool___",
+    controllerHostTools: options.hostTools !== false, controllerApprovalPolicy: options.approvalPolicy,
+    workerControlFile: join(root, "control.json"), workerMcpPrefix: "factory-workers-pool___",
     subscriptionProfile: "team1", subscriptionExpectedEmail: "team1@example.invalid",
     subscriptionAccounts: SUBSCRIPTION_PROFILES.map(profile => ({ profile, expectedEmail: `${profile}@example.invalid`, weight: 1,
       env: sanitizedSubscriptionEnvironment({ PATH: process.env.PATH }, `/fixture/${profile}`) })),
@@ -102,6 +103,47 @@ afterEach(async () => {
 });
 
 describe("exactly approved Factory host operations", () => {
+  it.each(["Execute", "Create", "Edit"] as const)("explicit bypass publishes %s without the extra AskUser question", async original => {
+    const { runtime, fake, base, control } = setup({ original, approvalPolicy: "bypass", askTool: false });
+    const first = await runtime.handle(base), action = callFrom(first);
+    expect(action).toMatchObject({ name: original, id: "host-action", input: actions[original] });
+    expect(first.response.content.some(block => block.type === "tool_use" && block.name === "AskUser")).toBe(false);
+    expect(fake.calls[0]!.options).toMatchObject({ permissionMode: "default", allowDangerouslySkipPermissions: false });
+    expect(runtime.describe()).toMatchObject({ controllerHostTools: true, controllerApprovalPolicy: "bypass", permissionMode: "ask", pendingApprovals: 0 });
+    expect(fake.calls[0]!.options.systemPrompt.append).toContain("Factory's own permissions still apply");
+    expect((await runtime.handle(toolResult(base, action.id, "host result"))).response.stop_reason).toBe("end_turn");
+    expect(fake.observedResult).toMatchObject({ isError: false });
+    expect(control.requestApproval).not.toHaveBeenCalled();
+  });
+
+  it("keeps Factory spec mode authoritative with bridge approval bypass", async () => {
+    const { runtime, fake, base, setMode } = setup({ approvalPolicy: "bypass" });
+    setMode("spec");
+    const result = await runtime.handle(base);
+    expect(result.response.content.some(block => block.type === "tool_use")).toBe(false);
+    expect(fake.observedResult).toMatchObject({ isError: true });
+  });
+
+  it("bypass retains the input snapshot and rejects a stale handler after cancellation", async () => {
+    const { runtime, fake, base } = setup({ approvalPolicy: "bypass" });
+    const action = callFrom(await runtime.handle(base));
+    fake.input.command = "changed after dispatch";
+    expect(action.input).toEqual({ command: "df -h ." });
+    const handler = fake.handlers.get(new StableDroidToolNames().toMcp("Execute"))!;
+    await runtime.cancel(base.session.bridgeSessionId, "cancelled by test");
+    await expect(handler({ command: "pwd" })).rejects.toMatchObject({ code: "stale_native_query" });
+  });
+
+  it("bypass keeps direct native writes, shell, Workflow and agent spawning blocked", async () => {
+    const { runtime, fake, base } = setup({ approvalPolicy: "bypass", invoke: false });
+    await runtime.handle(base);
+    const options = fake.calls[0]!.options, hook = options.hooks.PreToolUse[0].hooks[0];
+    for (const tool of ["Bash", "Write", "Edit", "Workflow", "Task", "SpawnAgent"]) {
+      expect(await hook({ tool_name: tool, tool_input: {} })).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+      expect(await options.canUseTool(tool, {})).toMatchObject({ behavior: "deny" });
+    }
+  });
+
   it.each(["Execute", "Create", "Edit"] as const)("asks before publishing %s and then forwards the exact approved action", async original => {
     const { runtime, fake, base, control } = setup({ original });
     const first = await runtime.handle(base), question = callFrom(first);

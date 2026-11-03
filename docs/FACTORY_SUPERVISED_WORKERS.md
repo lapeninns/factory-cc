@@ -62,8 +62,8 @@ The fixed-seat controller defaults to `controller-readonly`, which requires a
 Git checkout and blocks host mutations. The pool can explicitly enable
 `--host-tools` with `--controller-pool --worker-pool`. That policy accepts an
 existing canonical directory owned by the operator, including a non-Git folder.
-Factory Execute, Create and Edit actions then require an exact native AskUser
-decision before dispatch. Native direct writes, native Bash, built-in agent
+By default, Factory Execute, Create and Edit actions require an exact native
+AskUser decision before dispatch. Native direct writes, native Bash, built-in agent
 spawning and unrelated MCP tools remain blocked in this controller path.
 
 Workers default to an explicit repository allowlist. Subscription workers can
@@ -137,6 +137,30 @@ settings, lifecycle hooks, launch agents or account logins. Deployment must wire
 the matching private tokens, hook bindings, model connection and MCP namespace
 without replacing unrelated settings. The legacy `npm run desktop -- install`
 command remains the installer for the separate legacy bridge.
+
+## Optional bridge approval bypass
+
+The pooled subscription controller accepts `--approval-policy bypass` alongside
+`--host-tools --controller-pool --worker-pool`. This suppresses the extra
+bridge-generated AskUser questions for its allowed Execute, Create and Edit
+actions. Each subscription worker can separately set `"approvalPolicy":
+"bypass"` in its private service configuration to permit otherwise allowed
+native actions and validated workflows without a pending approval question.
+The default is `ask` for both, and API workers cannot select bypass.
+
+Bypass is broad within these execution boundaries: it also covers permitted
+writes and commands, not just read-only inspection. It does not change Factory's
+own autonomy setting, native SDK permission mode, sandbox, worker worktree
+boundaries, blocked tools, account identity checks, shared admission or cleanup
+requirements. Those independent restrictions still apply. The operator must
+explicitly choose this policy and restart idle services with matching private
+configuration; controller state markers reject policy drift. Keep the prior
+configuration and release for rollback.
+
+The controller's `--check` output reports `approvalPolicy`; its authenticated
+runtime view reports `controllerApprovalPolicy`. Worker `--check` reports its
+effective `approvalPolicy`. Restoring `ask` requires the same deliberate
+configuration and restart process.
 
 ## Validation boundaries
 

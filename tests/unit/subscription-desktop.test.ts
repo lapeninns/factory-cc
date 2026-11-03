@@ -48,6 +48,41 @@ function pooledArgs() {
 }
 
 describe("subscription Desktop launcher", () => {
+  it("requires explicit host tools before allowing bridge approval bypass", () => {
+    expect(parseSubscriptionDesktop(args).approvalPolicy).toBe("ask");
+    expect(() => parseSubscriptionDesktop([...args, "--approval-policy", "bypass"])).toThrow(/requires explicit --host-tools/);
+    const host = [...pooledArgs(), "--controller-pool", "--host-tools"];
+    expect(parseSubscriptionDesktop([...host, "--approval-policy", "bypass"]).approvalPolicy).toBe("bypass");
+    expect(() => parseSubscriptionDesktop([...host, "--approval-policy", "always"])).toThrow(/must be ask or bypass/);
+    expect(() => parseSubscriptionDesktop([...host, "--approval-policy", "bypass", "--approval-policy", "ask"])).toThrow(/Invalid subscription Desktop arguments/);
+  });
+
+  it("persists approval bypass and refuses policy drift before authentication", async () => {
+    const host = [...pooledArgs(), "--controller-pool", "--host-tools", "--approval-policy", "bypass"];
+    await runSubscriptionDesktop(host);
+    expect(vi.mocked(createBridgeApp).mock.calls[0]![0]).toMatchObject({ controllerApprovalPolicy: "bypass", permissionMode: "ask" });
+    const marker = JSON.parse(readFileSync(join(data, "subscription-desktop.json"), "utf8"));
+    expect(marker.approvalPolicy).toBe("bypass");
+    vi.mocked(prepareSubscription).mockClear();
+    await expect(runSubscriptionDesktop([...pooledArgs(), "--controller-pool", "--host-tools", "--check"])).rejects.toThrow(/another worker connection or pool policy/);
+    expect(prepareSubscription).not.toHaveBeenCalled();
+    await runSubscriptionDesktop([...host, "--check"]);
+    expect(JSON.parse(vi.mocked(console.log).mock.calls.at(-1)![0])).toMatchObject({ approvalPolicy: "bypass", modelRequestsMade: false });
+  });
+
+  it("treats an older host-tools marker as ask and refuses an implicit upgrade to bypass", async () => {
+    const host = [...pooledArgs(), "--controller-pool", "--host-tools"];
+    await runSubscriptionDesktop(host);
+    const path = join(data, "subscription-desktop.json"), marker = JSON.parse(readFileSync(path, "utf8"));
+    delete marker.approvalPolicy; writeFileSync(path, JSON.stringify(marker), { mode: 0o600 });
+    vi.mocked(prepareSubscription).mockClear();
+    await runSubscriptionDesktop([...host, "--check"]);
+    expect(prepareSubscription).toHaveBeenCalledTimes(8);
+    vi.mocked(prepareSubscription).mockClear();
+    await expect(runSubscriptionDesktop([...host, "--approval-policy", "bypass", "--check"])).rejects.toThrow(/another worker connection or pool policy/);
+    expect(prepareSubscription).not.toHaveBeenCalled();
+  });
+
   it("requires both pools for --host-tools and rejects duplicate opt-in", () => {
     expect(() => parseSubscriptionDesktop([...args, "--host-tools"])).toThrow(/requires? --controller-pool/);
     expect(() => parseSubscriptionDesktop([...pooledArgs(), "--host-tools"])).toThrow(/requires? --controller-pool/);

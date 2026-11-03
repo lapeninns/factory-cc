@@ -48,12 +48,15 @@ export interface WorkerRunContext {
   message(value: Record<string, unknown>): void;
 }
 export type WorkerRepositoryPolicy = "allowlist" | "owned-git";
+export type WorkerApprovalPolicy = "ask" | "bypass";
 export interface APIWorkerServiceOptions {
   stateRoot: string;
   workspaceRoot: string;
   allowedRepositories: string[];
   /** Private operator policy. Request inputs cannot expand repository access. */
   repositoryPolicy?: WorkerRepositoryPolicy;
+  /** Explicit local operator policy; subscription workers only. */
+  approvalPolicy?: WorkerApprovalPolicy;
   provider: { kind: "anthropic" | "openrouter" } | { kind: "subscription"; profile: SubscriptionProfile; mappingPath?: string; executable?: string };
   maxConcurrent?: number;
   maxBudgetUsd?: number;
@@ -104,6 +107,7 @@ export class APIWorkerService {
   private readonly workspaces: string;
   private readonly repositories: Set<string>;
   private readonly repositoryPolicy: WorkerRepositoryPolicy;
+  private readonly approvalPolicy: WorkerApprovalPolicy;
   private readonly workers = new Map<string, LiveWorker>();
   private readonly active = new Set<string>();
   private readonly creating = new Set<Promise<unknown>>();
@@ -112,6 +116,11 @@ export class APIWorkerService {
   private closed = false;
 
   constructor(private readonly options: APIWorkerServiceOptions) {
+    this.approvalPolicy = options.approvalPolicy ?? "ask";
+    if (!["ask", "bypass"].includes(this.approvalPolicy)
+        || (this.approvalPolicy === "bypass" && options.provider.kind !== "subscription")) {
+      throw new Error("Automatic worker approvals require an explicit subscription policy.");
+    }
     this.repositoryPolicy = options.repositoryPolicy === undefined ? "allowlist" : options.repositoryPolicy;
     if (!["allowlist", "owned-git"].includes(this.repositoryPolicy)
         || (this.repositoryPolicy === "owned-git" && options.provider.kind !== "subscription")) {
@@ -313,7 +322,8 @@ export class APIWorkerService {
             const id = toolUseId ?? event.tool_use_id;
             if (!id) return deny("Workflow execution requires an exact tool-use identity.");
             // Workflow can be classified as safe by the native permission engine.
-            // Ask explicitly here before it can run, regardless of canUseTool.
+            // Apply the operator's approval policy here even when the native
+            // permission engine would not call canUseTool for this workflow.
             const decision = await this.requestPermission(live, "Workflow", input!, context.signal, id);
             if (!active()) return deny("The worker was cancelled or its execution changed while awaiting approval.");
             if (!decision || decision.behavior !== "allow") return deny(decision?.message ?? "Workflow was not approved.");
@@ -403,12 +413,30 @@ export class APIWorkerService {
   }
   private policy(record: WorkerRecord): string {
     return (this.options.policyText ?? DEFAULT_POLICY) + "\n\nSelected workflow: " + record.workflow + ".\n" + (this.options.workflowText?.[record.workflow] ?? "")
+      + (this.approvalPolicy === "bypass" ? "\nThe local operator explicitly enabled automatic worker tool approval for this subscription connection. This removes extra tool approval prompts; it does not expand the task's authority or override repository, production, sandbox, or workspace rules." : "")
       + "\nAssigned worktree: " + record.worktree + ". Source checkout is read-only context: " + record.repository + ".";
   }
   private requestPermission(live: LiveWorker, tool: string, input: Record<string, unknown>, signal: AbortSignal, toolUseId?: string): ReturnType<CanUseTool> {
     if (live.controller.signal.aborted || signal.aborted || TERMINAL.has(live.record.state)) return Promise.resolve({ behavior: "deny", message: "The worker is no longer accepting actions." });
+    // The optional approval bypass does not bypass the worker's tool or
+    // workspace boundaries, including direct native permission callbacks.
+    let refused: string | undefined;
+    if (BLOCKED_TOOLS.includes(tool)) refused = "This worker cannot create another workspace, remote execution or a scheduled task.";
+    if (["Write", "Edit", "MultiEdit", "NotebookEdit"].includes(tool)) {
+      const path = input.file_path ?? input.notebook_path;
+      if (typeof path !== "string" || !insideWorktree(live.record.worktree, path)) refused = "Writes must stay in this worker's assigned worktree.";
+    }
+    if (tool === "Workflow") refused = validateWorkflowInput(input);
     const id = randomUUID(), snapshot = structuredClone(input);
     const view: WorkerApproval = { id, toolName: tool.slice(0, 160), input: redactJson(snapshot), requestedAt: now(), ...(toolUseId ? { toolUseId } : {}) };
+    if (refused || this.approvalPolicy === "bypass") {
+      // An existing parked batch must reacquire its seat before any native
+      // continuation, including an automatically approved concurrent action.
+      if (this.options.provider.kind === "subscription" && this.options.acquireLease && live.approvalBatch) {
+        return this.subscriptionPermission(live, snapshot, view, signal, refused ? { decision: "deny", message: refused } : { decision: "allow" });
+      }
+      return Promise.resolve(refused ? { behavior: "deny", message: refused } : { behavior: "allow", updatedInput: snapshot });
+    }
     // Apply the exact display/decision bound before creating a pending action or
     // parking a subscription lease. An unreadable action must return a denial
     // to the SDK so it can continue with a smaller operation.
@@ -417,7 +445,7 @@ export class APIWorkerService {
       // Another concurrent action may already have parked this worker's lease.
       // Its automatic denial must respect that handoff before native work resumes.
       if (this.options.provider.kind === "subscription" && this.options.acquireLease && live.approvalBatch) {
-        return this.subscriptionPermission(live, snapshot, view, signal, message);
+        return this.subscriptionPermission(live, snapshot, view, signal, { decision: "deny", message });
       }
       return Promise.resolve({ behavior: "deny", message });
     }
@@ -440,7 +468,8 @@ export class APIWorkerService {
       if (signal.aborted || live.controller.signal.aborted) abort();
     });
   }
-  private subscriptionPermission(live: LiveWorker, snapshot: Record<string, unknown>, view: WorkerApproval, signal: AbortSignal, denialMessage?: string): ReturnType<CanUseTool> {
+  private subscriptionPermission(live: LiveWorker, snapshot: Record<string, unknown>, view: WorkerApproval, signal: AbortSignal,
+    automatic?: { decision: "allow" | "deny"; message?: string }): ReturnType<CanUseTool> {
     let batch = live.approvalBatch;
     if (!batch) {
       const controller = new AbortController(), abort = () => controller.abort();
@@ -457,11 +486,11 @@ export class APIWorkerService {
     const current = batch, id = view.id;
     return new Promise(resolvePermission => {
       const abort = () => settle("deny");
-      const pending = { decision: (denialMessage ? "deny" : undefined) as "allow" | "deny" | undefined, finish: (allowed: boolean) => {
+      const pending = { decision: automatic?.decision as "allow" | "deny" | undefined, finish: (allowed: boolean) => {
         signal.removeEventListener("abort", abort);
         live.controller.signal.removeEventListener("abort", abort);
         resolvePermission(allowed && !signal.aborted ? { behavior: "allow", updatedInput: snapshot }
-          : { behavior: "deny", message: denialMessage ?? "Denied by the Factory controller or worker cancellation." });
+          : { behavior: "deny", message: automatic?.message ?? "Denied by the Factory controller or worker cancellation." });
       } };
       const settle = (decision: "allow" | "deny") => {
         if (pending.decision !== undefined) return;
@@ -473,7 +502,7 @@ export class APIWorkerService {
         this.resumeApprovedBatch(live, current);
       };
       current.requests.set(id, pending);
-      if (!denialMessage) {
+      if (!automatic) {
         live.approvals.set(id, { view, settle });
         live.record.pendingApprovalCount = live.approvals.size;
         live.record.state = "waiting_approval"; this.save(live);
@@ -481,7 +510,7 @@ export class APIWorkerService {
       signal.addEventListener("abort", abort, { once: true });
       live.controller.signal.addEventListener("abort", abort, { once: true });
       if (signal.aborted || live.controller.signal.aborted) abort();
-      if (denialMessage) this.resumeApprovedBatch(live, current);
+      if (automatic) this.resumeApprovedBatch(live, current);
     });
   }
   private resumeApprovedBatch(live: LiveWorker, batch: SubscriptionApprovalBatch): void {
