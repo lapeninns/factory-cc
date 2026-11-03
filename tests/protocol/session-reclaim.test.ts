@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as runtimeFactory from "../../src/runtime/factory.js";
@@ -232,5 +233,33 @@ describe("a session that is still in use is never reclaimed; the request gets th
     await expectRefused(app, token, busy!.bridgeSessionId, "GENERATING");
     release.resolve(textTurn());
     expect((await generating).status).toBe(200);
+  });
+});
+
+describe("Droid desktop turn outcomes", () => {
+  it("frees an ended turn without pressure and rejects its late result, preserving other parked work", async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), "relay-droid-transcripts-"));
+    const folder = join(sessionsDir, "workspace");
+    mkdirSync(folder);
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      const { app, token, config } = await bridge({ maxSessions: 2, droidSessionsDir: sessionsDir });
+      const abandoned = await park(app, token, "abandoned");
+      const active = await park(app, token, "active", { tool: "AskUser" });
+      const tool = (id: string) => ({ type: "message", message: { role: "assistant", content: [{ type: "tool_use", id }] } });
+      const outcome = { type: "agent_turn_outcome", turnId: "droid-turn-1", reason: "model_request_rejected" };
+      writeFileSync(join(folder, "first.jsonl"), [tool(abandoned.toolUseId), outcome, tool(active.toolUseId)].map((row) => JSON.stringify(row)).join("\n") + "\n");
+      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.waitFor(() => expect(runtime.cancel).toHaveBeenCalledExactlyOnceWith(abandoned.sessionId, "droid-turn-ended"));
+      expect(app.store.require(active.sessionId).state).toBe("WAITING_DROID_TOOL");
+      expect(app.store.require(abandoned.sessionId)).toMatchObject({ state: "IDLE", hostEnded: "interrupted", endedToolIds: [abandoned.toolUseId] });
+      expect((await postMessages(app.url, token, returnResult("abandoned"))).status).toBe(409);
+      expect((await postMessages(app.url, token, fresh())).status).toBe(200);
+      expect(readFileSync(join(config.logDir, "bridge.jsonl"), "utf8")).toContain("droid_turn_released");
+    } finally {
+      await apps.pop()?.close();
+      vi.useRealTimers();
+      rmSync(sessionsDir, { recursive: true, force: true });
+    }
   });
 });
