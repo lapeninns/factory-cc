@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import select
 import signal
 import subprocess
 import sys
@@ -10,7 +11,7 @@ import unittest
 from unittest import mock
 
 from native_runtime.core import RuntimeConfig, RuntimeRefused, process_identity, state_lock, write_job
-from native_runtime.supervisor import get_job, list_jobs, request_cancel, run_check, run_job
+from native_runtime.supervisor import execution_lane, get_job, list_jobs, request_cancel, run_check, run_job
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -164,6 +165,51 @@ print('RESULT='+r['id'],flush=True)
         request_cancel(self.config, second["id"])
         self.wait_process(first_proc)
         self.wait_process(second_proc)
+
+    def test_factory_controller_runs_while_native_workers_fill_their_capacity(self):
+        first_proc = self.launch(profile='team1', sleep=8)
+        first = self.wait_job(lambda item: item['state'] == 'running')
+        second_proc = self.launch(profile='team2', sleep=8)
+        second = self.wait_job(lambda item: item['id'] != first['id'] and item['state'] == 'running')
+        third_proc = self.launch(profile='team3', sleep=0.1)
+        third = self.wait_job(lambda item: item['id'] not in (first['id'], second['id'])
+                              and item['state'] == 'waiting_slot')
+        controller = subprocess.Popen(
+            [sys.executable, '-m', 'native_runtime.factory_lease', '--state-root', str(self.config.state_root)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            bufsize=0, env=dict(os.environ, PYTHONPATH=str(ROOT), PYTHONDONTWRITEBYTECODE='1'))
+        self.processes.append(controller)
+        try:
+            request = {'op': 'acquire', 'factorySessionId': 'native-controller',
+                       'bridgeSessionId': 'native-controller-phase', 'cwd': str(self.repo),
+                       'role': 'orchestrator', 'subscriptionProfile': 'team1',
+                       'workspacePolicy': 'controller-readonly'}
+            controller.stdin.write((json.dumps(request) + '\n').encode())
+            controller.stdin.flush()
+            self.assertTrue(select.select([controller.stdout], [], [], 3)[0])
+            self.assertEqual(json.loads(controller.stdout.readline())['event'], 'queued')
+            self.assertTrue(select.select([controller.stdout], [], [], 3)[0])
+            self.assertEqual(json.loads(controller.stdout.readline())['event'], 'ready')
+            jobs = list_jobs(self.config)
+            occupied = [job for job in jobs if job['state'] in ('starting', 'running')]
+            self.assertEqual(sum(execution_lane(job) == 'worker' for job in occupied), 2)
+            self.assertEqual(sum(execution_lane(job) == 'controller' for job in occupied), 1)
+            self.assertEqual(get_job(self.config, third['id'])['state'], 'waiting_slot')
+
+            request_cancel(self.config, first['id'])
+            self.wait_process(first_proc)
+            self.wait_process(third_proc)
+            self.assertEqual(get_job(self.config, third['id'])['state'], 'completed')
+            self.assertEqual(get_job(self.config, second['id'])['state'], 'running')
+            controller.stdin.write((json.dumps({'op': 'release', 'state': 'completed', 'cleanupVerified': True}) + '\n').encode())
+            controller.stdin.flush()
+            self.assertTrue(select.select([controller.stdout], [], [], 3)[0])
+            self.assertEqual(json.loads(controller.stdout.readline())['event'], 'released')
+            self.wait_process(controller)
+        finally:
+            controller.stdin.close()
+            request_cancel(self.config, second['id'])
+            self.wait_process(second_proc)
 
     def test_deadline_terminates_owned_process_without_touching_unrelated(self):
         unrelated = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(30)"])

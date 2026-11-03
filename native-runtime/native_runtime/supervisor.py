@@ -26,6 +26,44 @@ from .workspace import create_workspace, git, validate_workspace
 
 TERMINAL = frozenset(("completed", "failed", "cancelled", "interrupted"))
 OCCUPIED = frozenset(("starting", "running", "orphaned", "cleanup_blocked", "unknown"))
+CONTROLLER_SLOTS = 1
+SUBSCRIPTION_PROFILES = frozenset("team" + str(number) for number in range(1, 9))
+
+
+def execution_lane(job):
+    """Only a fully bound subscription controller gets reserved capacity."""
+    profile = job.get("profile")
+    if (job.get("kind") == "factory-session"
+            and job.get("authMode") == "subscription"
+            and job.get("workspacePolicy") in ("controller-readonly", "controller-host")
+            and job.get("role") in ("chat", "orchestrator")
+            and isinstance(profile, str) and profile in SUBSCRIPTION_PROFILES
+            and job.get("subscriptionProfile") == profile):
+        return "controller"
+    return "worker"
+
+
+def profile_conflicts(job, occupied):
+    """Known controller and worker execution may share an account across lanes.
+
+    An uncertain execution retains the whole account until its owner confirms
+    cleanup, even when the other lane would otherwise have room.
+    """
+    if job.get("kind") == "factory-session" and job.get("profile") == "factory-api":
+        return False
+    lane = execution_lane(job)
+    for running in occupied:
+        if running.get("profile") != job.get("profile"):
+            continue
+        if execution_lane(running) == lane:
+            return True
+        if running.get("state") in ("unknown", "orphaned", "cleanup_blocked"):
+            return True
+        owner = (running.get("leaseOwnerIdentity") if running.get("kind") == "factory-session"
+                 else running.get("supervisorIdentity"))
+        if not matches(owner):
+            return True
+    return False
 
 
 def _host_workspace_conflict(left, right):
@@ -125,16 +163,18 @@ def _reserve(config, job):
             job.update(current)
             return "cancelled"
         occupied = [item for item in jobs if item.get("state") in OCCUPIED]
-        if len(occupied) >= config.max_running:
+        lane = execution_lane(job)
+        lane_limit = CONTROLLER_SLOTS if lane == "controller" else config.max_running
+        if sum(execution_lane(item) == lane for item in occupied) >= lane_limit:
             return "wait"
-        busy_profiles = {item["profile"] for item in occupied}
         busy_workspaces = {item.get("worktree") for item in occupied}
-        if job["profile"] in busy_profiles:
+        if profile_conflicts(job, occupied):
             return "wait"
         if job.get("worktree") in busy_workspaces or any(_host_workspace_conflict(job, item) for item in occupied):
             return "wait"
         eligible = sorted((item for item in jobs if item.get("state") == "waiting_slot"
-                           and item["profile"] not in busy_profiles
+                           and execution_lane(item) == lane
+                           and not profile_conflicts(item, occupied)
                            and item.get("worktree") not in busy_workspaces
                            and not any(_host_workspace_conflict(item, running) for running in occupied)),
                           key=lambda item: (item.get("queuedAt", ""), item["id"]))

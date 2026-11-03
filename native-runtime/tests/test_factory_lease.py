@@ -11,7 +11,7 @@ from unittest import mock
 
 from native_runtime.core import RuntimeConfig, now, process_identity, read_job, state_lock, write_job
 from native_runtime.factory_lease import ProtocolError, validate_worktree
-from native_runtime.supervisor import list_jobs, _reserve as reserve_native
+from native_runtime.supervisor import execution_lane, list_jobs, _reserve as reserve_native
 
 
 SOURCE = Path(__file__).resolve().parents[1]
@@ -290,10 +290,15 @@ class FactoryLeaseTests(unittest.TestCase):
         self.assertEqual(same_id, job_id)
         self.release(resumed)
 
-    def test_readonly_controllers_may_share_primary_checkout_but_not_a_writer_workspace(self):
+    def test_readonly_controllers_share_checkout_with_serialized_execution(self):
         first, _ = self.admitted('controller-one', self.repo, role='chat', subscriptionProfile='team1', workspacePolicy='controller-readonly')
-        second, _ = self.admitted('controller-two', self.repo, role='orchestrator', subscriptionProfile='team2', workspacePolicy='controller-readonly')
+        second = self.start()
+        self.send(second, self.request('controller-two', self.repo, role='orchestrator',
+                                       subscriptionProfile='team2', workspacePolicy='controller-readonly'))
+        self.assertEqual(self.receive(second)['event'], 'queued')
+        self.assertIsNone(self.receive(second, .15))
         self.release(first)
+        self.assertEqual(self.receive(second)['event'], 'ready')
         self.release(second)
         reader, _ = self.admitted('reader', self.worktree, role='chat', subscriptionProfile='team1', workspacePolicy='controller-readonly')
         writer = self.start()
@@ -301,6 +306,172 @@ class FactoryLeaseTests(unittest.TestCase):
         self.assertFalse(self.receive(writer)['ok'])
         self.assertEqual(writer.wait(timeout=3), 2)
         self.release(reader)
+
+    def test_controller_capacity_remains_available_with_two_workers_and_an_older_queue(self):
+        second_tree = self.root / 'second-worker'
+        third_tree = self.root / 'third-worker'
+        self.git(self.repo, 'worktree', 'add', '-qb', 'second-worker', str(second_tree))
+        self.git(self.repo, 'worktree', 'add', '-qb', 'third-worker', str(third_tree))
+        first, _ = self.admitted('first-worker', subscriptionProfile='team1')
+        second, _ = self.admitted('second-worker', second_tree, subscriptionProfile='team2')
+        third = self.start()
+        self.send(third, self.request('third-worker', third_tree, subscriptionProfile='team3'))
+        self.assertEqual(self.receive(third)['event'], 'queued')
+        self.assertIsNone(self.receive(third, .15))
+
+        controller, _ = self.admitted('controller', self.repo, role='orchestrator',
+                                      subscriptionProfile='team1', workspacePolicy='controller-readonly')
+        running = [job for job in list_jobs(self.config) if job['state'] == 'running']
+        self.assertEqual(sum(execution_lane(job) == 'worker' for job in running), 2)
+        self.assertEqual(sum(execution_lane(job) == 'controller' for job in running), 1)
+        another_controller = self.start()
+        self.send(another_controller, self.request('another-controller', self.repo,
+                  role='chat', subscriptionProfile='team4', workspacePolicy='controller-readonly'))
+        self.assertEqual(self.receive(another_controller)['event'], 'queued')
+        self.assertIsNone(self.receive(another_controller, .15))
+        self.assertIsNone(self.receive(third, .1))
+
+        self.release(controller, 'completed', cleanupVerified=True)
+        self.assertEqual(self.receive(another_controller)['event'], 'ready')
+        self.assertIsNone(self.receive(third, .1))
+        self.release(first, 'completed', cleanupVerified=True)
+        self.assertEqual(self.receive(third)['event'], 'ready')
+        self.release(second, 'completed', cleanupVerified=True)
+        self.release(third, 'completed', cleanupVerified=True)
+        self.release(another_controller, 'completed', cleanupVerified=True)
+
+    def test_uncertain_worker_blocks_its_account_across_lanes_until_cleanup(self):
+        first, _ = self.admitted('uncertain-worker', subscriptionProfile='team1')
+        self.release(first, 'unknown', cleanupVerified=False)
+        same_account = self.start()
+        self.send(same_account, self.request('blocked-controller', self.repo, role='chat',
+                  subscriptionProfile='team1', workspacePolicy='controller-readonly'))
+        self.assertEqual(self.receive(same_account)['event'], 'queued')
+        self.assertIsNone(self.receive(same_account, .15))
+        other_account, _ = self.admitted('other-controller', self.repo, role='chat',
+                                         subscriptionProfile='team2', workspacePolicy='controller-readonly')
+        self.release(other_account, 'completed', cleanupVerified=True)
+        self.assertIsNone(self.receive(same_account, .1))
+
+        cleanup = self.start()
+        self.send(cleanup, self.request('uncertain-worker', op='update', subscriptionProfile='team1',
+                                       state='cancelled', cleanupVerified=True))
+        self.assertEqual(self.receive(cleanup)['event'], 'updated')
+        self.assertEqual(cleanup.wait(timeout=3), 0)
+        self.assertEqual(self.receive(same_account)['event'], 'ready')
+        self.release(same_account, 'completed', cleanupVerified=True)
+
+    def test_missing_external_owner_blocks_cross_lane_account_sharing(self):
+        with state_lock(self.config):
+            write_job(self.config, {'id': 'lost-worker-owner', 'kind': 'factory-session',
+                                    'profile': 'team1', 'state': 'running',
+                                    'supervisorIdentity': process_identity(os.getpid()),
+                                    'leaseOwnerIdentity': None, 'externalCleanupRequired': True,
+                                    'createdAt': now(), 'worktree': str(self.root / 'lost-worker')})
+        blocked = self.start()
+        self.send(blocked, self.request('blocked-controller', self.repo, role='chat',
+                                       subscriptionProfile='team1', workspacePolicy='controller-readonly'))
+        self.assertEqual(self.receive(blocked)['event'], 'queued')
+        self.assertIsNone(self.receive(blocked, .15))
+        other, _ = self.admitted('other-controller', self.repo, role='chat',
+                                 subscriptionProfile='team2', workspacePolicy='controller-readonly')
+        self.send(blocked, {'op': 'cancel'})
+        self.assertEqual(self.receive(blocked)['event'], 'cancelled')
+        self.assertEqual(blocked.wait(timeout=3), 0)
+        self.release(other, 'completed', cleanupVerified=True)
+
+    def test_cancelled_controller_waiter_does_not_block_the_next_controller(self):
+        first, _ = self.admitted('first-controller', self.repo, role='chat',
+                                 subscriptionProfile='team1', workspacePolicy='controller-readonly')
+        cancelled = self.start()
+        self.send(cancelled, self.request('cancelled-controller', self.repo, role='chat',
+                                         subscriptionProfile='team2', workspacePolicy='controller-readonly'))
+        queued = self.receive(cancelled)
+        self.assertEqual(queued['event'], 'queued')
+        self.assertIsNone(self.receive(cancelled, .15))
+        self.send(cancelled, {'op': 'cancel'})
+        self.assertEqual(self.receive(cancelled)['event'], 'cancelled')
+        self.assertEqual(cancelled.wait(timeout=3), 0)
+        self.assertNotIn('admittedAt', read_job(self.config, queued['jobId']))
+
+        next_controller = self.start()
+        self.send(next_controller, self.request('next-controller', self.repo, role='chat',
+                                               subscriptionProfile='team3', workspacePolicy='controller-readonly'))
+        self.assertEqual(self.receive(next_controller)['event'], 'queued')
+        self.assertIsNone(self.receive(next_controller, .15))
+        self.release(first, 'completed', cleanupVerified=True)
+        self.assertEqual(self.receive(next_controller)['event'], 'ready')
+        self.release(next_controller, 'completed', cleanupVerified=True)
+
+    def test_native_worker_ignores_controller_queue_but_keeps_its_profile_limit(self):
+        controller, _ = self.admitted('controller', self.repo, role='orchestrator',
+                                      subscriptionProfile='team1', workspacePolicy='controller-readonly')
+        queued_controller = self.start()
+        self.send(queued_controller, self.request('queued-controller', self.repo, role='chat',
+                  subscriptionProfile='team2', workspacePolicy='controller-readonly'))
+        self.assertEqual(self.receive(queued_controller)['event'], 'queued')
+        self.assertIsNone(self.receive(queued_controller, .15))
+
+        first = {'id': 'native-first', 'kind': 'native-session', 'profile': 'team1',
+                 'state': 'waiting_slot', 'supervisorIdentity': process_identity(os.getpid()),
+                 'createdAt': now(), 'queuedAt': now(), 'worktree': str(self.root / 'native-first')}
+        second = {'id': 'native-second', 'kind': 'native-session', 'profile': 'team1',
+                  'state': 'waiting_slot', 'supervisorIdentity': process_identity(os.getpid()),
+                  'createdAt': now(), 'queuedAt': now(), 'worktree': str(self.root / 'native-second')}
+        with state_lock(self.config):
+            write_job(self.config, first)
+            write_job(self.config, second)
+        self.assertEqual(reserve_native(self.config, first), 'start')
+        self.assertEqual(reserve_native(self.config, second), 'wait')
+        with state_lock(self.config):
+            first['state'] = 'completed'
+            write_job(self.config, first)
+        self.assertEqual(reserve_native(self.config, second), 'start')
+        self.release(controller, 'completed', cleanupVerified=True)
+        self.assertEqual(self.receive(queued_controller)['event'], 'ready')
+        self.release(queued_controller, 'completed', cleanupVerified=True)
+
+    def test_uncertain_controller_retains_its_slot_and_blocks_same_account_worker(self):
+        first, _ = self.admitted('uncertain-controller', self.repo, role='chat',
+                                subscriptionProfile='team1', workspacePolicy='controller-readonly')
+        self.release(first, 'unknown', cleanupVerified=False)
+        worker = self.start()
+        self.send(worker, self.request('blocked-worker', subscriptionProfile='team1'))
+        self.assertEqual(self.receive(worker)['event'], 'queued')
+        self.assertIsNone(self.receive(worker, .15))
+        next_controller = self.start()
+        self.send(next_controller, self.request('next-controller', self.repo, role='chat',
+                  subscriptionProfile='team2', workspacePolicy='controller-readonly'))
+        self.assertEqual(self.receive(next_controller)['event'], 'queued')
+        self.assertIsNone(self.receive(next_controller, .15))
+
+        other_tree = self.root / 'other-worker'
+        self.git(self.repo, 'worktree', 'add', '-qb', 'other-worker', str(other_tree))
+        other_worker, _ = self.admitted('other-worker', other_tree, subscriptionProfile='team3')
+        self.assertIsNone(self.receive(worker, .1))
+        self.assertIsNone(self.receive(next_controller, .1))
+        cleanup = self.start()
+        self.send(cleanup, self.request('uncertain-controller', self.repo, op='update', role='chat',
+                  subscriptionProfile='team1', workspacePolicy='controller-readonly',
+                  state='cancelled', cleanupVerified=True))
+        self.assertEqual(self.receive(cleanup)['event'], 'updated')
+        self.assertEqual(cleanup.wait(timeout=3), 0)
+        self.assertEqual(self.receive(worker)['event'], 'ready')
+        self.assertEqual(self.receive(next_controller)['event'], 'ready')
+        self.release(worker, 'completed', cleanupVerified=True)
+        self.release(other_worker, 'completed', cleanupVerified=True)
+        self.release(next_controller, 'completed', cleanupVerified=True)
+
+    def test_reserved_lane_requires_complete_matching_controller_metadata(self):
+        controller = {'kind': 'factory-session', 'authMode': 'subscription', 'profile': 'team1',
+                      'subscriptionProfile': 'team1', 'workspacePolicy': 'controller-readonly', 'role': 'chat'}
+        self.assertEqual(execution_lane(controller), 'controller')
+        for change in ({'kind': 'native-session'}, {'authMode': 'api'}, {'profile': 'team9'},
+                       {'subscriptionProfile': 'team2'}, {'subscriptionProfile': None},
+                       {'workspacePolicy': None}, {'role': 'worker'}, {'role': 'session'}):
+            with self.subTest(change=change):
+                self.assertEqual(execution_lane({**controller, **change}), 'worker')
+        self.assertEqual(execution_lane({'profile': 'team1', 'role': 'orchestrator'}), 'worker')
 
     def test_global_admission_counts_native_jobs_and_cancel_queued(self):
         with state_lock(self.config):

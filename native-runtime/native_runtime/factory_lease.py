@@ -17,7 +17,9 @@ import time
 
 from .core import (RuntimeConfig, RuntimeRefused, matches, now, process_identity,
                    read_job, state_lock, write_job)
-from .supervisor import OCCUPIED, TERMINAL, _all_jobs, _host_workspace_conflict, _reconcile_locked
+from .supervisor import (CONTROLLER_SLOTS, OCCUPIED, TERMINAL, _all_jobs,
+                         _host_workspace_conflict, _reconcile_locked,
+                         execution_lane, profile_conflicts)
 from .workspace import git
 
 MAX_MESSAGE = 64 * 1024
@@ -189,13 +191,14 @@ def reserve(config, job):
         if not matches(job["leaseOwnerIdentity"]):
             return "owner_lost"
         occupied = [item for item in jobs if item.get("state") in OCCUPIED]
-        if len(occupied) >= config.max_running:
+        lane = execution_lane(job)
+        lane_limit = CONTROLLER_SLOTS if lane == "controller" else config.max_running
+        if sum(execution_lane(item) == lane for item in occupied) >= lane_limit:
             return "wait"
-        busy_profiles = {item.get("profile") for item in occupied}
         eligible = [item for item in jobs if item.get("state") == "waiting_slot"
+                    and execution_lane(item) == lane
                     and not any(_workspace_conflict(item, running) for running in occupied)
-                    and ((item.get("kind") == "factory-session" and item.get("profile") == "factory-api")
-                         or item.get("profile") not in busy_profiles)]
+                    and not profile_conflicts(item, occupied)]
         eligible.sort(key=lambda item: (item.get("queuedAt", ""), item["id"]))
         if not eligible or eligible[0]["id"] != job["id"]:
             return "wait"

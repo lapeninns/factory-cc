@@ -39,14 +39,20 @@ and provider eligibility for every configured account.
 3. The worker creates a new Git branch and linked worktree from committed
    source, leaving dirty changes in the original checkout in place. It runs the
    official Claude Agent SDK with Opus 5.5, medium effort and Ultracode.
-4. The Python lease helper shares admission with standalone native jobs:
-   at most two active jobs in total and one active job per subscription seat.
+4. The Python lease helper shares admission with standalone native jobs.
+   It allows two active worker jobs and reserves one additional controller slot.
+   A subscription seat can run one worker and one controller concurrently.
    Paused model phases release capacity as appropriate; an outstanding host
    operation or uncertain cleanup retains its lease.
 5. The pooled connection scopes status, wait, list and cancel calls to the
    owning Workstream. Fixed-seat connections share their seat service's worker
    ledger. A worker remains pinned to its selected backend. New work can use
    other healthy seats; a partially executed worker is not migrated.
+
+Worker and controller queues are ordered independently, so running workers
+cannot consume the controller's reserved capacity. Workspace conflicts still
+apply across both queues. An uncertain or unowned execution holds its capacity
+and blocks reuse of its account across both queues until cleanup is verified.
 
 A limited pooled controller can change accounts only after the previous native
 process has been cleaned up and there is no unsafe pending tool action. The

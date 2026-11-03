@@ -33,6 +33,7 @@ export interface DesktopLeaseOptions {
   pythonExecutable: string;
   runtimePackagePath: string;
   stateRoot: string;
+  /** Shared worker capacity; the native scheduler reserves one additional controller slot. */
   maxRunning?: number;
   admissionTimeoutMs?: number;
   releaseTimeoutMs?: number;
@@ -334,8 +335,9 @@ export class DesktopJobsRuntime implements BridgeRuntime {
   }
 
   describe(): Record<string, unknown> {
+    const workerSlots = this.options.maxRunning ?? 2;
     return { ...this.inner.describe?.(), desktopJobs: { activePhases: this.active.size,
-      maxRunning: this.options.maxRunning ?? 2, faults: this.faults.slice(-32),
+      maxRunning: workerSlots + 1, workerSlots, controllerSlots: 1, faults: this.faults.slice(-32),
       heldHostActions: this.heldHost.size,
       scope: "active model phases; parked native sessions remain managed by the inner runtime" } };
   }
@@ -388,7 +390,7 @@ class LeaseChannel {
       "--max-running", String(options.maxRunning ?? 2)], { stdio: ["pipe", "pipe", "pipe"],
       env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "", LC_ALL: "C",
         PYTHONPATH: packagePath, PYTHONDONTWRITEBYTECODE: "1" } });
-    this.timer = setTimeout(() => this.fail("desktop_job_timeout", "The Factory job admission timed out."), options.admissionTimeoutMs ?? 300_000);
+    this.timer = setTimeout(() => this.fail("desktop_job_timeout", "The scheduler could not admit this request before its queue deadline."), options.admissionTimeoutMs ?? 300_000);
     this.timer.unref();
     this.child.stdout.on("data", (data: Buffer) => this.consume(data));
     // Error diagnostics from the helper may contain paths; never relay raw text.

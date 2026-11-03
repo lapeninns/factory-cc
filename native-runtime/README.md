@@ -1,12 +1,17 @@
 # Native Team job runtime
 
 Python 3.9+ standard-library runtime for supervised native jobs and Factory Workstream leases.
-It adds isolated Git worktrees, one-job-per-profile admission, a shared queue,
+It adds isolated Git worktrees, per-profile admission within worker and controller queues,
 supervised execution, privacy-preserving reports, shared policy/workflows and
 versioned releases. Standalone native launchers support the assigned `team1`
 through `team4` profiles. The shared Factory lease helper also accounts for
 `team5` through `team8`; bridge configuration determines fixed-seat versus pool
 routing and the permitted workspace policy.
+
+The default scheduler admits two worker jobs plus one reserved Factory
+controller. Each profile can run one worker and one controller concurrently.
+Workspace conflicts apply across both queues, and uncertain cleanup blocks
+reuse of the affected profile until it is resolved.
 
 Read [the operations guide](docs/OPERATIONS.md) for commands, policy and limits.
 
