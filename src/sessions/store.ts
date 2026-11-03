@@ -1,12 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { appendFileSync, closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, fsyncSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Logger } from "../logging.js";
 import type { ModelProvider } from "../models.js";
+import type { RuntimeHostCompletion } from "../runtime/types.js";
 import { sessionId } from "../relay/ids.js";
 import type { RoleTag, SessionState } from "../types.js";
 import { BridgeError } from "../types.js";
 import { type SessionRecord, retirePendingTools, transition } from "./state.js";
+import { sameToolInput } from "./compaction.js";
 
 export interface SessionRetention { maxRecords: number; maxAgeMs: number; journalMaxBytes: number }
 export const DEFAULT_SESSION_RETENTION: SessionRetention = { maxRecords: 1000, maxAgeMs: 7 * 24 * 60 * 60 * 1000, journalMaxBytes: 8 * 1024 * 1024 };
@@ -97,6 +99,41 @@ export class SessionStore {
     this.sessions.set(id, record);
     this.flush(record);
     return record;
+  }
+
+  /** Persist a host receipt independently of admission to the next model turn. */
+  recordHostCompletion(id: string, completion: RuntimeHostCompletion): "accepted" | "duplicate" {
+    const record = this.require(id);
+    const value = structuredClone({ ...completion, isError: Boolean(completion.isError), terminal: Boolean(completion.terminal) });
+    if (typeof value.toolUseId !== "string" || !value.toolUseId || typeof value.toolName !== "string" || !value.toolName
+        || value.input === undefined || !(typeof value.content === "string" || Array.isArray(value.content))) {
+      throw new BridgeError(400, "invalid_host_completion", "A complete host action receipt is required.");
+    }
+    const previous = record.hostCompletionReceipts ?? [];
+    const existing = previous.find(receipt => receipt.toolUseId === value.toolUseId);
+    if (existing) {
+      if (!sameToolInput(existing, value)) throw new BridgeError(409, "conflicting_host_completion", "The host action already has a different receipt.");
+      return "duplicate";
+    }
+    if (!record.pendingToolIds.includes(value.toolUseId)) {
+      throw new BridgeError(409, "unknown_tool_use_id", "The receipt does not belong to a pending host action.");
+    }
+    const receipts = [...previous, value];
+    if (receipts.length > 128 || Buffer.byteLength(JSON.stringify(receipts)) > 8 * 1024 * 1024) {
+      throw new BridgeError(409, "host_completion_capacity", "Pending host receipts must be reconciled before accepting more data.");
+    }
+    record.hostCompletionReceipts = receipts;
+    try {
+      this.flush(record);
+      if (this.persist) {
+        const fd = openSync(this.file, "r");
+        try { fsyncSync(fd); } finally { closeSync(fd); }
+      }
+    } catch (error) {
+      record.hostCompletionReceipts = previous;
+      throw error;
+    }
+    return "accepted";
   }
 
   /**

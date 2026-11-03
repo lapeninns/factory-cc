@@ -12,6 +12,26 @@ from native_runtime import auth
 
 
 class AuthResolutionTests(unittest.TestCase):
+    def test_all_eight_profiles_resolve_their_own_private_mapping(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            profiles = {}
+            for number in range(1, 9):
+                name = 'team' + str(number)
+                directory = root / name
+                directory.mkdir()
+                profiles[name] = {'email': name + '@example.invalid', 'configDir': str(directory)}
+            mapping = root / 'mapping.json'
+            mapping.write_text(json.dumps({'profiles': profiles}))
+            mapping.chmod(0o600)
+            with patch.object(auth, 'CONFIG', mapping):
+                self.assertEqual(auth.PROFILES, set(profiles))
+                for name, profile in profiles.items():
+                    with self.subTest(profile=name):
+                        self.assertEqual(auth.profile_settings(name), (profile['email'], profile['configDir']))
+                with self.assertRaises(auth.Refused):
+                    auth.profile_settings('team9')
+
     def test_explicit_cli_path_takes_precedence_over_path_lookup(self):
         with patch.object(auth.shutil, 'which') as lookup:
             self.assertEqual(auth.resolve_cli({'NATIVE_TEAM_CLAUDE_CLI': '/configured/claude'}, '/home/fixture'),

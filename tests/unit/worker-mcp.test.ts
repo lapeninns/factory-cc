@@ -51,4 +51,26 @@ describe("Factory supervised worker MCP", () => {
     } finally { await client.close(); await server.close(); }
   });
 
+  it("forwards scoped operation identity and performs read-only lookup", async () => {
+    const calls: unknown[] = [];
+    const controller = {
+      start: async (input: unknown) => { calls.push(input); return { id: "worker-fixture" }; },
+      lookup: (operationId: string, operationOwner: string) => ({ id: "worker-fixture", operationId, operationOwner }),
+      status: () => ({}), list: () => [], cancel: async () => ({}),
+    };
+    const server = createWorkerMcp(controller), client = new Client({ name: "fixture", version: "1" });
+    const [host, peer] = InMemoryTransport.createLinkedPair();
+    await server.connect(peer); await client.connect(host);
+    try {
+      const operation = { operationId: "operation-1", operationOwner: "a".repeat(64) };
+      const input = { repository: "/repo", task: "fixture", workflow: "investigate", ...operation };
+      await client.callTool({ name: "factory_worker_start", arguments: input });
+      expect(calls).toEqual([input]);
+      const lookup = await client.callTool({ name: "factory_worker_lookup", arguments: operation });
+      expect(lookup.isError).not.toBe(true);
+      expect(JSON.stringify(lookup)).toContain("worker-fixture");
+      expect(calls).toHaveLength(1);
+    } finally { await client.close(); await server.close(); }
+  });
+
 });

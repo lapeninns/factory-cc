@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import type { BridgeRuntime, RuntimeApprovalRequest, RuntimeControl, RuntimePermissionDecision } from "../runtime/types.js";
 import type { SessionStore } from "../sessions/store.js";
 import { BridgeError, type ContentBlock, type MessagesRequest } from "../types.js";
-import { canonicalWorkspacePath } from "../workspace.js";
+import { canonicalWorkspacePath, COMPACTION_SUMMARY } from "../workspace.js";
 
 type ObjectValue = Record<string, unknown>;
 interface HostBinding {
@@ -116,19 +116,43 @@ export class ControlBroker implements RuntimeControl {
     return { ok: true, launchId, ended: true };
   }
 
-  /** Registered opaque hook markers are transport metadata, not native prompt text. */
-  prepareRequest(original: MessagesRequest, cwd: string): { request: MessagesRequest; binding?: string } {
-    const request = structuredClone(original);
+  /** Only leading host context can select a binding. Returned content is data. */
+  prepareRequest(original: MessagesRequest, cwd?: string): { request: MessagesRequest; binding?: string } {
     const found = new Set<HostBinding>();
     let markers = 0;
     let recognizedMarkers = 0;
-    const clean = (text: string): string => text.replace(/\[factory-cc-session:([a-f0-9]{64})\]/g, (marker, token: string) => {
-      markers += 1;
-      const host = this.tokens.get(token);
-      if (host) recognizedMarkers += 1;
-      if (host && !host.ended) found.add(host);
-      return "";
-    });
+    const collect = (text: string): void => {
+      for (const match of text.matchAll(/\[factory-cc-session:([a-f0-9]{64})\]/g)) {
+        markers += 1;
+        const host = this.tokens.get(match[1]!);
+        if (host) recognizedMarkers += 1;
+        if (host && !host.ended) found.add(host);
+      }
+    };
+    for (const message of original.messages) {
+      if (message.role !== "user") continue;
+      const content = typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content;
+      for (const [index, block] of content.entries()) {
+        if (block.type !== "text" || typeof block.text !== "string") break;
+        const text = block.text;
+        if (index === 0 && text.startsWith(COMPACTION_SUMMARY)) continue;
+        // Droid wraps hook additionalContext in a leading system reminder.
+        if (text.startsWith("<system-reminder>\n") && text.endsWith("</system-reminder>")) {
+          const end = text.indexOf("</system-reminder>");
+          if (end !== text.length - "</system-reminder>".length) break;
+          if (text.indexOf("<system-reminder>", 1) === -1) collect(text);
+          continue;
+        }
+        // Older hook consumers preserve additionalContext as a bare prefix.
+        const prefix = /^(?:\s*\[factory-cc-session:[a-f0-9]{64}\])+/.exec(text)?.[0];
+        if (!prefix) break;
+        collect(prefix);
+        if (text.slice(prefix.length).trim()) break;
+      }
+    }
+
+    const request = structuredClone(original);
+    const clean = (text: string): string => text.replace(/\[factory-cc-session:[a-f0-9]{64}\]/g, "");
     const blocks = (content: string | ContentBlock[]): string | ContentBlock[] => {
       if (typeof content === "string") return clean(content);
       return content.flatMap((block): ContentBlock[] => {
@@ -146,12 +170,12 @@ export class ControlBroker implements RuntimeControl {
       return (content === "" && message.content !== "") || (Array.isArray(content) && content.length === 0 && Array.isArray(message.content) && message.content.length > 0)
         ? [] : [{ ...message, content }];
     });
-    if (found.size > 1) throw new BridgeError(409, "ambiguous_host_binding", "Multiple live Factory session markers in this request.");
+    if (found.size > 1) throw new BridgeError(409, "ambiguous_host_binding", "Multiple live Factory session markers in trusted host context.");
     if (markers > 0 && found.size === 0 && (!this.options.ignoreUnknownSessionMarkers || recognizedMarkers > 0)) {
       throw new BridgeError(409, "stale_host_binding", "This Factory session has ended or its generation is no longer registered.");
     }
     const host = [...found][0];
-    if (host && host.cwd !== canonicalWorkspacePath(cwd)) throw new BridgeError(409, "host_workspace_mismatch", "Factory hook and native workspace differ.");
+    if (host && cwd !== undefined && host.cwd !== canonicalWorkspacePath(cwd)) throw new BridgeError(409, "host_workspace_mismatch", "Factory hook and native workspace differ.");
     return { request, binding: host?.token };
   }
 
@@ -332,6 +356,16 @@ export class ControlBroker implements RuntimeControl {
         const structuredError = response && typeof response === "object" && !Array.isArray(response)
           && ((response as ObjectValue).isError === true || (response as ObjectValue).is_error === true || (response as ObjectValue).error !== undefined);
         host.terminalResults.set(match.sessionId, { toolUseId: match.call.toolUseId, input: event.tool_input, response, isError: event.is_error === true || Boolean(structuredError) });
+      } else if (this.runtime.recordHostToolCompletion) {
+        const completion = { ...match.call,
+          content: typeof event.tool_response === "string" ? event.tool_response : JSON.stringify(event.tool_response),
+          isError: hostToolFailed(event) };
+        this.runtime.validateHostToolCompletion?.(match.sessionId, completion);
+        // The receipt survives a rejected continuation. Persist it before the
+        // runtime releases any reservation or changes its in-memory mailbox.
+        const receipt = this.store.recordHostCompletion(match.sessionId, completion);
+        await this.runtime.recordHostToolCompletion(match.sessionId, completion);
+        return { ok: true, observed: true, matched: true, completionRecorded: true, receipt };
       }
       return { ok: true, observed: true, matched: true };
     }

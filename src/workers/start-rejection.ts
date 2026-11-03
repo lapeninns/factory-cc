@@ -4,6 +4,7 @@ const REASONS = {
   subscription_preflight_failed: "Worker subscription preflight failed before execution. Check the assigned login and pinned authentication runtime before starting replacement work.",
   runtime_unverified: "Worker runtime verification failed before execution. Verify the configured native runtime before starting replacement work.",
   service_unavailable: "Worker service rejected the start before execution. Restore the service before starting replacement work.",
+  capacity_unavailable: "Worker admission is full. Wait for an existing worker to settle before submitting another operation.",
 } as const;
 
 export type WorkerStartRejectionCode = keyof typeof REASONS;

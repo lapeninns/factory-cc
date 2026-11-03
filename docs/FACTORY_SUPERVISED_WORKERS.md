@@ -4,7 +4,7 @@ Factory remains the controller. Independent tasks run through the
 `factory_worker_start` MCP tool in separate Git worktrees, and progress, pending
 permissions and results return to the originating Workstream. These workers do
 not appear in Factory's built-in Agents list. Ordinary folders can be used for
-controller operations when the explicit host-tools policy is enabled.
+controller operations when the explicit host-tools policy is enabled. Subscription workers can use the owned-workspace policy for bounded snapshots of ordinary folders and new repositories.
 
 ## Connection choices
 
@@ -39,20 +39,24 @@ Selecting this path does not establish a throughput improvement over legacy.
    controller connection. An exact worker MCP namespace prevents crossing into
    another connection.
 2. The controller delegates an independent task. A fixed connection uses its
-   own seat; a pool selects a healthy configured worker backend. An uncertain
+   own seat. A pool selects the least occupied healthy backend across all eight
+   profiles, then applies configured weights among equally occupied profiles. An uncertain
    start is retained for reconciliation instead of automatically replayed.
    A confirmed rejection before workspace creation returns a failed result
    with a bounded reason code and `retrySafe: true`. A missing response or an
    error after workspace creation remains uncertain. Neither case retries
-   automatically.
-3. The worker creates a new Git branch and linked worktree from committed
-   source, leaving dirty changes in the original checkout in place. It runs the
+   automatically. Each assignment supplies a stable `operationId`. Repeating
+   that ID with the same payload returns its existing job. Status queries use
+   the backend operation record to reconcile lost start responses.
+3. The worker creates an isolated input snapshot, including relevant dirty and
+   untracked source files. The original checkout retains its working files. It runs the
    official Claude Agent SDK with Opus 5.5, medium effort and Ultracode.
 4. The Python lease helper shares admission with standalone native jobs.
    It allows two active worker jobs and reserves one additional controller slot.
    A subscription seat can run one worker and one controller concurrently.
-   Paused model phases release capacity as appropriate; an outstanding host
-   operation or uncertain cleanup retains its lease.
+   A published host action releases inference capacity while a separate
+   reservation protects its workspace. Unverified native cleanup continues to
+   reserve the account and inference capacity.
 5. The pooled connection scopes status, wait, list and cancel calls to the
    owning Workstream. Fixed-seat connections share their seat service's worker
    ledger. A worker remains pinned to its selected backend. New work can use
@@ -77,6 +81,19 @@ Older random-scope records remain intact. Drain their live workers before
 switching an adapter to the new mode. Historical records cannot be reassigned
 by repository path, because several Workstreams can share a repository.
 
+Use `factory_worker_accounts` to inspect all eight profiles, their health,
+cooldown, active workers and assignment counts. These values describe observed
+routing activity. Provider allowance remains a separate account property.
+
+Subscription workers execute in independent per-job processes. A private
+authenticated local channel preserves status, approvals, cancellation and
+result collection across worker API restarts. A bounded durable launch queue
+keeps `maxConcurrent` executor processes per service. The default pending-job
+limit is 16. Executor-process death retains an explicit uncertain outcome.
+
+Worker results move through `result_ready` and `cleaning`. A completed worker
+has settled its tracked-process cleanup and lease release.
+
 Worker and controller queues are ordered independently, so running workers
 cannot consume the controller's reserved capacity. Workspace conflicts still
 apply across both queues. An uncertain or unowned execution holds its capacity
@@ -97,14 +114,21 @@ Git checkout and blocks host mutations. The pool can explicitly enable
 `--host-tools` with `--controller-pool --worker-pool`. That policy accepts an
 existing canonical directory owned by the operator, including a non-Git folder.
 By default, Factory Execute, Create and Edit actions require an exact native
-AskUser decision before dispatch. Native direct writes, native Bash, built-in agent
-spawning and unrelated MCP tools remain blocked in this controller path.
+AskUser decision before dispatch. The host-tools policy also supports advertised
+synchronous Task and MCP operations, with conservative workspace reservations.
+Detached work uses the managed worker pool so its lifetime has an owner.
+Factory spec mode and native-tool permission boundaries continue to apply.
 
 Workers default to an explicit repository allowlist. Subscription workers can
 instead opt into `"repositoryPolicy": "owned-git"`: each request must identify
-a canonical, owned, non-bare Git repository with a commit. This supports new
-repositories without editing an allowlist. A plain directory is not a worker
-repository. Native scheduling rejects conflicting parent/child host workspaces
+a canonical, owned, non-bare Git repository with a commit, or its subdirectory.
+The assigned subdirectory bounds worker writes. The subscription-only
+`"repositoryPolicy": "owned-workspace"` additionally supports ordinary folders
+and unborn repositories through a private Git snapshot. Snapshots are bounded
+to 10,000 files and 64 MiB. Recorded exclusions cover generated caches and
+private credential state. Tracked credentials and escaping symlinks cause a
+pre-execution refusal. Repository instructions and skills remain available in
+the snapshot. Native scheduling rejects conflicting parent/child host workspaces
 and worker worktrees while retaining conservative cleanup accounting.
 
 ## Source package and build
@@ -112,8 +136,8 @@ and worker worktrees while retaining conservative cleanup accounting.
 The accompanying [native runtime](../native-runtime/README.md) is included in
 this repository. It supplies the lease helper, standalone native launchers,
 shared workflow instructions, recovery commands and deterministic Python tests.
-The standalone native launchers cover `team1`–`team4`; Factory lease accounting
-supports all eight seats.
+The standalone native launchers and Factory lease accounting support `team1`
+through `team8`. Each profile still requires its own valid private mapping.
 
 ```sh
 npm ci
@@ -126,7 +150,9 @@ npm run test:native
 
 Use an absolute `nativeRuntimePath` (worker config) or `--runtime-path`
 (controller) pointing to `<checkout>/native-runtime`, or to an immutable release
-created from that directory. Keep source and installed releases separate. The
+created from that directory. Keep source and installed releases separate. The controller and Python lease
+helper must come from the same tested release because workspace reservations
+and admission deferral use their shared protocol. The
 native release installer takes `native-runtime` as its source root, not the
 top-level bridge directory.
 

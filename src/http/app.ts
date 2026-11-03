@@ -101,7 +101,7 @@ export async function prepareControllerWorkspaceMigration(config: BridgeConfig, 
 export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath: string, runtime: BridgeRuntime = createRuntime(config, logger, canaryPath)): BridgeApp {
   if (config.desktopJobs) runtime = new DesktopJobsRuntime(runtime, {
     pythonExecutable: "/usr/bin/python3", runtimePackagePath: config.desktopRuntimePath!,
-    stateRoot: config.desktopStateRoot!, maxRunning: 2,
+    stateRoot: config.desktopStateRoot!, maxRunning: 2, workerMcpPrefix: config.workerMcpPrefix,
     getBinding: (input) => controllerJobBinding(config, input),
   });
   const store = new SessionStore(join(config.dataDir, "sessions"), config.persistSessions, config.maxSessions, logger, {
@@ -473,9 +473,9 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       if (config.mode === "sdk") resolveRequestModel(config, parsed.model);
     }
     const role = roleFromHeaders(headers);
-    const cwd = resolveRequestCwd(headers, parsed, config);
-    const prepared = control.prepareRequest(parsed, cwd);
+    const prepared = control.prepareRequest(parsed);
     const factorySession = control.hostIdentity(prepared.binding);
+    const cwd = resolveRequestCwd(headers, prepared.request, config, process.env, factorySession?.cwd);
     if (config.desktopJobs && !factorySession?.desktopLifecycle) throw new BridgeError(409, "desktop_binding_required", "Start this session with the configured Factory Desktop lifecycle hooks before using the supervised model.");
     const request = prepared.request;
     const listed = configuredModels(config).find((model) => model.id === request.model);
@@ -487,10 +487,11 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     const incomingHashes = historyMessageHashes(request.messages);
     const requestFingerprint = createHash("sha256").update(JSON.stringify({ request, role, cwd, provider, contextHash, host: control.hostSessionId(prepared.binding) ?? null })).digest("hex");
     const explicit = explicitSessionId(headers, request);
-    const retries = store.list().filter((session) => session.state === "IDLE" && session.hostEnded === undefined && !session.pendingToolIds.length
+    const retries = store.list().filter((session) => (session.state === "IDLE" && !session.pendingToolIds.length
+      || session.state === "WAITING_DROID_TOOL" && session.retryableRequestKind === "admission") && session.hostEnded === undefined
       && session.retryableRequestHash === requestFingerprint && (!explicit || session.bridgeSessionId === explicit || session.droidSessionId === explicit));
     if (retries.length > 1) throw new BridgeError(409, "ambiguous_session", "Multiple failed requests match; supply X-Bridge-Session");
-    const resolved = retries[0] ? { match: retries[0], reason: "upstream-retry" } : resolveSession(store.list(), headers, request, {
+    const resolved = retries[0] ? { match: retries[0], reason: retries[0].retryableRequestKind === "admission" ? "admission-retry" : "upstream-retry" } : resolveSession(store.list(), headers, request, {
       cwd, hostSessionId: control.hostSessionId(prepared.binding), allowModelSwitch: config.models !== undefined, provider, claudeProfile: listed?.claudeProfile,
       // Droid desktop has no conversation ID header or hooks to disambiguate.
       continueIdenticalTranscripts: config.desktopProfile,
@@ -610,13 +611,17 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     const sink: StreamSink = {
       textDelta: (text) => { watchdog.touch(); if (writer && !completed && !cancellationRequested) writer.textDelta(text); },
       toolTrace: (name, detail) => { watchdog.touch(); if (writer && !completed && !cancellationRequested) writer.toolTrace(name, detail); },
-      activity: () => watchdog.touch(),
+      activity: () => {
+        watchdog.touch();
+        if (writer && !completed && !cancellationRequested) writer.activity();
+      },
       approvalsPending: (count) => watchdog.setPaused(count > 0),
     };
     try {
       store.update(sessionId, {
         hostEnded: undefined,
         retryableRequestHash: undefined,
+        retryableRequestKind: undefined,
         role,
         model: request.model,
         ...(provider === "cursor" ? { provider } : {}),
@@ -659,6 +664,8 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       const assistantContent = writer ? writer.completeContent(turn.response) : turn.response.content;
       store.update(sessionId, {
         pendingToolIds: turn.pendingToolIds,
+        hostCompletionReceipts: store.require(sessionId).hostCompletionReceipts
+          ?.filter(receipt => turn.pendingToolIds.includes(receipt.toolUseId)),
         notes,
         sdkSessionId: turn.sdkSessionId ?? session.sdkSessionId,
         historyMessageHashes: historyMessageHashes([...request.messages, { role: "assistant", content: assistantContent }]),
@@ -684,6 +691,10 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     } catch (error) {
       completed = true;
       const current = store.get(sessionId);
+      const deferredAdmission = error instanceof BridgeError && error.code === "desktop_job_timeout"
+        && error.extra.retry_safe === true && error.extra.phase === "admission"
+        && !cancellationRequested && current && !current.cancelRequested && current.hostEnded === undefined
+        && (current.state === "GENERATING" || current.state === "RESUMING");
       const recoverableSwitch = error instanceof BridgeError && error.status === 409
         && ["model_switch_busy", "model_switch_requires_persistence", "model_switch_unavailable", "reasoning_switch_busy", "reasoning_switch_requires_persistence", "reasoning_switch_unavailable"].includes(error.code);
       const rejectedInput = error instanceof BridgeError && [400, 409, 422].includes(error.status) && runtime.isSessionUsable?.(sessionId) === true;
@@ -700,7 +711,17 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         claudePool!.cool(limitedAccount, seconds);
         logger.warn("claude_account_cooling", { sessionId, account: limitedAccount, seconds, usageLimit: (error as BridgeError).extra.usage_limit === true });
       }
-      if (retryableUpstream) {
+      if (deferredAdmission) {
+        // The scheduler has confirmed that this attempt never acquired compute.
+        // Preserve the checkpoint and completed tool results for the same retry.
+        store.update(sessionId, { ...previous, hostCompletionReceipts: current.hostCompletionReceipts,
+          state: previous.state === "NEW" ? "IDLE" : previous.state,
+          retryableRequestHash: requestFingerprint, retryableRequestKind: "admission" });
+        error = new BridgeError(503, "desktop_job_timeout",
+          "The request is deferred before model execution. Retry the same request with this session to continue.",
+          { ...(error as BridgeError).extra, retry_after: 1, resumable: true, retry_mode: "same_request", session_id: sessionId,
+            session_state: store.require(sessionId).state });
+      } else if (retryableUpstream) {
         let retired = true;
         try {
           if (config.controllerPool) {
@@ -723,7 +744,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
             store.setState(sessionId, "FAILED");
             error = new BridgeError(503, "native_generation_exhausted", "Start a new Workstream after its native generation limit.");
           } else {
-            store.update(sessionId, { pendingToolIds: [], sdkSessionId: undefined, retryableRequestHash: requestFingerprint,
+            store.update(sessionId, { pendingToolIds: [], sdkSessionId: undefined, retryableRequestHash: requestFingerprint, retryableRequestKind: "upstream",
               ...(config.controllerPool ? { nativeGeneration: nextGeneration } : {}), ...(nextAccount ? { claudeAccount: nextAccount } : {}) });
             store.setState(sessionId, "IDLE");
             if (nextAccount) {
@@ -740,7 +761,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         if (!cancellationRequested && current && !current.cancelRequested && current.hostEnded === undefined
           && (current.state === "GENERATING" || current.state === "RESUMING")) {
           // Restore only our pending request, never a later host lifecycle event.
-          store.update(sessionId, { ...previous, hostEnded: previous.hostEnded });
+          store.update(sessionId, { ...previous, hostCompletionReceipts: current.hostCompletionReceipts, hostEnded: previous.hostEnded });
         }
       } else if (!timedOut && current?.state !== "CANCELLED" && !(error instanceof BridgeError && error.code === "host_session_ended")) {
         store.setState(sessionId, "FAILED");

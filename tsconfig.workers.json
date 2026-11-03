@@ -1,6 +1,6 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": { "rootDir": ".", "outDir": "workers-dist" },
-  "include": ["src/**/*.ts", "scripts/factory-workers.ts", "scripts/subscription-workers.ts", "scripts/subscription-desktop.ts", "scripts/subscription-pool.ts", "scripts/worker-control.ts"],
+  "include": ["src/**/*.ts", "scripts/factory-workers.ts", "scripts/subscription-workers.ts", "scripts/subscription-desktop.ts", "scripts/subscription-pool.ts", "scripts/worker-control.ts", "scripts/worker-executor.ts"],
   "exclude": ["dist", "workers-dist", "fixtures", "node_modules", "tests"]
 }

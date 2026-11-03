@@ -74,13 +74,15 @@ describe("private owned-Git repository policy", () => {
     const before = git(requested, ["status", "--porcelain"]);
     const value = service({ repositoryPolicy: "owned-git", run: async context => {
       expect(context.worker.worktree).not.toBe(requested);
-      expect(readFileSync(join(context.worker.worktree, "tracked.txt"), "utf8")).toBe("committed\n");
+      expect(readFileSync(join(context.worker.worktree, "tracked.txt"), "utf8")).toBe("uncommitted source\n");
       expect(readdirSync(context.worker.worktree)).not.toContain(".env");
       writeFileSync(join(context.worker.worktree, "result.txt"), "worker-only\n"); complete(context);
     } });
     const worker = await start(value, requested);
     await until(() => value.status(worker.id).state === "completed");
     expect(value.status(worker.id)).toMatchObject({ sourceCommit: head, sourceDirty: true, subscriptionProfile: "team1", cleanupVerified: true });
+    expect(value.status(worker.id).inputCommit).not.toBe(head);
+    expect(value.status(worker.id).inputSnapshot?.excluded).toContainEqual({ path: ".env", reason: "Credential or private environment file" });
     expect(git(requested, ["rev-parse", "HEAD"])).toBe(head);
     expect(git(requested, ["symbolic-ref", "HEAD"])).toBe(branch);
     expect(git(requested, ["status", "--porcelain"])).toBe(before);
@@ -93,15 +95,104 @@ describe("private owned-Git repository policy", () => {
     await until(() => value.status(worker.id).state === "completed");
   });
 
-  it("rejects non-Git folders, non-root subfolders, bare repositories and repositories without a commit before authentication", async () => {
+  it("rejects non-Git folders, bare repositories and repositories without a commit before authentication", async () => {
     const plain = join(root, "plain"); mkdirSync(plain);
-    const child = join(requested, "child"); mkdirSync(child);
     const unborn = repository("unborn", false);
     const bare = join(root, "bare.git"); execFileSync("git", ["init", "--bare", "-q", bare]);
     const value = service({ repositoryPolicy: "owned-git" });
-    for (const path of [plain, child, unborn, bare]) await expect(start(value, path)).rejects.toThrow();
+    for (const path of [plain, unborn, bare]) await expect(start(value, path)).rejects.toThrow();
     expect(auth.prepareSubscription).not.toHaveBeenCalled();
     expect(value.list()).toEqual([]);
+    expect(readdirSync(join(root, "workers-0"))).toEqual([]);
+  });
+
+  it("maps a repository subdirectory into its isolated snapshot and bounds writes there", async () => {
+    const child = join(requested, "child"); mkdirSync(child);
+    writeFileSync(join(child, "input.txt"), "untracked input\n");
+    let denied: unknown;
+    const value = service({ repositoryPolicy: "owned-git", run: async context => {
+      expect(context.options.cwd).toBe(join(context.worker.worktree, "child"));
+      expect(readFileSync(join(context.options.cwd!, "input.txt"), "utf8")).toBe("untracked input\n");
+      denied = await context.options.canUseTool!("Write", { file_path: join(context.worker.worktree, "outside.txt"), content: "blocked" }, { signal: context.options.abortController!.signal, toolUseID: "outside", requestId: "request" });
+      complete(context);
+    } });
+    const worker = await start(value, child);
+    await until(() => value.status(worker.id).state === "completed");
+    expect(denied).toMatchObject({ behavior: "deny" });
+    expect(readFileSync(join(child, "input.txt"), "utf8")).toBe("untracked input\n");
+  });
+
+  it.each([false, true])("snapshots an owned ordinary or unborn folder without changing its original Git state (%s)", async unborn => {
+    const source = join(root, unborn ? "new-repo" : "ordinary-folder"); mkdirSync(source);
+    if (unborn) git(source, ["init", "-q"]);
+    writeFileSync(join(source, "notes.txt"), "source note\n");
+    writeFileSync(join(source, ".env"), "SECRET=fixture\n");
+    const value = service({ repositoryPolicy: "owned-workspace", allowedRepositories: [], run: async context => {
+      expect(readFileSync(join(context.worker.worktree, "notes.txt"), "utf8")).toBe("source note\n");
+      expect(readdirSync(context.worker.worktree)).not.toContain(".env");
+      expect(git(context.worker.worktree, ["status", "--porcelain"])).toBe("");
+      writeFileSync(join(context.worker.worktree, "result.txt"), "only in worker");
+      complete(context);
+    } });
+    const worker = await start(value, source);
+    await until(() => value.status(worker.id).state === "completed");
+    expect(value.status(worker.id).sourceKind).toBe(unborn ? "unborn" : "folder");
+    expect(readFileSync(join(source, "notes.txt"), "utf8")).toBe("source note\n");
+    expect(readdirSync(source)).not.toContain("result.txt");
+    expect(readdirSync(source).includes(".git")).toBe(unborn);
+    if (unborn) expect(() => git(source, ["rev-parse", "--verify", "HEAD"])).toThrow();
+  });
+
+  it("rejects symlink escapes and tracked credentials before authentication", async () => {
+    const value = service({ repositoryPolicy: "owned-workspace" });
+    symlinkSync(join(listed, "tracked.txt"), join(requested, "escaped"));
+    await expect(start(value, requested)).rejects.toThrow(/outside/);
+    rmSync(join(requested, "escaped"));
+    writeFileSync(join(requested, ".env"), "SECRET=fixture\n");
+    git(requested, ["add", ".env"]);
+    await expect(start(value, requested)).rejects.toThrow(/tracked credential/);
+    expect(auth.prepareSubscription).not.toHaveBeenCalled();
+  });
+
+  it("preserves internal symlinks and rejects broken links before starting", async () => {
+    symlinkSync("tracked.txt", join(requested, "internal-link"));
+    const value = service({ repositoryPolicy: "owned-workspace", run: async context => {
+      expect(realpathSync(join(context.worker.worktree, "internal-link"))).toBe(join(context.worker.worktree, "tracked.txt"));
+      complete(context);
+    } });
+    const worker = await start(value, requested);
+    await until(() => value.status(worker.id).state === "completed");
+    symlinkSync("missing.txt", join(requested, "broken-link"));
+    await expect(start(value, requested)).rejects.toThrow();
+  });
+
+  it("copies tracked project instructions and provider-free settings", async () => {
+    mkdirSync(join(requested, ".factory", "skills", "qa"), { recursive: true });
+    mkdirSync(join(requested, ".claude", "commands"), { recursive: true });
+    mkdirSync(join(requested, ".codex", "skills", "review"), { recursive: true });
+    writeFileSync(join(requested, ".factory", "skills", "qa", "SKILL.md"), "Run the project checks.\n");
+    writeFileSync(join(requested, ".claude", "commands", "test.md"), "Run local tests.\n");
+    writeFileSync(join(requested, ".codex", "skills", "review", "SKILL.md"), "Review the source.\n");
+    writeFileSync(join(requested, ".claude", "settings.json"), JSON.stringify({ permissions: { defaultMode: "default" } }));
+    git(requested, ["add", "."]);
+    const value = service({ repositoryPolicy: "owned-workspace", run: async context => {
+      expect(readFileSync(join(context.worker.worktree, ".factory", "skills", "qa", "SKILL.md"), "utf8")).toContain("project checks");
+      expect(readFileSync(join(context.worker.worktree, ".claude", "commands", "test.md"), "utf8")).toContain("local tests");
+      expect(readFileSync(join(context.worker.worktree, ".codex", "skills", "review", "SKILL.md"), "utf8")).toContain("Review");
+      expect(JSON.parse(readFileSync(join(context.worker.worktree, ".claude", "settings.json"), "utf8"))).toMatchObject({ permissions: { defaultMode: "default" } });
+      complete(context);
+    } });
+    const worker = await start(value, requested);
+    await until(() => value.status(worker.id).state === "completed");
+  });
+
+  it("rejects credential-bearing project settings without copying their values", async () => {
+    mkdirSync(join(requested, ".claude"));
+    writeFileSync(join(requested, ".claude", "settings.json"), JSON.stringify({ env: { ANTHROPIC_API_KEY: "private-fixture-value" } }));
+    git(requested, ["add", "."]);
+    const value = service({ repositoryPolicy: "owned-workspace" });
+    await expect(start(value, requested)).rejects.toThrow(/tracked credential/);
+    expect(auth.prepareSubscription).not.toHaveBeenCalled();
     expect(readdirSync(join(root, "workers-0"))).toEqual([]);
   });
 

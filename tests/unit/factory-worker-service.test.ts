@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, readdirSync, chmodSync, symlinkSync, realpathSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync, readdirSync, chmodSync, symlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -8,6 +8,7 @@ import { BridgeError } from "../../src/types.js";
 import { WorkerStartRejected } from "../../src/workers/start-rejection.js";
 import { startWorkerControl } from "../../src/workers/control.js";
 import { decideWorkerApproval, readPendingWorkerApprovals } from "../../src/runtime/worker-permission-client.js";
+import * as workerState from "../../src/workers/worker-state.js";
 
 const support = () => ({ executable: "/fixture/unmodified-claude", sdkVersion: "0.3.300", cliVersion: "2.1.300", sha256: "fixture" });
 const sleep = (ms: number) => new Promise<void>((done) => setTimeout(done, ms));
@@ -31,7 +32,7 @@ describe("Factory supervised API workers", () => {
     execFileSync("git", ["-C", repo, "add", "file.txt"]);
     execFileSync("git", ["-C", repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture"]);
   });
-  afterEach(async () => { await Promise.all(services.splice(0).map((service) => service.close())); });
+  afterEach(async () => { await Promise.all(services.splice(0).map((service) => service.close())); vi.restoreAllMocks(); });
   function service(changes: Partial<APIWorkerServiceOptions> = {}): APIWorkerService {
     const result = new APIWorkerService({ stateRoot: join(folder, "state"), workspaceRoot: join(folder, "workspaces"), allowedRepositories: [repo],
       provider: { kind: "anthropic" }, maxBudgetUsd: 0.2, maxMs: 10_000, sourceEnv: { PATH: process.env.PATH, ANTHROPIC_API_KEY: "fixture-api-value" }, verifyRuntime: support,
@@ -48,13 +49,16 @@ describe("Factory supervised API workers", () => {
     await expect(blocked.start({ repository: repo, task: "fixture", workflow: "investigate" })).rejects.toMatchObject({ code: "service_unavailable" });
   });
 
-  it("keeps a failure after worktree creation begins outside the preflight classification", async () => {
+  it("retains accepted operation evidence when worktree creation cannot be confirmed", async () => {
     const runtime = service();
     writeFileSync(join(repo, ".git", "worktrees"), "fixture obstruction");
-    const error = await runtime.start({ repository: repo, task: "fixture", workflow: "investigate" }).catch(error => error);
-    expect(error).toBeInstanceOf(Error);
-    expect(error).not.toBeInstanceOf(WorkerStartRejected);
-    expect(runtime.list()).toEqual([]);
+    const input = { repository: repo, task: "fixture", workflow: "investigate" as const, operationId: "accepted-operation", operationOwner: "a".repeat(64) };
+    const result = await runtime.start(input);
+    expect(result).toMatchObject({ state: "unknown", reason: "workspace_preparation_unconfirmed", cleanupVerified: null });
+    expect(runtime.lookup(input.operationId, input.operationOwner)).toMatchObject({ id: result.id });
+    expect((await runtime.start(input)).id).toBe(result.id);
+    expect(runtime.list()).toHaveLength(1);
+    expect(JSON.parse(readFileSync(join(folder, "state", result.id + ".json"), "utf8"))).toMatchObject({ operation: { id: input.operationId } });
   });
 
   it("uses distinct worktrees, preserves dirty source and secrets, and records only observed evidence", async () => {
@@ -334,5 +338,120 @@ describe("Factory supervised API workers", () => {
     const restored = service();
     expect(restored.status(item.id).state).toBe("unknown");
     expect(restored.status(item.id).reason).toBe("service_restarted_without_process_ownership");
+  });
+
+  it("deduplicates concurrent operation starts and recovers the same result after restart", async () => {
+    let executions = 0;
+    const runtime = service({ run: async context => { executions++; success(context); } });
+    const input = { repository: repo, task: "one side effect", workflow: "implement" as const, operationId: "request-1", operationOwner: "a".repeat(64) };
+    const [first, second] = await Promise.all([runtime.start(input), runtime.start(input)]);
+    expect(second.id).toBe(first.id);
+    await until(() => runtime.status(first.id).state === "completed");
+    expect(executions).toBe(1);
+    await expect(runtime.start({ ...input, task: "different input" })).rejects.toMatchObject({ code: "invalid_request" });
+    expect(runtime.lookup(input.operationId, "b".repeat(64))).toEqual({ found: false });
+    await runtime.close();
+    const restored = service({ run: async context => { executions++; success(context); } });
+    const recovered = await restored.start(input);
+    expect(recovered).toMatchObject({ id: first.id, state: "completed", cleanupVerified: true, leaseReleased: true });
+    expect(executions).toBe(1);
+    expect(restored.list()).toHaveLength(1);
+  });
+
+  it("keeps identical operation IDs isolated by owner and preserves legacy starts", async () => {
+    const runtime = service();
+    const input = { repository: repo, task: "fixture", workflow: "investigate" as const, operationId: "same-id" };
+    const a = await runtime.start({ ...input, operationOwner: "a".repeat(64) });
+    const b = await runtime.start({ ...input, operationOwner: "b".repeat(64) });
+    expect(a.id).not.toBe(b.id);
+    const legacy = await runtime.start({ repository: repo, task: "legacy", workflow: "investigate" });
+    expect(legacy.operation).toBeUndefined();
+    await expect(runtime.start({ ...input, operationOwner: undefined })).rejects.toMatchObject({ code: "invalid_request" });
+  });
+
+  it("reserves bounded pending admission before concurrent starts create workspaces", async () => {
+    const runtime = service({ maxConcurrent: 1, maxPendingWorkers: 2, run: async () => new Promise<void>(() => undefined) });
+    const input = { repository: repo, task: "fixture", workflow: "investigate" as const };
+    const results = await Promise.allSettled([runtime.start(input), runtime.start(input), runtime.start(input)]);
+    expect(results.filter(result => result.status === "fulfilled")).toHaveLength(2);
+    expect(results.find(result => result.status === "rejected")).toMatchObject({ reason: { code: "capacity_unavailable" } });
+    expect(runtime.list()).toHaveLength(2);
+    expect(readdirSync(join(folder, "workspaces"))).toHaveLength(2);
+    const queued = runtime.list().find(worker => worker.state === "queued")!;
+    await runtime.cancel(queued.id);
+    const replacement = await runtime.start(input);
+    expect(replacement.state).toBe("queued");
+    expect(runtime.list()).toHaveLength(3);
+  });
+
+  it("persists recoverable task input before accepted intent and workspace creation", async () => {
+    const events: string[] = [];
+    const originalTask = workerState.writeWorkerTask, originalWorker = workerState.writeWorker;
+    vi.spyOn(workerState, "writeWorkerTask").mockImplementation((root, id, task) => {
+      events.push("task");
+      expect(existsSync(join(folder, "workspaces", id))).toBe(false);
+      originalTask(root, id, task);
+    });
+    vi.spyOn(workerState, "writeWorker").mockImplementation((root, record) => {
+      const pending = join(root, ".pending-task-" + record.id + ".json");
+      expect(existsSync(pending)).toBe(true);
+      if (record.state === "starting") {
+        events.push("intent");
+        expect(existsSync(record.worktree)).toBe(false);
+      } else if (record.state === "queued") {
+        events.push("workspace");
+        expect(existsSync(record.worktree)).toBe(true);
+      }
+      originalWorker(root, record);
+    });
+    const runtime = service({ executionHost: {
+      start: async worker => ({ ...worker, state: "running", approvals: [] }),
+      status: worker => ({ ...worker, state: "running", approvals: [] }),
+      cancel: async worker => ({ ...worker, state: "cancelled", approvals: [] }),
+      approve: async worker => ({ ...worker, approvals: [] }),
+      detach: async () => {},
+    } });
+    await runtime.start({ repository: repo, task: "recoverable fixture input", workflow: "investigate" });
+    expect(events.slice(0, 3)).toEqual(["task", "intent", "workspace"]);
+  });
+
+  it("keeps successful output nonterminal until cleanup and lease release settle", async () => {
+    let cleanup!: () => void, release!: () => void;
+    let cleanupEntered = false, releaseEntered = false;
+    const runtime = service({
+      cleanup: async () => { cleanupEntered = true; await new Promise<void>(resolve => { cleanup = resolve; }); },
+      acquireLease: async () => ({ release: async () => { releaseEntered = true; await new Promise<void>(resolve => { release = resolve; }); } }),
+    });
+    const item = await runtime.start({ repository: repo, task: "fixture", workflow: "investigate" });
+    await until(() => cleanupEntered);
+    expect(runtime.status(item.id)).toMatchObject({ state: "cleaning", resultState: "completed", result: "Worker fixture complete.", cleanupVerified: null, leaseReleased: false });
+    expect(runtime.status(item.id).endedAt).toBeUndefined();
+    cleanup();
+    await until(() => releaseEntered);
+    expect(runtime.status(item.id)).toMatchObject({ state: "cleaning", cleanupVerified: true, leaseReleased: false });
+    release();
+    await until(() => runtime.status(item.id).state === "completed");
+    expect(runtime.status(item.id)).toMatchObject({ cleanupVerified: true, leaseReleased: true, settledAt: expect.any(String), endedAt: expect.any(String) });
+  });
+
+  it("preserves successful results when cleanup or lease release fails", async () => {
+    const cleanupFailed = service({ cleanup: async () => { throw new Error("private cleanup detail"); } });
+    const a = await cleanupFailed.start({ repository: repo, task: "fixture", workflow: "investigate" });
+    await until(() => cleanupFailed.status(a.id).state === "unknown");
+    expect(cleanupFailed.status(a.id)).toMatchObject({ resultState: "completed", result: "Worker fixture complete.", cleanupVerified: false, failure: { stage: "cleanup" } });
+    await cleanupFailed.close();
+    const releaseFailed = service({ stateRoot: join(folder, "other-state"), cleanup: async () => {}, acquireLease: async () => ({ release: async () => { throw new Error("private lease detail"); } }) });
+    const b = await releaseFailed.start({ repository: repo, task: "fixture", workflow: "investigate" });
+    await until(() => releaseFailed.status(b.id).state === "unknown");
+    expect(releaseFailed.status(b.id)).toMatchObject({ resultState: "completed", result: "Worker fixture complete.", cleanupVerified: true, leaseReleased: false, failure: { stage: "lease_release" } });
+    expect(releaseFailed.status(b.id).settledAt).toBeUndefined();
+  });
+
+  it("persists a bounded error code and phase without the native error message", async () => {
+    const runtime = service({ run: async () => { throw Object.assign(new Error("private token text"), { code: "ECONNRESET" }); } });
+    const item = await runtime.start({ repository: repo, task: "fixture", workflow: "investigate" });
+    await until(() => runtime.status(item.id).state === "failed");
+    expect(runtime.status(item.id).failure).toMatchObject({ stage: "execution", code: "ECONNRESET" });
+    expect(readFileSync(join(folder, "state", item.id + ".json"), "utf8")).not.toContain("private token text");
   });
 });

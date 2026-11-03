@@ -15,6 +15,9 @@ const actions = {
   Execute: { command: "df -h ." },
   Create: { file_path: "/fixture/report.txt", content: "report" },
   Edit: { file_path: "/fixture/report.txt", old_str: "old", new_str: "new" },
+  Task: { subagent_type: "general", prompt: "Inspect the owned fixture" },
+  SpawnAgent: { task: "Inspect the owned fixture" },
+  "factory-workers-pool___factory_worker_accounts": {},
 };
 const roots: string[] = [], runtimes: SdkRuntime[] = [];
 
@@ -103,6 +106,48 @@ afterEach(async () => {
 });
 
 describe("exactly approved Factory host operations", () => {
+  it.each(["Task", "factory-workers-pool___factory_worker_accounts"] as const)("forwards advertised %s with host tools enabled", async original => {
+    const { runtime, fake, base } = setup({ original, approvalPolicy: "bypass" });
+    const action = callFrom(await runtime.handle(base));
+    expect(action).toMatchObject({ name: original, input: actions[original] });
+    expect((await runtime.handle(toolResult(base, action.id, "host result"))).response.stop_reason).toBe("end_turn");
+    expect(fake.observedResult).toMatchObject({ isError: false });
+  });
+
+  it("keeps detached spawning on the managed worker path", async () => {
+    const { runtime, fake, base } = setup({ original: "SpawnAgent", invoke: false, approvalPolicy: "bypass" });
+    await runtime.handle(base);
+    expect(fake.handlers.has(new StableDroidToolNames().toMcp("SpawnAgent"))).toBe(false);
+  });
+
+  it("records authenticated completion without resuming the SDK before admission", async () => {
+    const { runtime, fake, base } = setup({ approvalPolicy: "bypass" });
+    const action = callFrom(await runtime.handle(base));
+    const receipt = { toolUseId: action.id, toolName: "Execute", input: action.input, content: "authenticated result [factory-cc-session:" + "a".repeat(64) + "]" };
+    runtime.validateHostToolCompletion(base.session.bridgeSessionId, receipt);
+    expect(await runtime.recordHostToolCompletion(base.session.bridgeSessionId, receipt)).toBe("accepted");
+    expect(await runtime.recordHostToolCompletion(base.session.bridgeSessionId, receipt)).toBe("duplicate");
+    expect(fake.observedResult).toBeUndefined();
+    expect(runtime.pendingHostCalls(base.session.bridgeSessionId)).toHaveLength(1);
+    const next = toolResult(base, action.id, "Droid display wrapper differs");
+    next.session = { ...base.session, hostCompletionReceipts: [receipt] };
+    expect((await runtime.handle(next)).response.stop_reason).toBe("end_turn");
+    expect(fake.observedResult).toMatchObject({ content: [{ type: "text", text: expect.stringContaining("authenticated result") }] });
+    expect(JSON.stringify(fake.observedResult)).not.toContain("factory-cc-session:");
+    expect(await runtime.recordHostToolCompletion(base.session.bridgeSessionId, receipt)).toBe("duplicate");
+  });
+
+  it("rejects conflicting authenticated completion and keeps the original pending action", async () => {
+    const { runtime, fake, base } = setup({ approvalPolicy: "bypass" });
+    const action = callFrom(await runtime.handle(base));
+    const receipt = { toolUseId: action.id, toolName: "Execute", input: action.input, content: "first result" };
+    await runtime.recordHostToolCompletion(base.session.bridgeSessionId, receipt);
+    await expect(runtime.recordHostToolCompletion(base.session.bridgeSessionId, { ...receipt, content: "changed" }))
+      .rejects.toMatchObject({ code: "conflicting_host_completion" });
+    expect(fake.observedResult).toBeUndefined();
+    await runtime.handle(toolResult(base, action.id, "first result"));
+  });
+
   it.each(["Execute", "Create", "Edit"] as const)("explicit bypass publishes %s without the extra AskUser question", async original => {
     const { runtime, fake, base, control } = setup({ original, approvalPolicy: "bypass", askTool: false });
     const first = await runtime.handle(base), action = callFrom(first);

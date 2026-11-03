@@ -34,6 +34,7 @@ function backends() {
         const worker = { id: "worker-" + randomUUID(), state: "waiting_approval", subscriptionProfile: profile, approvals: [approval] };
         workers.set(worker.id, worker); return worker;
       }
+      if (name === "factory_worker_list") return [...workers.values()].map(worker => ({ ...worker }));
       const worker = workers.get(String(args.id));
       if (!worker) throw new Error();
       if (name === "factory_worker_cancel") worker.state = "cancelled";
@@ -97,7 +98,7 @@ describe("pooled worker MCP and approval boundaries", () => {
     expect(f.tasks).toEqual([task]);
   });
 
-  it("serves authenticated readiness, requires a private scope, and exposes only five tools", async () => {
+  it("serves authenticated readiness, requires a private scope, and exposes worker tools plus account availability", async () => {
     const f = await fixture();
     expect((await fetch(f.url + "/health")).status).toBe(401);
     const health = await fetch(f.url + "/health", { headers: { authorization: "Bearer " + token } });
@@ -105,7 +106,7 @@ describe("pooled worker MCP and approval boundaries", () => {
     expect((await fetch(f.url + "/mcp", { method: "POST", headers: { authorization: "Bearer " + token }, body: "{}" })).status).toBe(403);
     const c = await client(f.url, scopeA);
     expect((await c.listTools()).tools.map(item => item.name)).toEqual([
-      "factory_worker_start", "factory_worker_status", "factory_worker_wait", "factory_worker_list", "factory_worker_cancel",
+      "factory_worker_start", "factory_worker_status", "factory_worker_wait", "factory_worker_list", "factory_worker_cancel", "factory_worker_accounts",
     ]);
     const unknown = await c.callTool({ name: "factory_worker_approve", arguments: {} });
     expect(unknown.isError).toBe(true);
@@ -124,6 +125,36 @@ describe("pooled worker MCP and approval boundaries", () => {
     expect(result(await a.callTool({ name: "factory_worker_wait", arguments: { id: workerA.id } })).state).toBe("waiting_approval");
     expect(result(await a.callTool({ name: "factory_worker_cancel", arguments: { id: workerA.id } })).state).toBe("cancelled");
     expect([...f.workers.values()].map(worker => worker.state)).toEqual(["cancelled", "waiting_approval"]);
+  });
+
+  it("exposes eight-account availability and stable operation retries through MCP", async () => {
+    const f = await fixture(), c = await client(f.url, scopeA);
+    const input = { repository: "/fixture/repo", task: "one logical task", operationId: "operation-1" };
+    const first = result(await c.callTool({ name: "factory_worker_start", arguments: input }));
+    const repeated = result(await c.callTool({ name: "factory_worker_start", arguments: input }));
+    expect(repeated).toMatchObject({ id: first.id, reused: true });
+    expect(f.tasks).toEqual([input.task]);
+    const conflict = await c.callTool({ name: "factory_worker_start", arguments: { ...input, task: "changed task" } });
+    expect(conflict.isError).toBe(true);
+    expect(result(conflict)).toMatchObject({ type: "operation_conflict", retrySafe: false });
+    const accounts = result(await c.callTool({ name: "factory_worker_accounts", arguments: {} }));
+    expect(accounts.seatCount).toBe(8);
+    expect(accounts.accounts.map((account: { profile: string }) => account.profile)).toEqual(SUBSCRIPTION_PROFILES);
+    expect(accounts.accounts[0]).toMatchObject({ profile: "team1", activeWorkers: 1, assignedWorkers: 1 });
+    expect((await fetch(f.url + "/accounts")).status).toBe(401);
+    const readback = await fetch(f.url + "/accounts", { headers: { authorization: "Bearer " + token } });
+    expect(await readback.json()).toMatchObject({ seatCount: 8 });
+  });
+
+  it("returns a bounded retry instruction when all accounts are unavailable", async () => {
+    const f = await fixture(), c = await client(f.url, scopeA);
+    for (const backend of f.values) backend.health = async () => false;
+    const reply = await c.callTool({ name: "factory_worker_start", arguments: {
+      repository: "/fixture/repo", task: "wait for availability", operationId: "unavailable-1",
+    } });
+    expect(reply.isError).toBe(true);
+    expect(result(reply)).toMatchObject({ type: "pool_unavailable", executionStarted: false, retrySafe: true, retryAfterSeconds: 5 });
+    expect(f.tasks).toEqual([]);
   });
 
   it("uses the private exact-action approval channel and the pinned backend identifier", async () => {

@@ -30,6 +30,7 @@ function fixture(weights = SUBSCRIPTION_PROFILES.map(() => 1)) {
         const worker = { id: "worker-" + randomUUID(), state: "running", subscriptionProfile: profile, approvals: [approval] };
         workers.set(worker.id, worker); return { ...worker };
       }
+      if (name === "factory_worker_list") return [...workers.values()].map(worker => ({ ...worker }));
       const worker = workers.get(String(args.id));
       if (!worker) throw new Error("Unknown fake worker");
       if (name === "factory_worker_cancel") worker.state = "cancelled";
@@ -47,14 +48,16 @@ describe("subscription worker pool routing", () => {
     const starts = [];
     for (let index = 0; index < 8; index++) starts.push(await pool.start(scopeA, input));
     expect(starts.map(item => item.subscriptionProfile)).toEqual(SUBSCRIPTION_PROFILES);
-    const first = starts[0]!, firstBackendId = f.calls[0]!.args;
+    const first = starts[0]!, firstBackendId = f.calls.find(call => call.name === "factory_worker_start")!.args;
     expect(first.id).not.toEqual([...f.workers.keys()][0]);
     await pool.status(scopeA, String(first.id));
     await pool.cancel(scopeA, String(first.id));
     const operations = f.calls.slice(-2);
     expect(operations.map(item => item.profile)).toEqual(["team1", "team1"]);
     expect(operations.map(item => item.args.id)).toEqual([[...f.workers.keys()][0], [...f.workers.keys()][0]]);
-    expect(firstBackendId).toEqual(input);
+    expect(firstBackendId).toMatchObject(input);
+    expect(firstBackendId.operationId).toBe(first.id);
+    expect(firstBackendId.operationOwner).toHaveLength(64);
   });
 
   it("retains the configured legacy 5:1 relative weights", async () => {
@@ -63,6 +66,8 @@ describe("subscription worker pool routing", () => {
     for (let index = 0; index < 24; index++) {
       const worker = await pool.start(scopeA, input), profile = String(worker.subscriptionProfile);
       counts[profile] = (counts[profile] ?? 0) + 1;
+      const lastWorker = [...f.workers.values()].at(-1)!;
+      lastWorker.state = "completed"; lastWorker.cleanupVerified = true;
     }
     expect(SUBSCRIPTION_PROFILES.map(profile => counts[profile])).toEqual([5, 5, 5, 5, 1, 1, 1, 1]);
   });
@@ -73,7 +78,7 @@ describe("subscription worker pool routing", () => {
     expect((await pool.start(scopeA, input)).subscriptionProfile).toBe("team2");
     f.healthy.clear();
     await expect(pool.start(scopeA, input)).rejects.toThrow("No healthy");
-    expect(f.calls).toHaveLength(1);
+    expect(f.calls.filter(call => call.name === "factory_worker_start")).toHaveLength(1);
     expect(JSON.parse(readFileSync(join(path, "pool-state.json"), "utf8")).routes).toHaveLength(1);
   });
 
@@ -111,7 +116,7 @@ describe("subscription worker pool routing", () => {
     const restored = new SubscriptionWorkerPool(path, f.backends);
     expect((await restored.status(scopeA, String(item.id))).state).toBe("unknown");
     expect((await restored.cancel(scopeA, String(item.id))).state).toBe("unknown");
-    expect(f.calls).toHaveLength(1);
+    expect(f.calls.filter(call => call.name === "factory_worker_start")).toHaveLength(1);
   });
 
   it("persists confirmed rejection without contacting the backend again or retrying", async () => {
@@ -160,7 +165,7 @@ describe("subscription worker pool routing", () => {
     writeFileSync(file, JSON.stringify(saved), { mode: 0o600 });
     const count = f.calls.length, restored = new SubscriptionWorkerPool(path, f.backends);
     expect((await restored.status(scopeA, String(item.id))).state).toBe("unknown");
-    expect(f.calls).toHaveLength(count);
+    expect(f.calls.filter(call => call.name === "factory_worker_start")).toHaveLength(1);
     expect(JSON.parse(readFileSync(file, "utf8")).routes[0].phase).toBe("unknown");
   });
 

@@ -155,6 +155,125 @@ class FactoryLeaseTests(unittest.TestCase):
         self.assertIsNone(saved['sourceCommit'])
         self.release(child, 'completed', cleanupVerified=True)
 
+    def test_host_action_reservation_releases_compute_for_other_workstreams(self):
+        first_dir, second_dir, third_dir = (self.root / name for name in ('first', 'second', 'third'))
+        for folder in (first_dir, second_dir, third_dir):
+            folder.mkdir()
+        first, first_id = self.admitted('first', first_dir, role='chat', subscriptionProfile='team1',
+                                        workspacePolicy='controller-host')
+        self.release(first, 'waiting_host', hostActionReservation=True, cleanupVerified=False)
+        self.assertTrue(read_job(self.config, first_id)['hostActionReservation'])
+        second, _ = self.admitted('second', second_dir, role='chat', subscriptionProfile='team1',
+                                  workspacePolicy='controller-host')
+        third = self.start()
+        self.send(third, self.request('third', third_dir, role='chat', subscriptionProfile='team8',
+                                     workspacePolicy='controller-host'))
+        self.assertEqual(self.receive(third)['event'], 'queued')
+        self.assertIsNone(self.receive(third, .1))
+        self.release(second, 'idle')
+        self.assertEqual(self.receive(third)['event'], 'ready')
+        self.release(third, 'idle')
+        self.assertTrue(read_job(self.config, first_id)['hostActionReservation'])
+        overlap = self.start()
+        self.send(overlap, self.request('overlap', first_dir, role='chat', subscriptionProfile='team2',
+                                       workspacePolicy='controller-host'))
+        self.assertEqual(self.receive(overlap)['event'], 'queued')
+        self.assertIsNone(self.receive(overlap, .1))
+        self.send(overlap, {'op': 'cancel'})
+        self.assertEqual(self.receive(overlap)['event'], 'cancelled')
+        self.assertEqual(overlap.wait(timeout=3), 0)
+        resumed, same_id = self.admitted('first', first_dir, role='chat', subscriptionProfile='team1',
+                                        workspacePolicy='controller-host')
+        self.assertEqual(first_id, same_id)
+        self.release(resumed, 'idle')
+        self.assertFalse(read_job(self.config, first_id)['hostActionReservation'])
+
+    def test_unknown_host_action_blocks_its_workspace_without_consuming_controller_slot(self):
+        other = self.root / 'other-host'
+        other.mkdir()
+        first, first_id = self.admitted('uncertain-host', self.repo, role='chat', subscriptionProfile='team1',
+                                        workspacePolicy='controller-host')
+        self.release(first, 'unknown', hostActionReservation=True, cleanupVerified=True)
+        next_host, _ = self.admitted('next-host', other, role='chat', subscriptionProfile='team1',
+                                     workspacePolicy='controller-host')
+        self.release(next_host, 'idle')
+        blocked = self.start()
+        self.send(blocked, self.request('blocked-host', self.repo, role='chat', subscriptionProfile='team2',
+                                       workspacePolicy='controller-host'))
+        self.assertEqual(self.receive(blocked)['event'], 'queued')
+        self.assertIsNone(self.receive(blocked, .1))
+        self.assertTrue(read_job(self.config, first_id)['externalCleanupRequired'])
+
+    def test_unknown_native_cleanup_retains_controller_compute_and_account(self):
+        other = self.root / 'other-after-cleanup-failure'
+        other.mkdir()
+        first, _ = self.admitted('cleanup-failure', self.repo, role='chat', subscriptionProfile='team1',
+                                  workspacePolicy='controller-host')
+        self.release(first, 'unknown', hostActionReservation=True, cleanupVerified=False)
+        controller = self.start()
+        self.send(controller, self.request('after-cleanup-failure', other, role='chat', subscriptionProfile='team1',
+                                           workspacePolicy='controller-host'))
+        self.assertEqual(self.receive(controller)['event'], 'queued')
+        self.assertIsNone(self.receive(controller, .15))
+        worker = self.start()
+        self.send(worker, self.request('worker-after-cleanup-failure', subscriptionProfile='team1'))
+        self.assertEqual(self.receive(worker)['event'], 'queued')
+        self.assertIsNone(self.receive(worker, .15))
+
+    def test_deferred_admission_restores_prior_workspace_reservation(self):
+        other = self.root / 'busy-host'
+        other.mkdir()
+        first, first_id = self.admitted('resume-host', self.repo, role='chat', subscriptionProfile='team1',
+                                        workspacePolicy='controller-host')
+        self.release(first, 'waiting_host', hostActionReservation=True, cleanupVerified=False)
+        busy, _ = self.admitted('busy-host', other, role='chat', subscriptionProfile='team2',
+                                workspacePolicy='controller-host')
+        queued = self.start()
+        self.send(queued, self.request('resume-host', self.repo, role='chat', subscriptionProfile='team1',
+                                      workspacePolicy='controller-host'))
+        self.assertEqual(self.receive(queued)['event'], 'queued')
+        self.send(queued, {'op': 'defer'})
+        self.assertEqual(self.receive(queued)['event'], 'deferred')
+        self.assertEqual(queued.wait(timeout=3), 0)
+        waiting = read_job(self.config, first_id)
+        self.assertEqual(waiting['state'], 'waiting_host')
+        self.assertTrue(waiting['hostActionReservation'])
+        self.release(busy, 'idle')
+        resumed, same_id = self.admitted('resume-host', self.repo, role='chat', subscriptionProfile='team1',
+                                        workspacePolicy='controller-host')
+        self.assertEqual(same_id, first_id)
+        self.release(resumed, 'idle')
+
+    def test_cancelled_readmission_keeps_the_unfinished_host_action_reserved(self):
+        other = self.root / 'busy-readmission'
+        other.mkdir()
+        first, first_id = self.admitted('cancel-readmission', self.repo, role='chat', subscriptionProfile='team1',
+                                        workspacePolicy='controller-host')
+        self.release(first, 'waiting_host', hostActionReservation=True, cleanupVerified=False)
+        busy, _ = self.admitted('busy-readmission', other, role='chat', subscriptionProfile='team2',
+                                workspacePolicy='controller-host')
+        queued = self.start()
+        self.send(queued, self.request('cancel-readmission', self.repo, role='chat', subscriptionProfile='team1',
+                                      workspacePolicy='controller-host'))
+        self.assertEqual(self.receive(queued)['event'], 'queued')
+        self.send(queued, {'op': 'cancel'})
+        self.assertEqual(self.receive(queued)['event'], 'cancelled')
+        self.assertEqual(queued.wait(timeout=3), 0)
+        waiting = read_job(self.config, first_id)
+        self.assertEqual(waiting['state'], 'waiting_host')
+        self.assertTrue(waiting['hostActionReservation'])
+        self.release(busy, 'idle')
+
+    def test_defer_after_ready_restores_an_unexecuted_phase_for_retry(self):
+        first, first_id = self.admitted('ready-race')
+        self.send(first, {'op': 'defer'})
+        self.assertEqual(self.receive(first)['event'], 'deferred')
+        self.assertEqual(first.wait(timeout=3), 0)
+        self.assertEqual(read_job(self.config, first_id)['state'], 'idle')
+        retry, retry_id = self.admitted('ready-race')
+        self.assertEqual(first_id, retry_id)
+        self.release(retry, 'completed', cleanupVerified=True)
+
     def test_host_folder_policy_refuses_symlinks_nonowners_and_forged_roles(self):
         link = self.root / 'host-link'
         link.symlink_to(self.repo)

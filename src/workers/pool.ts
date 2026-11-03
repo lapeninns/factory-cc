@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fsyncSync, fstatSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -12,7 +12,7 @@ import { isWorkerStartRejection, isWorkerStartRejectionCode, workerStartRejectio
 
 export interface PoolSeatConfig { profile: SubscriptionProfile; weight: number; configFile: string }
 export interface PoolConfig { version: 1; enabled: boolean; stateRoot: string; port: number; clientTokenFile: string; seats: PoolSeatConfig[] }
-export interface PoolWorkerInput { repository: string; task: string; workflow: "implement" | "investigate" | "release-prepare" }
+export interface PoolWorkerInput { repository: string; task: string; workflow: "implement" | "investigate" | "release-prepare"; operationId?: string }
 export interface PoolBackend {
   profile: SubscriptionProfile;
   weight: number;
@@ -29,6 +29,10 @@ interface PoolRoute {
   phase: "dispatching" | "attached" | "unknown"; createdAt: string; updatedAt: string; requestDigest: string;
   cooldownApplied?: boolean;
   rejectionCode?: WorkerStartRejectionCode;
+  operationHash?: string;
+  backendOperation?: boolean;
+  observedState?: string;
+  active?: boolean;
 }
 interface PoolState {
   version: 1;
@@ -42,6 +46,20 @@ const object = (value: unknown): value is Record<string, unknown> => !!value && 
 const validWorker = (value: unknown): value is string => typeof value === "string" && /^worker-[a-f0-9-]{36}$/.test(value);
 const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
 const hex = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+const operationIdValid = (value: unknown): value is string => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(value);
+const terminalStates = new Set(["completed", "failed", "cancelled"]);
+
+export class PoolUnavailableError extends Error {
+  readonly code = "pool_unavailable";
+  constructor(readonly retryAfterSeconds: number) {
+    super("No healthy pool seat is currently available. Retry after the reported delay or inspect account availability.");
+  }
+}
+
+export class PoolOperationConflictError extends Error {
+  readonly code = "operation_conflict";
+  constructor() { super("This operation ID already belongs to a different worker request."); }
+}
 
 export function readPoolPrivateFile(path: string, limit = 128 * 1024): string {
   if (!isAbsolute(path)) throw new Error("An absolute private pool file is required.");
@@ -157,15 +175,24 @@ export class SubscriptionWorkerPool {
       const value: unknown = JSON.parse(readPoolPrivateFile(this.statePath, 4 * 1024 * 1024));
       if (!object(value) || value.version !== 1 || JSON.stringify(value.seats) !== JSON.stringify(seats) || !object(value.current) || !object(value.coolUntil)
           || !Array.isArray(value.routes) || value.routes.length > 2000) throw new Error("Pool state belongs to another routing configuration.");
-      const ids = new Set<string>();
+      const ids = new Set<string>(), operations = new Set<string>();
       for (const route of value.routes) {
         if (!object(route) || !validWorker(route.id) || ids.has(route.id) || !hex(route.ownerHash) || !this.backends.has(route.profile as SubscriptionProfile)
             || !["dispatching", "attached", "unknown"].includes(String(route.phase)) || !hex(route.requestDigest)
             || typeof route.createdAt !== "string" || typeof route.updatedAt !== "string"
             || (route.cooldownApplied !== undefined && typeof route.cooldownApplied !== "boolean")
+            || (route.operationHash !== undefined && !hex(route.operationHash))
+            || (route.backendOperation !== undefined && typeof route.backendOperation !== "boolean")
+            || (route.active !== undefined && typeof route.active !== "boolean")
+            || (route.observedState !== undefined && (typeof route.observedState !== "string" || route.observedState.length > 100))
             || (route.phase === "attached" ? !validWorker(route.backendId) : route.backendId !== undefined)
             || (route.rejectionCode !== undefined && (route.phase !== "unknown" || !isWorkerStartRejectionCode(route.rejectionCode)))) throw new Error("Invalid pool route record.");
         ids.add(route.id);
+        if (route.operationHash) {
+          const operation = route.ownerHash + ":" + route.operationHash;
+          if (operations.has(operation)) throw new Error("Duplicate pool operation record.");
+          operations.add(operation);
+        }
       }
       for (const [key, counter] of Object.entries(value.current)) if (!this.backends.has(key as SubscriptionProfile) || typeof counter !== "number" || !Number.isSafeInteger(counter)) throw new Error("Invalid pool scheduler state.");
       for (const [key, until] of Object.entries(value.coolUntil)) if (!this.backends.has(key as SubscriptionProfile) || typeof until !== "number" || !Number.isSafeInteger(until) || until < 0) throw new Error("Invalid pool cooldown state.");
@@ -179,7 +206,7 @@ export class SubscriptionWorkerPool {
   private save(): void {
     const temporary = join(this.stateRoot, ".pool-state-" + randomBytes(12).toString("hex"));
     const fd = openSync(temporary, "wx", 0o600);
-    try { writeFileSync(fd, JSON.stringify(this.state) + "\n"); } finally { closeSync(fd); }
+    try { writeFileSync(fd, JSON.stringify(this.state) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
     try { renameSync(temporary, this.statePath); } finally { rmSync(temporary, { force: true }); }
   }
 
@@ -205,6 +232,11 @@ export class SubscriptionWorkerPool {
   }
   private view(route: PoolRoute, value: unknown): Record<string, unknown> {
     if (!object(value) || value.id !== route.backendId || (value.subscriptionProfile !== undefined && value.subscriptionProfile !== route.profile)) throw new Error("Fixed worker identity did not match its pinned route.");
+    const observedState = typeof value.state === "string" ? value.state : "unknown";
+    const active = !terminalStates.has(observedState) || value.cleanupVerified !== true;
+    if (route.observedState !== observedState || route.active !== active) {
+      route.observedState = observedState; route.active = active; this.save();
+    }
     const backoff = value.backoff;
     if (!route.cooldownApplied && ["failed", "unknown"].includes(String(value.state)) && object(backoff)
         && ["rate_limit", "usage_limit", "overloaded"].includes(String(backoff.kind))
@@ -221,14 +253,74 @@ export class SubscriptionWorkerPool {
     }
     return { ...value, id: route.id, subscriptionProfile: route.profile, poolRoute: "pinned" };
   }
+  private async reconcile(route: PoolRoute, signal?: AbortSignal): Promise<Record<string, unknown> | undefined> {
+    if (!route.backendOperation || route.rejectionCode) return undefined;
+    try {
+      const value = await this.backends.get(route.profile)!.call("factory_worker_lookup", { operationId: route.id, operationOwner: route.ownerHash }, signal);
+      if (!object(value) || !validWorker(value.id) || (value.subscriptionProfile !== undefined && value.subscriptionProfile !== route.profile)) return undefined;
+      if (this.state.routes.some(item => item !== route && item.profile === route.profile && item.backendId === value.id)) return undefined;
+      route.backendId = value.id; route.phase = "attached"; route.updatedAt = new Date(this.now()).toISOString(); this.save();
+      return this.view(route, value);
+    } catch { return undefined; }
+  }
+  private async refreshActive(signal?: AbortSignal): Promise<void> {
+    await Promise.all([...this.backends.values()].map(async backend => {
+      const assigned = this.state.routes.filter(route => route.profile === backend.profile && !route.rejectionCode && route.active !== false);
+      for (const route of assigned) if (route.phase !== "attached") await this.reconcile(route, signal);
+      const routes = assigned.filter(route => route.phase === "attached");
+      if (!routes.length) return;
+      try {
+        const workers = await backend.call("factory_worker_list", {}, signal);
+        if (!Array.isArray(workers)) return;
+        for (const route of routes) {
+          const worker = workers.find(value => object(value) && value.id === route.backendId);
+          if (worker) this.view(route, worker);
+        }
+      } catch { /* Retain the last known reservation until the service confirms its state. */ }
+    }));
+  }
+  private activeCount(profile: SubscriptionProfile): number {
+    return this.state.routes.filter(route => route.profile === profile && !route.rejectionCode && route.active !== false).length;
+  }
+  private recoveryRequired(profile: SubscriptionProfile): boolean {
+    return this.state.routes.some(route => route.profile === profile && !route.rejectionCode
+      && (route.phase === "unknown" || route.observedState === "unknown"));
+  }
+  async accounts(signal?: AbortSignal): Promise<Record<string, unknown>> {
+    await this.refreshActive(signal);
+    const now = this.now();
+    const accounts = await Promise.all([...this.backends.values()].map(async backend => {
+      let healthy = false;
+      try { healthy = await backend.health(signal); } catch { /* Health is an observation, not an execution claim. */ }
+      const coolingUntil = this.state.coolUntil[backend.profile] ?? 0;
+      const recoveryRequired = this.recoveryRequired(backend.profile);
+      const state = recoveryRequired ? "recovery_required" : coolingUntil > now ? "cooling_down" : healthy ? "ready" : "unavailable";
+      const routes = this.state.routes.filter(route => route.profile === backend.profile);
+      return { profile: backend.profile, weight: backend.weight, state, eligible: state === "ready", healthy,
+        activeWorkers: this.activeCount(backend.profile), assignedWorkers: routes.length,
+        completedWorkers: routes.filter(route => route.observedState === "completed" && route.active === false).length,
+        failedWorkers: routes.filter(route => route.rejectionCode || route.observedState === "failed").length,
+        unknownWorkers: routes.filter(route => !route.rejectionCode && (route.phase === "unknown" || route.observedState === "unknown")).length,
+        ...(coolingUntil > now ? { coolingUntil: new Date(coolingUntil).toISOString() } : {}) };
+    }));
+    return { checkedAt: new Date(now).toISOString(), seatCount: accounts.length, weightMeaning: "assignment_priority", accounts };
+  }
   private async select(signal?: AbortSignal): Promise<PoolBackend> {
+    await this.refreshActive(signal);
     const backends = [...this.backends.values()];
     const healthy = await Promise.all(backends.map(async backend => {
-      if ((this.state.coolUntil[backend.profile] ?? 0) > this.now()) return false;
+      if ((this.state.coolUntil[backend.profile] ?? 0) > this.now() || this.recoveryRequired(backend.profile)) return false;
       try { return await backend.health(signal); } catch { return false; }
     }));
-    const ready = backends.filter((_, index) => healthy[index]);
-    if (!ready.length) throw new Error("No healthy pool seat is currently available. No task was dispatched.");
+    let ready = backends.filter((_, index) => healthy[index]);
+    if (!ready.length) {
+      const upcoming = Object.values(this.state.coolUntil).filter(until => until > this.now());
+      throw new PoolUnavailableError(upcoming.length ? Math.max(1, Math.ceil((Math.min(...upcoming) - this.now()) / 1000)) : 5);
+    }
+    // Prefer idle accounts before adding work to an occupied account. Weights
+    // decide between equally loaded accounts, rather than hiding idle seats.
+    const minimumActive = Math.min(...ready.map(backend => this.activeCount(backend.profile)));
+    ready = ready.filter(backend => this.activeCount(backend.profile) === minimumActive);
     const total = ready.reduce((sum, item) => sum + item.weight, 0);
     let best = ready[0]!;
     for (const backend of ready) {
@@ -241,7 +333,10 @@ export class SubscriptionWorkerPool {
   async start(scope: string, input: PoolWorkerInput, signal?: AbortSignal): Promise<Record<string, unknown>> {
     const ownerHash = this.scope(scope);
     if (!input || typeof input.repository !== "string" || !isAbsolute(input.repository) || typeof input.task !== "string" || !input.task.trim()
-        || input.task.length > 100_000 || !["implement", "investigate", "release-prepare"].includes(input.workflow)) throw new Error("Invalid pooled worker request.");
+        || input.task.length > 100_000 || !["implement", "investigate", "release-prepare"].includes(input.workflow)
+        || (input.operationId !== undefined && !operationIdValid(input.operationId))) throw new Error("Invalid pooled worker request.");
+    const requestDigest = digest(JSON.stringify({ repository: input.repository, task: input.task, workflow: input.workflow }));
+    const operationHash = input.operationId === undefined ? undefined : digest(input.operationId);
     // Serialise only admission; independent worker execution is left to the fixed services and shared leases.
     let release!: () => void;
     const previous = this.serial; this.serial = new Promise<void>(resolve => { release = resolve; });
@@ -249,17 +344,31 @@ export class SubscriptionWorkerPool {
     try {
       await previous;
       if (signal?.aborted) throw new Error("Pool request was cancelled before dispatch.");
+      if (operationHash) {
+        const existing = this.state.routes.find(item => item.ownerHash === ownerHash && item.operationHash === operationHash);
+        if (existing) {
+          if (existing.requestDigest !== requestDigest) throw new PoolOperationConflictError();
+          return { ...await this.status(scope, existing.id, signal), reused: true };
+        }
+      }
       if (this.state.routes.length >= 2000) throw new Error("Pool routing ledger is full; archive it after all owned work is resolved.");
       backend = await this.select(signal);
+      if (signal?.aborted) throw new Error("Pool request was cancelled before dispatch.");
       const at = new Date(this.now()).toISOString();
       route = { id: "worker-" + randomUUID(), ownerHash, profile: backend.profile, phase: "dispatching", createdAt: at, updatedAt: at,
-        requestDigest: digest(JSON.stringify(input)) };
+        requestDigest, ...(operationHash ? { operationHash } : {}), backendOperation: true, active: true };
       this.state.routes.push(route); this.save();
     } finally { release(); }
     try {
-      const result = await backend.call("factory_worker_start", input as unknown as Record<string, unknown>, signal);
+      const result = await backend.call("factory_worker_start", { repository: input.repository, task: input.task, workflow: input.workflow,
+        operationId: route.id, operationOwner: ownerHash }, signal);
       if (isWorkerStartRejection(result)) {
-        route.phase = "unknown"; route.rejectionCode = result.code; route.updatedAt = new Date(this.now()).toISOString(); this.save();
+        route.phase = "unknown"; route.rejectionCode = result.code; route.active = false; route.observedState = "failed";
+        route.updatedAt = new Date(this.now()).toISOString();
+        if (["subscription_preflight_failed", "runtime_unverified", "service_unavailable"].includes(result.code)) {
+          this.state.coolUntil[route.profile] = Math.max(this.state.coolUntil[route.profile] ?? 0, this.now() + 30_000);
+        }
+        this.save();
         return this.rejected(route);
       }
       if (object(result) && result.type === "worker_start_rejected") throw new Error("Malformed worker rejection.");
@@ -276,7 +385,7 @@ export class SubscriptionWorkerPool {
   async status(scope: string, id: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
     const route = this.route(id, scope);
     if (route.rejectionCode !== undefined) return this.rejected(route);
-    if (route.phase !== "attached") return this.unknown(route);
+    if (route.phase !== "attached") return await this.reconcile(route, signal) ?? this.unknown(route);
     return this.view(route, await this.backends.get(route.profile)!.call("factory_worker_status", { id: route.backendId! }, signal));
   }
   async list(scope: string, signal?: AbortSignal): Promise<Record<string, unknown>[]> {
@@ -289,6 +398,7 @@ export class SubscriptionWorkerPool {
   async cancel(scope: string, id: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
     const route = this.route(id, scope);
     if (route.rejectionCode !== undefined) return this.rejected(route);
+    if (route.phase !== "attached") await this.status(scope, id, signal);
     if (route.phase !== "attached") return this.unknown(route);
     return this.view(route, await this.backends.get(route.profile)!.call("factory_worker_cancel", { id: route.backendId! }, signal));
   }

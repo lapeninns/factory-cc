@@ -36,7 +36,7 @@ def resolve_profile_config(environ=None, home=None):
 
 CLI = resolve_cli()
 CONFIG = resolve_profile_config()
-PROFILES = frozenset(("team1", "team2", "team3", "team4"))
+PROFILES = frozenset("team" + str(number) for number in range(1, 9))
 MODEL = "claude-opus-5-5"
 SETTINGS = '{"ultracode":true,"workflowSizeGuideline":"small"}'
 BLOCKED_FLAGS = frozenset(("-m", "--model", "--fallback-model", "--effort", "--settings", "--setting-sources", "--api-key", "--auth-token", "--oauth-token", "--access-token", "--api-key-helper", "--config-dir"))
@@ -70,7 +70,7 @@ def sanitized_env(source, config_dir):
 
 def profile_settings(profile):
     if profile not in PROFILES:
-        raise Refused("Only team1 through team4 are configured.")
+        raise Refused("Only team1 through team8 are supported.")
     try:
         info = CONFIG.lstat()
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:

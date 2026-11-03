@@ -87,7 +87,7 @@ describe("real pooled worker stdio adapter recovery", () => {
   it("recovers running and completed workers after fresh adapter processes without restarting execution", async () => {
     const f = await fixture(), first = await f.connect();
     const catalogue = await first.listTools();
-    expect(catalogue.tools).toHaveLength(5);
+    expect(catalogue.tools).toHaveLength(6);
     expect(catalogue.tools.find(tool => tool.name === "factory_worker_list")?.description).toContain("across reconnections");
     const running = value(await call(first, "factory_worker_start", { repository: f.root, task: "running fixture" }));
     const completed = value(await call(first, "factory_worker_start", { repository: f.root, task: "completed fixture" }));

@@ -45,7 +45,7 @@ export async function runSubscriptionPool(argv = process.argv.slice(2)): Promise
     const client = await connect(scope);
     const proxy = new Server({ name: "factory-subscription-pool", version: "1.0.0" }, {
       capabilities: { tools: {} },
-      instructions: "Use factory_worker_start for independent tasks. This connection distributes new workers across eight subscription accounts and keeps each worker pinned. Poll status/wait for completion or human approval. Never retry an unknown start automatically."
+      instructions: "Use factory_worker_start for independent tasks with a stable operationId for each logical task. Reuse the ID when retrying the same task. This connection distributes new workers across eight eligible subscription accounts and keeps each worker pinned. Poll status/wait for completion or human approval. Check factory_worker_accounts for availability and assignments. An unknown start is reconciled against its original service before replacement work."
         + (factorySessionScope ? " Worker ownership follows the Factory Workstream across reconnections. List its existing workers before starting replacement work." : ""),
     });
     proxy.setRequestHandler(ListToolsRequestSchema, async () => {

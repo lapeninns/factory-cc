@@ -4,7 +4,7 @@ import { closeSync, existsSync, openSync, renameSync, rmSync, writeFileSync } fr
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { readPoolPrivateFile, type PoolWorkerInput, type SubscriptionWorkerPool } from "./pool.js";
+import { PoolOperationConflictError, PoolUnavailableError, readPoolPrivateFile, type PoolWorkerInput, type SubscriptionWorkerPool } from "./pool.js";
 
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
 const tokenValid = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
@@ -28,15 +28,16 @@ async function body(request: AsyncIterable<Buffer | string>, limit: number): Pro
 export function createPoolMcp(pool: SubscriptionWorkerPool, scope: string, enabled = true): Server {
   const server = new Server({ name: "factory-subscription-pool", version: "1.0.0" }, {
     capabilities: { tools: {} },
-    instructions: "Delegate independent tasks with these pooled supervised workers. New workers are distributed among eight fixed subscription services; each stays on its assigned account and isolated worktree. Start a worker, then poll status/wait and report recorded results. An unknown start must not be retried automatically because execution may already have begun. Human actions require the controller's native approval; the model has no approval tool.",
+    instructions: "Delegate independent tasks with these pooled supervised workers. New workers use the least occupied healthy accounts among eight fixed subscription services and remain on their assigned account. Give each logical task one stable operationId and reuse it for retries. Status reconciles an uncertain start with its original service. Start a worker, then use bounded status/wait calls and report recorded results. Check factory_worker_accounts for account availability and assignment counts. Human actions use the controller's configured permission policy.",
   });
   const idSchema = { type: "object" as const, properties: { id: { type: "string" } }, required: ["id"], additionalProperties: false };
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [
-    { name: "factory_worker_start", description: "Start a supervised Opus 5.5 medium Ultracode worker, automatically assigning one of eight subscription accounts. Its account stays fixed. Unknown delivery requires inspection, not an automatic retry.", inputSchema: { type: "object", properties: { repository: { type: "string" }, task: { type: "string" }, workflow: { type: "string", enum: ["implement", "investigate", "release-prepare"] } }, required: ["repository", "task"], additionalProperties: false } },
+    { name: "factory_worker_start", description: "Start a supervised Opus 5.5 medium Ultracode worker on one of eight eligible accounts. Use one operationId for each logical task and reuse that ID if its response is lost. The same ID and task return the existing worker.", inputSchema: { type: "object", properties: { repository: { type: "string" }, task: { type: "string" }, operationId: { type: "string", minLength: 1, maxLength: 160, pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]*$" }, workflow: { type: "string", enum: ["implement", "investigate", "release-prepare"] } }, required: ["repository", "task", "operationId"], additionalProperties: false } },
     { name: "factory_worker_status", description: "Read an owned worker's state, assigned account, result, usage and pending human actions.", inputSchema: idSchema, annotations: { readOnlyHint: true } },
     { name: "factory_worker_wait", description: "Wait at most 20 seconds for an owned worker, returning immediately for a terminal state or human approval.", inputSchema: idSchema, annotations: { readOnlyHint: true } },
     { name: "factory_worker_list", description: "List only workers started through this Workstream's current connection.", inputSchema: { type: "object", properties: {}, additionalProperties: false }, annotations: { readOnlyHint: true } },
     { name: "factory_worker_cancel", description: "Cancel an owned worker through its original account's service. Never switches accounts.", inputSchema: idSchema },
+    { name: "factory_worker_accounts", description: "Read availability, active and assigned worker counts for all eight accounts. Weights express assignment priority. Counts do not measure subscription quota.", inputSchema: { type: "object", properties: {}, additionalProperties: false }, annotations: { readOnlyHint: true } },
   ] }));
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     try {
@@ -44,15 +45,17 @@ export function createPoolMcp(pool: SubscriptionWorkerPool, scope: string, enabl
       const args = request.params.arguments ?? {};
       if (!object(args)) throw new Error();
       const name = request.params.name;
-      const keys = name === "factory_worker_start" ? ["repository", "task", "workflow"] : name === "factory_worker_list" ? [] : ["id"];
+      const keys = name === "factory_worker_start" ? ["repository", "task", "workflow", "operationId"] : ["factory_worker_list", "factory_worker_accounts"].includes(name) ? [] : ["id"];
       if (Object.keys(args).some(key => !keys.includes(key))) throw new Error();
       let result: unknown;
       if (name === "factory_worker_start") {
         const workflow = args.workflow ?? "implement";
         if (!["implement", "investigate", "release-prepare"].includes(String(workflow))) throw new Error();
-        result = await pool.start(scope, { repository: string(args.repository), task: string(args.task), workflow: workflow as PoolWorkerInput["workflow"] }, extra.signal);
+        result = await pool.start(scope, { repository: string(args.repository), task: string(args.task), workflow: workflow as PoolWorkerInput["workflow"],
+          ...(args.operationId === undefined ? {} : { operationId: string(args.operationId) }) }, extra.signal);
       } else if (name === "factory_worker_status") result = await pool.status(scope, string(args.id), extra.signal);
       else if (name === "factory_worker_list") result = await pool.list(scope, extra.signal);
+      else if (name === "factory_worker_accounts") result = await pool.accounts(extra.signal);
       else if (name === "factory_worker_cancel") result = await pool.cancel(scope, string(args.id), extra.signal);
       else if (name === "factory_worker_wait") {
         const id = string(args.id);
@@ -71,7 +74,11 @@ export function createPoolMcp(pool: SubscriptionWorkerPool, scope: string, enabl
         result = current;
       } else throw new Error();
       return { content: [{ type: "text", text: JSON.stringify(result) }] };
-    } catch {
+    } catch (error) {
+      if (error instanceof PoolUnavailableError || error instanceof PoolOperationConflictError) {
+        return { isError: true, content: [{ type: "text", text: JSON.stringify({ type: error.code, message: error.message,
+          ...(error instanceof PoolUnavailableError ? { executionStarted: false, retrySafe: true, retryAfterSeconds: error.retryAfterSeconds } : { retrySafe: false }) }) }] };
+      }
       return { isError: true, content: [{ type: "text", text: "Pooled worker operation failed. Inspect this connection and its owned worker state. No account switch or automatic retry was performed." }] };
     }
   });
@@ -128,6 +135,15 @@ export async function startPoolServer(factory: () => SubscriptionWorkerPool, opt
       response.writeHead(ready ? 200 : 503, { "content-type": "application/json" }).end(JSON.stringify({ ok: ready, seatCount: 8, routing: "new-workers-only" })); return;
     }
     if (!ready || !pool) { response.writeHead(503).end(); return; }
+    if (request.method === "GET" && request.url === "/accounts") {
+      const abort = new AbortController();
+      response.once("close", () => abort.abort());
+      try {
+        const accounts = await pool.accounts(abort.signal);
+        response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(accounts));
+      } catch { response.writeHead(503).end(); }
+      return;
+    }
     const scope = request.headers["x-factory-worker-scope"];
     if (!tokenValid(scope)) { response.writeHead(403).end(); return; }
     if (request.method !== "POST" || request.url !== "/mcp") { response.writeHead(405).end(); return; }

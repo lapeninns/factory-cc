@@ -11,13 +11,13 @@ describe("Claude account pool", () => {
     expect(picks.slice(0, 4)).toContain("pro");
   });
 
-  it("skips an account while it cools down and falls back to the soonest recovery when all are cooling", () => {
+  it("skips cooling accounts and reports the next recovery instead of sending more work", () => {
     let clock = 0;
     const pool = new ClaudePool([{ id: "personal", weight: 10 }, { id: "pro", weight: 1 }], () => clock);
     pool.cool("personal", 600);
     expect(Array.from({ length: 5 }, () => pool.pick())).toEqual(["pro", "pro", "pro", "pro", "pro"]);
     pool.cool("pro", 60);
-    expect(pool.pick()).toBe("pro");
+    expect(() => pool.pick()).toThrow("All configured accounts are cooling");
     expect(pool.status()).toEqual([{ id: "personal", weight: 10, coolingUntil: new Date(600_000).toISOString() }, { id: "pro", weight: 1, coolingUntil: new Date(60_000).toISOString() }]);
     clock = 600_001;
     expect(pool.isCooling("personal")).toBe(false);

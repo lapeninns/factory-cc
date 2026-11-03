@@ -43,11 +43,25 @@ def execution_lane(job):
     return "worker"
 
 
+def holds_workspace(job):
+    """A published host action keeps its write reservation while compute is free."""
+    return job.get("state") in OCCUPIED or job.get("hostActionReservation") is True
+
+
+def occupies_compute(job):
+    return job.get("state") in OCCUPIED and not (
+        job.get("kind") == "factory-session"
+        and job.get("workspacePolicy") == "controller-host"
+        and job.get("hostActionReservation") is True
+        and job.get("reportedCleanupVerified") is True)
+
+
 def profile_conflicts(job, occupied):
     """Known controller and worker execution may share an account across lanes.
 
-    An uncertain execution retains the whole account until its owner confirms
-    cleanup, even when the other lane would otherwise have room.
+    Uncertain native execution retains the account until cleanup is confirmed.
+    A host-only reservation with verified native cleanup is excluded before
+    this check and continues to reserve only its workspace.
     """
     if job.get("kind") == "factory-session" and job.get("profile") == "factory-api":
         return False
@@ -93,6 +107,16 @@ def _reconcile_locked(config):
     jobs = _all_jobs(config)
     for job in jobs:
         if job.get("state") in TERMINAL or matches(job.get("supervisorIdentity"), table):
+            continue
+        if job.get("hostActionReservation") is True and not matches(job.get("leaseOwnerIdentity"), table):
+            job.update(state="unknown", externalCleanupRequired=True, reason="host_action_owner_lost")
+            write_job(config, job)
+            continue
+        if job.get("hostActionReservation") is True and job.get("state") == "waiting_slot":
+            previous = job.pop("admissionPreviousPhase", {})
+            job.update(state=previous.get("state", "waiting_host"),
+                       externalCleanupRequired=False, reason="queued_helper_lost_host_reservation_retained")
+            write_job(config, job)
             continue
         if job.get("kind") == "factory-session" and job.get("externalCleanupRequired"):
             # The lease helper does not own or contain the bridge's SDK. Its
@@ -162,21 +186,21 @@ def _reserve(config, job):
         if current.get("cancelRequestedAt"):
             job.update(current)
             return "cancelled"
-        occupied = [item for item in jobs if item.get("state") in OCCUPIED]
+        occupied = [item for item in jobs if occupies_compute(item)]
+        reserved = [item for item in jobs if holds_workspace(item) and item.get("id") != job.get("id")]
         lane = execution_lane(job)
         lane_limit = CONTROLLER_SLOTS if lane == "controller" else config.max_running
         if sum(execution_lane(item) == lane for item in occupied) >= lane_limit:
             return "wait"
-        busy_workspaces = {item.get("worktree") for item in occupied}
         if profile_conflicts(job, occupied):
             return "wait"
-        if job.get("worktree") in busy_workspaces or any(_host_workspace_conflict(job, item) for item in occupied):
+        if any(job.get("worktree") == item.get("worktree") or _host_workspace_conflict(job, item) for item in reserved):
             return "wait"
         eligible = sorted((item for item in jobs if item.get("state") == "waiting_slot"
                            and execution_lane(item) == lane
                            and not profile_conflicts(item, occupied)
-                           and item.get("worktree") not in busy_workspaces
-                           and not any(_host_workspace_conflict(item, running) for running in occupied)),
+                           and not any(item.get("worktree") == running.get("worktree") or _host_workspace_conflict(item, running) for running in reserved
+                                       if running.get("id") != item.get("id"))),
                           key=lambda item: (item.get("queuedAt", ""), item["id"]))
         if not eligible or eligible[0]["id"] != job["id"]:
             return "wait"
@@ -186,8 +210,8 @@ def _reserve(config, job):
 
 
 def _new_job(config, profile, repo, workflow, timeout_seconds, base_ref, requested, metadata):
-    if profile not in ("team1", "team2", "team3", "team4"):
-        raise RuntimeRefused("Only team1 through team4 are configured.")
+    if profile not in SUBSCRIPTION_PROFILES:
+        raise RuntimeRefused("Only team1 through team8 are configured.")
     job_id = "job-" + time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + uuid.uuid4().hex[:10]
     identity = process_identity(os.getpid())
     if not identity:

@@ -27,6 +27,14 @@ describe('subscription-only worker entry point',()=>{
     expect(readWorkerServerConfig(config({repositoryPolicy:'owned-git',allowedRepositories:[]}))).toMatchObject({repositoryPolicy:'owned-git',allowedRepositories:[]});
     expect(readWorkerServerConfig(config({repositoryPolicy:'owned-git',allowedRepositories:['/missing/previous-repository']})).repositoryPolicy).toBe('owned-git');
   });
+  it('supports explicit owned-workspace access for subscription folder snapshots',()=>{
+    expect(readWorkerServerConfig(config({repositoryPolicy:'owned-workspace',allowedRepositories:[]}))).toMatchObject({repositoryPolicy:'owned-workspace',allowedRepositories:[]});
+    expect(()=>readWorkerServerConfig(config({provider:'anthropic',repositoryPolicy:'owned-workspace',subscriptionProfile:undefined,apiKeyFile:'/missing-api-secret',maxBudgetUsd:1}))).toThrow(/subscription authentication/);
+  });
+  it('bounds pending workspace admissions before allocating snapshots',()=>{
+    expect(readWorkerServerConfig(config({maxPendingWorkers:8})).maxPendingWorkers).toBe(8);
+    for(const maxPendingWorkers of [0,65,1.5,'8']) expect(()=>readWorkerServerConfig(config({maxPendingWorkers}))).toThrow(/Pending worker admission/);
+  });
   it.each(['anywhere','',true,null])('rejects invalid private repository policy %j',repositoryPolicy=>{
     expect(()=>readWorkerServerConfig(config({repositoryPolicy}))).toThrow(/repository policy/);
   });

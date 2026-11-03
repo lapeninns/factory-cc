@@ -65,7 +65,7 @@ it("routes through actual SDK MCP clients into eight fake fixed worker services 
     expect((await pool.cancel(scope, publicIds[1]!)).state).toBe("cancelled");
     failure = "preflight";
     const rejected = await pool.start(scope, { repository: "/fixture/repo", task: "Rejected before execution", workflow: "investigate" });
-    expect(rejected).toMatchObject({ state: "failed", subscriptionProfile: "team1", errorCode: "subscription_preflight_failed", executionStarted: false, retrySafe: true });
+    expect(rejected).toMatchObject({ state: "failed", errorCode: "subscription_preflight_failed", executionStarted: false, retrySafe: true });
     expect(JSON.stringify(rejected)).not.toContain("private");
     const restored = new SubscriptionWorkerPool(config.stateRoot, backends);
     expect(await restored.status(scope, String(rejected.id))).toEqual(rejected);

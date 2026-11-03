@@ -28,6 +28,10 @@ class InstallerTests(unittest.TestCase):
             (home / '.factory/AGENTS.md').write_text('Existing policy.\n')
             first = install.install(source, home, 'v1', run_tests=False)
             self.assertTrue((home / '.local/bin/team-job').is_file())
+            for number in range(1, 9):
+                wrapper = home / '.local/bin' / ('claude-team' + str(number) + '-ultracode')
+                self.assertTrue(wrapper.is_file())
+                self.assertIn(' team' + str(number) + ' ', wrapper.read_text())
             self.assertIn('Existing policy.', (home / '.factory/AGENTS.md').read_text())
             receipt = json.loads((Path(first['backupDirectory']) / 'installation-receipt.json').read_text())
             self.assertFalse(receipt['accountCredentialsCopied'])
@@ -41,7 +45,7 @@ class InstallerTests(unittest.TestCase):
             common = home / '.claude/CLAUDE.md'
             common.parent.mkdir()
             common.write_text('Shared original instructions.\n')
-            for number in range(1, 5):
+            for number in range(1, 9):
                 profile = home / ('.claude-account' + str(number))
                 profile.mkdir()
                 (profile / 'CLAUDE.md').symlink_to(common)

@@ -6,7 +6,8 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { APIWorkerService, type WorkerApprovalPolicy, type WorkerRepositoryPolicy } from "../src/workers/service.js";
+import { APIWorkerService, type APIWorkerServiceOptions, type WorkerApprovalPolicy, type WorkerRepositoryPolicy, type WorkerView } from "../src/workers/service.js";
+import { callWorkerExecutor, launchWorkerExecutor, workerExecutorStatus, type WorkerExecutorController } from "../src/workers/executor.js";
 import { startWorkerControl } from "../src/workers/control.js";
 import { acquireDesktopJobLease, updateDesktopJobRecord, SUBSCRIPTION_PROFILES, type SubscriptionProfile } from "../src/runtime/desktop-jobs.js";
 import { startWorkerMcp } from "../src/workers/http.js";
@@ -34,6 +35,7 @@ export interface WorkerServerConfig {
   maxBudgetUsd?: number;
   maxMs: number;
   maxTurns: number;
+  maxPendingWorkers?: number;
 }
 
 function privateFile(path: string, limit = 64 * 1024): string {
@@ -48,8 +50,8 @@ export function readWorkerServerConfig(path: string): WorkerServerConfig {
   if (!value || typeof value.enabled !== "boolean" || typeof value.approvalGuardVerified !== "boolean" || !["anthropic", "openrouter", "subscription"].includes(value.provider)) throw new Error("Invalid worker service configuration.");
   if ((value.approvalPolicy !== undefined && !["ask", "bypass"].includes(value.approvalPolicy))
       || (value.approvalPolicy === "bypass" && value.provider !== "subscription")) throw new Error("Automatic worker approvals require an explicit subscription policy.");
-  if (value.repositoryPolicy !== undefined && !["allowlist", "owned-git"].includes(value.repositoryPolicy)) throw new Error("Invalid worker repository policy.");
-  if (value.repositoryPolicy === "owned-git" && value.provider !== "subscription") throw new Error("Owned Git repository access requires subscription authentication.");
+  if (value.repositoryPolicy !== undefined && !["allowlist", "owned-git", "owned-workspace"].includes(value.repositoryPolicy)) throw new Error("Invalid worker repository policy.");
+  if (value.repositoryPolicy && value.repositoryPolicy !== "allowlist" && value.provider !== "subscription") throw new Error("Owned workspace access requires subscription authentication.");
   for (const key of ["stateRoot", "workspaceRoot", "nativeRuntimePath", "sharedStateRoot", "clientTokenFile"] as const) if (typeof value[key] !== "string" || !isAbsolute(value[key])) throw new Error("Worker paths must be absolute.");
   if (value.approvalCommand !== undefined && !isAbsolute(value.approvalCommand)) throw new Error("An approval helper path must be absolute.");
   if (value.provider === "subscription") {
@@ -57,9 +59,48 @@ export function readWorkerServerConfig(path: string): WorkerServerConfig {
     if (value.profileMappingPath !== undefined && !isAbsolute(value.profileMappingPath)) throw new Error("Profile mapping path must be absolute.");
   } else if (typeof value.apiKeyFile !== "string" || !isAbsolute(value.apiKeyFile) || !Number.isFinite(value.maxBudgetUsd) || value.maxBudgetUsd! <= 0) throw new Error("API workers require an explicit key file and budget.");
   if (!Number.isInteger(value.port) || value.port < 1024 || value.port > 65535 || value.port === 18787) throw new Error("Use a dedicated local worker port.");
-  if (!Array.isArray(value.allowedRepositories) || (value.repositoryPolicy !== "owned-git" && !value.allowedRepositories.length) || value.allowedRepositories.some(path => typeof path !== "string" || !isAbsolute(path))) throw new Error("An explicit repository allowlist is required.");
+  if (!Array.isArray(value.allowedRepositories) || ((!value.repositoryPolicy || value.repositoryPolicy === "allowlist") && !value.allowedRepositories.length) || value.allowedRepositories.some(path => typeof path !== "string" || !isAbsolute(path))) throw new Error("An explicit repository allowlist is required.");
   if (!Number.isInteger(value.maxMs) || value.maxMs < 1000 || value.maxMs > 7200000 || !Number.isInteger(value.maxTurns) || value.maxTurns < 1 || value.maxTurns > 500) throw new Error("Finite worker deadline and turn bounds are required.");
+  if (value.maxPendingWorkers !== undefined && (!Number.isInteger(value.maxPendingWorkers) || value.maxPendingWorkers < 1 || value.maxPendingWorkers > 64)) throw new Error("Pending worker admission must be from one to 64.");
   return value;
+}
+
+export function createWorkerServiceOptions(config: WorkerServerConfig): APIWorkerServiceOptions {
+  const sourceEnv = { ...process.env };
+  for (const name of Object.keys(sourceEnv)) if (/^ANTHROPIC_|^CLAUDE_CODE_(?:OAUTH|USE_|API_BASE_URL|GATEWAY_TOKEN)|^BRIDGE_OPENROUTER_API_KEY$/.test(name)) delete sourceEnv[name];
+  if (config.provider !== "subscription") {
+    sourceEnv[config.provider === "anthropic" ? "ANTHROPIC_API_KEY" : "BRIDGE_OPENROUTER_API_KEY"] = privateFile(config.apiKeyFile!, 16384).trim();
+  }
+  const runtime = realpathSync(config.nativeRuntimePath);
+  const policy = readFileSync(join(runtime, "policies/team-policy.md"), "utf8");
+  const workflows = Object.fromEntries(["implement", "investigate", "release-prepare"].map(name => [name, readFileSync(join(runtime, "workflows", name + ".md"), "utf8")]));
+  const leases = { pythonExecutable: "/usr/bin/python3", runtimePackagePath: runtime, stateRoot: config.sharedStateRoot, maxRunning: 2 };
+  return { stateRoot: config.stateRoot, workspaceRoot: config.workspaceRoot,
+    allowedRepositories: config.allowedRepositories, repositoryPolicy: config.repositoryPolicy, approvalPolicy: config.approvalPolicy,
+    provider: config.provider === "subscription" ? { kind: "subscription", profile: config.subscriptionProfile!, mappingPath: config.profileMappingPath } : { kind: config.provider }, maxConcurrent: config.provider === "subscription" ? 1 : 2,
+    maxBudgetUsd: config.maxBudgetUsd, maxMs: config.maxMs, maxTurns: config.maxTurns, maxPendingWorkers: config.maxPendingWorkers, sourceEnv,
+    policyText: policy, workflowText: workflows,
+    acquireLease: (worker, signal) => acquireDesktopJobLease(leases, { factorySessionId: worker.id, bridgeSessionId: worker.id, cwd: worker.worktree, role: "worker", ...(config.subscriptionProfile ? { subscriptionProfile: config.subscriptionProfile } : {}) }, signal),
+    finalizeLease: (worker, result) => updateDesktopJobRecord(leases, { factorySessionId: worker.id, bridgeSessionId: worker.id, cwd: worker.worktree, role: "worker", ...(config.subscriptionProfile ? { subscriptionProfile: config.subscriptionProfile } : {}) }, result),
+  };
+}
+
+/** Only the independently owned executor calls this entry point. */
+export async function createExecutorController(configFile: string, id: string, task: string): Promise<WorkerExecutorController> {
+  const config = readWorkerServerConfig(configFile);
+  if (config.provider !== "subscription" || !config.enabled || !config.approvalGuardVerified) throw new Error("Subscription worker execution is disabled by its configuration.");
+  const service = new APIWorkerService({ ...createWorkerServiceOptions(config), managedWorkerId: id });
+  const worker = service.status(id);
+  if (worker.authentication !== config.provider || (config.provider === "subscription" && worker.subscriptionProfile !== config.subscriptionProfile)) {
+    await service.close();
+    throw new Error("Prepared worker and executor authentication route differ.");
+  }
+  return {
+    status: () => service.status(id),
+    start: async () => { try { await service.executePrepared(id, task); } finally { await service.close(); } },
+    cancel: () => service.cancel(id),
+    approve: input => service.approve(input),
+  };
 }
 
 export async function runFactoryWorkers(argv = process.argv.slice(2), options: { subscriptionOnly?: boolean } = {}): Promise<void> {
@@ -94,20 +135,24 @@ export async function runFactoryWorkers(argv = process.argv.slice(2), options: {
     await proxy.connect(new StdioServerTransport());
     return;
   }
-  const sourceEnv = { ...process.env };
-  for (const name of Object.keys(sourceEnv)) if (/^ANTHROPIC_|^CLAUDE_CODE_(?:OAUTH|USE_|API_BASE_URL|GATEWAY_TOKEN)|^BRIDGE_OPENROUTER_API_KEY$/.test(name)) delete sourceEnv[name];
-  if (key) sourceEnv[config.provider === "anthropic" ? "ANTHROPIC_API_KEY" : "BRIDGE_OPENROUTER_API_KEY"] = key;
-  const runtime = realpathSync(config.nativeRuntimePath);
-  const policy = readFileSync(join(runtime, "policies/team-policy.md"), "utf8");
-  const workflows = Object.fromEntries(["implement", "investigate", "release-prepare"].map(name => [name, readFileSync(join(runtime, "workflows", name + ".md"), "utf8")]));
-  const leases = { pythonExecutable: "/usr/bin/python3", runtimePackagePath: runtime, stateRoot: config.sharedStateRoot, maxRunning: 2 };
-  const makeService = () => new APIWorkerService({ stateRoot: config.stateRoot, workspaceRoot: config.workspaceRoot,
-    allowedRepositories: config.allowedRepositories, repositoryPolicy: config.repositoryPolicy, approvalPolicy: config.approvalPolicy, provider: config.provider === "subscription" ? { kind: "subscription", profile: config.subscriptionProfile!, mappingPath: config.profileMappingPath } : { kind: config.provider }, maxConcurrent: 2,
-    maxBudgetUsd: config.maxBudgetUsd, maxMs: config.maxMs, maxTurns: config.maxTurns, sourceEnv,
-    policyText: policy, workflowText: workflows,
-    acquireLease: (worker, signal) => acquireDesktopJobLease(leases, { factorySessionId: worker.id, bridgeSessionId: worker.id, cwd: worker.worktree, role: "worker", ...(config.subscriptionProfile ? { subscriptionProfile: config.subscriptionProfile } : {}) }, signal),
-    finalizeLease: (worker, result) => updateDesktopJobRecord(leases, { factorySessionId: worker.id, bridgeSessionId: worker.id, cwd: worker.worktree, role: "worker", ...(config.subscriptionProfile ? { subscriptionProfile: config.subscriptionProfile } : {}) }, result),
-  });
+  const executionOptions = createWorkerServiceOptions(config);
+  const snapshot = (worker: Parameters<NonNullable<APIWorkerServiceOptions["executionHost"]>["status"]>[0]): WorkerView => {
+    const current = workerExecutorStatus(config.stateRoot, worker.id);
+    if (current) return current;
+    if (["completed", "failed", "cancelled", "unknown"].includes(worker.state)) return { ...structuredClone(worker), approvals: [] };
+    return { ...structuredClone(worker), state: "unknown", reason: "executor_ownership_unconfirmed", cleanupVerified: null, pendingApprovalCount: 0, approvals: [] };
+  };
+  const executionHost: APIWorkerServiceOptions["executionHost"] = config.provider === "subscription" ? {
+    start: (worker, task) => launchWorkerExecutor({ stateRoot: config.stateRoot, workerId: worker.id, configFile: realpathSync(filtered[1]!), task }),
+    status: snapshot,
+    cancel: async worker => {
+      const current = snapshot(worker);
+      return ["completed", "failed", "cancelled"].includes(current.state) ? current : callWorkerExecutor(config.stateRoot, worker.id, "cancel");
+    },
+    approve: (worker, input) => callWorkerExecutor(config.stateRoot, worker.id, "approve", input),
+    detach: async () => {},
+  } : undefined;
+  const makeService = () => new APIWorkerService({ ...executionOptions, executionHost });
   let service: APIWorkerService;
   const guarded = {
     start: (input: Parameters<APIWorkerService["start"]>[0]) => {
@@ -118,6 +163,7 @@ export async function runFactoryWorkers(argv = process.argv.slice(2), options: {
       return service.start(input);
     },
     status: (id: string) => service.status(id), list: () => service.list(), cancel: (id: string) => service.cancel(id),
+    lookup: (operationId: string, operationOwner: string) => service.lookup(operationId, operationOwner),
   };
   const { server } = await startWorkerMcp(() => { service = makeService(); return guarded; }, { port: config.port, token: clientToken, approvalCommand: config.approvalCommand });
   let control;

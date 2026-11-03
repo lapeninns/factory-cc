@@ -29,6 +29,7 @@ import { publicSelection, sdkEnv, selectionFromConfig, type UpstreamSelection } 
 import { resolveRequestModel } from "../models.js";
 import { claudeReasoningKey, claudeReasoningOptions, droidReasoningLevel } from "./reasoning.js";
 import { OwnedProcesses } from "./owned-processes.js";
+import { hostActionNeedsWorkspaceReservation } from "./desktop-jobs.js";
 import { upstreamError } from "./upstream-error.js";
 import { redactValue } from "../security/redact.js";
 
@@ -172,6 +173,7 @@ interface LiveSdk {
   resultFingerprints: Map<string, string>;
   hostResultConsumptions: Map<string, HostResultConsumption>;
   hostCompletionFingerprints: Map<string, string>;
+  recordedHostCompletions: Map<string, RuntimeHostCompletion>;
   approvals: Set<AbortController>;
   desktopApprovals: Map<string, DesktopApprovalReceipt>;
   hostEnding?: string;
@@ -320,7 +322,7 @@ export class SdkRuntime implements BridgeRuntime {
     return [...live.pending.values()].map((call) => ({ toolUseId: call.id, toolName: call.name, input: structuredClone(call.input) }));
   }
 
-  async completeHostTool(sessionId: string, completion: RuntimeHostCompletion): Promise<"accepted" | "duplicate"> {
+  validateHostToolCompletion(sessionId: string, completion: RuntimeHostCompletion): void {
     const live = this.lives.get(sessionId);
     if (!live) throw new BridgeError(409, "interrupted_tool_roundtrip", "No live SDK owns this host completion");
     const call = live.mailbox.getCall(completion.toolUseId);
@@ -332,7 +334,11 @@ export class SdkRuntime implements BridgeRuntime {
     const previous = live.hostCompletionFingerprints.get(completion.toolUseId);
     if (previous) {
       if (previous !== fingerprint) throw new BridgeError(409, "conflicting_host_completion", completion.toolUseId);
-      return "duplicate";
+      return;
+    }
+    const recorded = live.recordedHostCompletions.get(completion.toolUseId);
+    if (recorded && hostCompletionFingerprint(recorded) !== fingerprint) {
+      throw new BridgeError(409, "conflicting_host_completion", completion.toolUseId);
     }
     if (live.terminal) throw live.terminal;
     if (live.hostEnding) throw new BridgeError(409, "host_session_ending", live.hostEnding);
@@ -342,7 +348,24 @@ export class SdkRuntime implements BridgeRuntime {
     }
     const result: DroidResult = { tool_use_id: completion.toolUseId, content: completion.content, is_error: Boolean(completion.isError) };
     mcpContent(result.content);
-    this.validateResults(live, [result]);
+    if (!previous) this.validateResults(live, [result]);
+  }
+
+  async recordHostToolCompletion(sessionId: string, completion: RuntimeHostCompletion): Promise<"accepted" | "duplicate"> {
+    this.validateHostToolCompletion(sessionId, completion);
+    const live = this.lives.get(sessionId)!;
+    if (live.recordedHostCompletions.has(completion.toolUseId) || live.hostCompletionFingerprints.has(completion.toolUseId)) return "duplicate";
+    live.recordedHostCompletions.set(completion.toolUseId, structuredClone(completion));
+    live.events.push({ at: now(), type: "host_tool_receipt_recorded", data: { toolUseId: completion.toolUseId, toolName: completion.toolName } });
+    return "accepted";
+  }
+
+  async completeHostTool(sessionId: string, completion: RuntimeHostCompletion): Promise<"accepted" | "duplicate"> {
+    this.validateHostToolCompletion(sessionId, completion);
+    const live = this.lives.get(sessionId)!;
+    const fingerprint = hostCompletionFingerprint(completion);
+    if (live.hostCompletionFingerprints.has(completion.toolUseId)) return "duplicate";
+    const result: DroidResult = { tool_use_id: completion.toolUseId, content: completion.content, is_error: Boolean(completion.isError) };
     live.hostCompletionFingerprints.set(completion.toolUseId, fingerprint);
     if (completion.terminal) live.hostEnding = `Host completed ${completion.toolName}`;
     const [outcome] = this.submitResults(live, [result]);
@@ -439,6 +462,17 @@ export class SdkRuntime implements BridgeRuntime {
         .slice(0, input.request.messages.length - trailing.length).filter((message) => message.role === "user"))
         .filter((result) => live.pending.has(result.tool_use_id)) : [];
       let results = [...earlier, ...latestToolResults(input, live.active || live.pending.size > 0)];
+      // Hook receipts are authenticated independently of a model continuation.
+      // Their representation may differ from Droid's display wrapper. Deliver
+      // the recorded content once, under this phase's admission permit.
+      for (const completion of input.session.hostCompletionReceipts ?? []) {
+        if (live.pending.has(completion.toolUseId)) await this.recordHostToolCompletion(id, completion);
+      }
+      for (const completion of live.recordedHostCompletions.values()) {
+        if (!live.pending.has(completion.toolUseId)) continue;
+        results = results.filter(result => result.tool_use_id !== completion.toolUseId);
+        results.push({ tool_use_id: completion.toolUseId, content: hostReceiptContent(completion.content), is_error: Boolean(completion.isError) });
+      }
       if (input.recovery === "cold-import") results = [];
       // A conversation imported from history has no native callbacks to answer.
       // Its tool results are earlier history when the same message carries a new
@@ -602,7 +636,7 @@ export class SdkRuntime implements BridgeRuntime {
       sdkSessionId, outbox: [], usage: new UsageLedger(), streamed: "", blocks: [], pending: new Map(),
       candidates: new Map(), handlerArrivals: new Set(), retiredCandidates: new Set(), batchChecks: new Set(), prefetched: new Set(),
       claimedHandlers: new Set(), resultFingerprints: new Map(), sentUserTurns: 0,
-      hostResultConsumptions: new Map(), hostCompletionFingerprints: new Map(), approvals: new Set(),
+      hostResultConsumptions: new Map(), hostCompletionFingerprints: new Map(), recordedHostCompletions: new Map(), approvals: new Set(),
       desktopApprovals: new Map(),
       starting: false, queryEpoch: 0, lastTouched: Date.now(), backgroundTasks: new Set(),
     };
@@ -718,6 +752,11 @@ export class SdkRuntime implements BridgeRuntime {
       const fresh = !live.resultFingerprints.has(result.tool_use_id);
       live.resultFingerprints.set(result.tool_use_id, resultFingerprint(result));
       live.pending.delete(result.tool_use_id);
+      const receipt = live.recordedHostCompletions.get(result.tool_use_id);
+      if (receipt) {
+        live.hostCompletionFingerprints.set(result.tool_use_id, hostCompletionFingerprint(receipt));
+        live.recordedHostCompletions.delete(result.tool_use_id);
+      }
       const desktopApproval = live.desktopApprovals.get(result.tool_use_id);
       if (desktopApproval) {
         if (!fresh) return "duplicate" as const;
@@ -908,7 +947,10 @@ export class SdkRuntime implements BridgeRuntime {
           if (live.retiredCandidates.has(call.id)) throw new BridgeError(409, "sdk_tool_rejected", "The native SDK already completed this tool invocation");
           if (!controllerHostToolAllowed(this.config, original)) throw new BridgeError(403, "controller_tool_denied", "The read-only Factory controller cannot invoke this tool.");
           if (!live.catalog?.has(original)) throw new BridgeError(409, "tool_not_advertised", `Droid no longer advertises ${original}`);
-          if (this.config.controllerHostTools && controllerHostAction(original)) {
+          if (this.config.controllerHostTools && original === "Task" && (args.run_in_background === true || args.background === true)) {
+            throw new BridgeError(403, "untracked_background_task", "Use the managed worker pool for detached tasks so workspace ownership and completion remain tracked.");
+          }
+          if (this.config.controllerHostTools && controllerHostAction(original, this.config)) {
             // Preserve the exact reviewed action even if a caller retains and
             // mutates its input object while the human question is pending.
             const approvedInput = structuredClone(call.input);
@@ -1004,7 +1046,10 @@ export class SdkRuntime implements BridgeRuntime {
               + (this.config.controllerApprovalPolicy === "bypass"
                 ? "The operator disabled this bridge's extra confirmation for Factory Execute, Create and Edit. Use those advertised host tools within the user's task scope; Factory's own permissions still apply. "
                 : "General filesystem operations may use Factory Execute, Create or Edit only through the exact-action human approval; never bypass it with native tools. ")
-              + "Delegate code implementation to the configured supervised workers in isolated worktrees. Never use Task, SpawnAgent, unrelated MCP tools or native side effects. Keep the user's requested scope and permissions; a folder task does not authorize deletion or production changes."
+              + "Use the advertised Factory tools and delegate useful independent work to the configured worker pool. Use synchronous Factory Task calls when appropriate. Give each writer separate ownership and use one integration owner. "
+              + "The worker pool routes across its eight configured accounts. Use factory_worker_accounts to inspect actual availability and assignment counts. Keep one stable operationId for each worker assignment and reuse it after transport uncertainty. "
+              + "Use bounded factory_worker_wait calls and check messages and status between waits. Do not use long shell sleeps to wait for workers. Report queue, approval, failure, cleanup and completion separately. "
+              + "For an ordinary folder or a workspace the worker cannot isolate, use authorized Factory host tools. Keep all actions within the user's task and current Factory permission mode."
             : this.config.controllerReadOnly ? "\nThis Factory controller is read-only. Inspect with the allowed read tools, discover only allowed tools with ToolSearch, and ask the user with AskUser. Delegate all implementation to the configured supervised worker tools. Never use Execute, Create, Edit, Task, SpawnAgent, unrelated MCP tools or native side effects." : "") },
       canUseTool: async (name: string, toolInput: Record<string, unknown>, context?: NativePermissionContext) => live.queryEpoch === epoch
         ? this.canUseTool(live, name, toolInput, context)
@@ -1323,7 +1368,7 @@ export class SdkRuntime implements BridgeRuntime {
    * Native Claude tools remain disabled; both policies enforce the same live
    * query, workspace, Factory mode and advertised-call checks. */
   private async requestControllerHostActionApproval(live: LiveSdk, original: string, input: unknown, mcpName: string): Promise<boolean> {
-    if (!this.config.controllerHostTools || !controllerHostAction(original) || !live.current || !this.control) return false;
+    if (!this.config.controllerHostTools || !controllerHostAction(original, this.config) || !live.current || !this.control) return false;
     const epoch = live.queryEpoch, control = this.control, cwd = resolveCwd(live.current, this.config);
     const approval = new AbortController();
     const current = (): boolean => !approval.signal.aborted && !live.terminal && !live.hostEnding && !live.turnHandoff
@@ -1532,8 +1577,9 @@ export class SdkRuntime implements BridgeRuntime {
     if (this.config.controllerReadOnly) {
       const original = name?.startsWith("mcp__droid__") ? live.names?.toOriginal(name.slice("mcp__droid__".length)) : name;
       if (!original || !controllerHostToolAllowed(this.config, original)) return "BRIDGE_CONTROLLER_READ_ONLY: This tool is outside the controller's read-only and supervised-worker allowlist.";
-      if (controllerHostAction(original) && (factoryPermissionMode ?? live.current?.factoryPermissionMode) === "spec") {
-        return "BRIDGE_FACTORY_SPEC_READ_ONLY: Leave Factory spec mode before authorizing a host filesystem action.";
+      if (this.config.controllerHostTools && !["Read", "LS", "Grep", "Glob", "ToolSearch", "AskUser", "ExitSpecMode"].includes(original)
+          && (factoryPermissionMode ?? live.current?.factoryPermissionMode) === "spec") {
+        return "BRIDGE_FACTORY_SPEC_READ_ONLY: Leave Factory spec mode before authorizing a mutating host action.";
       }
     }
     return toolAccessDenial(live, name, factoryPermissionMode);
@@ -1764,7 +1810,7 @@ export class SdkRuntime implements BridgeRuntime {
 
   private makeTurn(live: LiveSdk, extra: ContentBlock[], stop: "tool_use" | "end_turn"): RuntimeTurn {
     for (const id of live.mailbox.pruneCompleted()) {
-      live.resultFingerprints.delete(id); live.hostCompletionFingerprints.delete(id);
+      live.resultFingerprints.delete(id); live.hostCompletionFingerprints.delete(id); live.recordedHostCompletions.delete(id);
       live.claimedHandlers.delete(id); live.retiredCandidates.delete(id);
     }
     if (live.events.length > 1000) live.events.splice(0, live.events.length - 1000);
@@ -1937,6 +1983,16 @@ function resultFingerprint(result: DroidResult): string {
   return createHash("sha256").update(JSON.stringify({ tool_use_id: result.tool_use_id, content: result.content, is_error: Boolean(result.is_error) })).digest("hex");
 }
 
+function hostCompletionFingerprint(completion: RuntimeHostCompletion): string {
+  return createHash("sha256").update(canonicalJson({ ...completion, isError: Boolean(completion.isError), terminal: Boolean(completion.terminal) })).digest("hex");
+}
+
+function hostReceiptContent(content: RuntimeHostCompletion["content"]): RuntimeHostCompletion["content"] {
+  const strip = (text: string) => text.replace(/\[factory-cc-session:[a-f0-9]{64}\]/g, "");
+  if (typeof content === "string") return strip(content);
+  return content.map(block => block.type === "text" && typeof block.text === "string" ? { ...block, text: strip(block.text) } : block);
+}
+
 function mcpContent(content: string | ContentBlock[]): Record<string, unknown>[] {
   if (typeof content === "string") return [{ type: "text", text: content }];
   return content.map((block) => {
@@ -1959,12 +2015,14 @@ function queryPolicy(input: RuntimeRequest, config: BridgeConfig): string {
 }
 function controllerHostToolAllowed(config: BridgeConfig, name: string): boolean {
   if (!config.controllerReadOnly) return true;
+  if (config.controllerHostTools) return name !== "SpawnAgent";
   if (["Read", "LS", "Grep", "Glob", "ToolSearch", "AskUser"].includes(name)) return true;
-  if (config.controllerHostTools && controllerHostAction(name)) return true;
   const prefix = config.workerMcpPrefix;
-  return !!prefix && ["factory_worker_start", "factory_worker_status", "factory_worker_wait", "factory_worker_list", "factory_worker_cancel"].some((tool) => name === prefix + tool);
+  return !!prefix && ["factory_worker_start", "factory_worker_status", "factory_worker_wait", "factory_worker_list", "factory_worker_cancel", "factory_worker_accounts"].some((tool) => name === prefix + tool);
 }
-function controllerHostAction(name: string): boolean { return ["Execute", "Create", "Edit"].includes(name); }
+function controllerHostAction(name: string, config: BridgeConfig): boolean {
+  return hostActionNeedsWorkspaceReservation(name, config.workerMcpPrefix);
+}
 function toolAccessDenial(live: LiveSdk, name: string | undefined, factoryPermissionMode?: string): string | undefined {
   const request = live.current?.request;
   if (!hostAllowsAnyTools(request)) return "BRIDGE_HOST_TOOL_ACCESS_NONE: This host request permits no tools. Answer using the supplied conversation only.";
@@ -1981,6 +2039,7 @@ function toolAccessDenial(live: LiveSdk, name: string | undefined, factoryPermis
   return `BRIDGE_HOST_TOOL_NOT_ADVERTISED: ${name ?? "Unknown tool"} is not authorized by the current host tool set. Use only its advertised native equivalents or Factory MCP tools; do not work around this restriction.`;
 }
 function resolveCwd(input: RuntimeRequest, config: BridgeConfig): string {
+  if (input.factorySession?.desktopLifecycle) return input.factorySession.cwd;
   return resolveRequestCwd(input.headers, input.request, config);
 }
 function extractToolUses(message: Record<string, unknown>): DroidCall[] {
