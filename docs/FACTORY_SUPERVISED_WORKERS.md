@@ -204,6 +204,14 @@ the matching private tokens, hook bindings, model connection and MCP namespace
 without replacing unrelated settings. The legacy `npm run desktop -- install`
 command remains the installer for the separate legacy bridge.
 
+Global lifecycle hooks should use `modelScope` with the exact candidate custom
+model IDs and the absolute Factory sessions directory. The hook checks the
+persisted selected model in the session's bounded settings file before binding
+or emitting context. This permits a candidate connection to coexist with active
+legacy connections. A valid existing candidate binding can still deliver its
+session-end cleanup after a model change. Fresh Workstreams provide the clearest
+cutover boundary.
+
 ## Routine decisions and approval policy
 
 Controllers and workers choose the recommended option for routine, reversible
