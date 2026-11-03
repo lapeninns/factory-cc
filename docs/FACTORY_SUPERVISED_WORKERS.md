@@ -58,6 +58,25 @@ Selecting this path does not establish a throughput improvement over legacy.
    ledger. A worker remains pinned to its selected backend. New work can use
    other healthy seats; a partially executed worker is not migrated.
 
+The Factory stdio adapter supports `--factory-session-scope`. In this mode it
+uses Factory's host-added MCP `assemblySessionId` metadata to derive a stable
+owner with the private pool capability. Reconnecting the adapter or resuming
+the same Workstream retains access to its running and completed workers. A
+different Workstream receives separate ownership, even in the same directory.
+Changing the working directory does not change the Workstream owner. Model
+tool arguments cannot supply this identity, and missing or malformed host
+metadata rejects the operation before dispatch.
+
+The installed Factory Workstream implementation retains its session UUID for
+resume and automatic or current-session compaction. A fork receives its own
+identity. Keep the pool capability during routine updates, because changing
+that key changes the derived worker owner. Generic MCP clients without the
+Factory-specific flag keep their connection-lifetime scope.
+
+Older random-scope records remain intact. Drain their live workers before
+switching an adapter to the new mode. Historical records cannot be reassigned
+by repository path, because several Workstreams can share a repository.
+
 Worker and controller queues are ordered independently, so running workers
 cannot consume the controller's reserved capacity. Workspace conflicts still
 apply across both queues. An uncertain or unowned execution holds its capacity
@@ -142,6 +161,8 @@ the existing loopback service rather than creating another worker owner. A
 pooled MCP service uses `subscription-pool.js` with a separate private config:
 `version: 1`, `enabled`, `stateRoot`, `port`, `clientTokenFile`, and eight `seats`
 entries containing distinct `profile`, `weight` and fixed-worker `configFile`.
+Its Factory stdio entry adds `--factory-session-scope` after the config path.
+The HTTP dispatcher uses `--serve` without that adapter-only flag.
 
 The subscription controller entrypoint is
 `workers-dist/scripts/subscription-desktop.js`. Required options are `--profile`,
