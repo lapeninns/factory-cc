@@ -125,7 +125,9 @@ a canonical, owned, non-bare Git repository with a commit, or its subdirectory.
 The assigned subdirectory bounds worker writes. The subscription-only
 `"repositoryPolicy": "owned-workspace"` additionally supports ordinary folders
 and unborn repositories through a private Git snapshot. Snapshots are bounded
-to 10,000 files and 64 MiB. Recorded exclusions cover generated caches and
+to 10,000 files and 64 MiB. Folder and unborn snapshots use a private backing
+repository and a linked worker worktree so native admission validates the same
+workspace contract. Retain the backing repository with its worker worktree. Recorded exclusions cover generated caches and
 private credential state. Tracked credentials and escaping symlinks cause a
 pre-execution refusal. Repository instructions and skills remain available in
 the snapshot. Native scheduling rejects conflicting parent/child host workspaces

@@ -145,36 +145,64 @@ export async function inspectWorkerWorkspace(path: string, allowFolders: boolean
     snapshot: { files: files.length, bytes, ignoredUntrackedFiles: kind !== "folder", excluded: exclusions } };
 }
 
-/** Materialize a bounded input snapshot, then commit it in the private worker repository. */
+/** Materialize a bounded input snapshot in a linked worker worktree. */
 export async function prepareWorkerWorkspace(source: WorkerWorkspaceSource, worktree: string, branch: string): Promise<{ inputCommit: string; workingDirectory: string }> {
-  if (source.sourceCommit) await git(source.repository, ["worktree", "add", "-b", branch, worktree, source.sourceCommit]);
-  else {
-    mkdirSync(worktree, { mode: 0o700 });
-    await git(worktree, ["init", "-q"]);
-    await git(worktree, ["checkout", "-qb", branch]);
-  }
-  const copied = new Set(source.files.map(file => file.path));
-  for (const path of source.originalFiles) if (!copied.has(path)) rmSync(join(worktree, path), { force: true, recursive: true });
-  for (const file of source.files) {
-    const input = join(source.repository, file.path), destination = join(worktree, file.path);
-    mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
-    if (file.link !== undefined) {
-      if (realpathSync(input) !== resolve(dirname(input), file.link)) throw new Error("A workspace symlink changed during snapshot preparation.");
-      rmSync(destination, { force: true, recursive: true });
-      symlinkSync(file.link, destination);
-    } else {
-      if (!lstatSync(input).isFile() || createHash("sha256").update(readFileSync(input)).digest("hex") !== file.digest) throw new Error("A workspace input changed during snapshot preparation.");
-      if (existsSync(destination) && lstatSync(destination).isSymbolicLink()) rmSync(destination);
-      copyFileSync(input, destination);
-      chmodSync(destination, file.mode);
-      if (createHash("sha256").update(readFileSync(destination)).digest("hex") !== file.digest) throw new Error("A workspace input changed while copying.");
+  const snapshotRepository = source.sourceCommit ? undefined : worktree + ".snapshot-source";
+  if (snapshotRepository) {
+    // These paths are allocated for one worker. Refuse existing paths before
+    // taking ownership so failure cleanup cannot remove another workspace.
+    for (const path of [snapshotRepository, worktree]) {
+      try { lstatSync(path); }
+      catch (error) { if ((error as { code?: string }).code === "ENOENT") continue; throw error; }
+      throw new Error("Worker snapshot paths must be unused.");
     }
+    // Retain this repository beside the successful worktree because its Git
+    // object store and worktree metadata remain part of the worker result.
+    mkdirSync(snapshotRepository, { mode: 0o700 });
   }
-  await git(worktree, ["add", "-A"]);
-  if (!source.sourceCommit || (await git(worktree, ["status", "--porcelain"])).trim()) {
-    await git(worktree, ["-c", "user.name=Factory Worker", "-c", "user.email=worker@localhost", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "Capture worker input snapshot"]);
+  let snapshotWorktreeCreated = false;
+  try {
+    if (snapshotRepository) {
+      mkdirSync(worktree, { mode: 0o700 });
+      snapshotWorktreeCreated = true;
+      await git(snapshotRepository, ["init", "-q"]);
+      await git(snapshotRepository, ["-c", "user.name=Factory Worker", "-c", "user.email=worker@localhost", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "Initialize private worker snapshot"]);
+      await git(snapshotRepository, ["worktree", "add", "-b", branch, worktree, "HEAD"]);
+    } else {
+      await git(source.repository, ["worktree", "add", "-b", branch, worktree, source.sourceCommit!]);
+    }
+    const copied = new Set(source.files.map(file => file.path));
+    for (const path of source.originalFiles) if (!copied.has(path)) rmSync(join(worktree, path), { force: true, recursive: true });
+    for (const file of source.files) {
+      const input = join(source.repository, file.path), destination = join(worktree, file.path);
+      mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
+      if (file.link !== undefined) {
+        if (realpathSync(input) !== resolve(dirname(input), file.link)) throw new Error("A workspace symlink changed during snapshot preparation.");
+        rmSync(destination, { force: true, recursive: true });
+        symlinkSync(file.link, destination);
+      } else {
+        if (!lstatSync(input).isFile() || createHash("sha256").update(readFileSync(input)).digest("hex") !== file.digest) throw new Error("A workspace input changed during snapshot preparation.");
+        if (existsSync(destination) && lstatSync(destination).isSymbolicLink()) rmSync(destination);
+        copyFileSync(input, destination);
+        chmodSync(destination, file.mode);
+        if (createHash("sha256").update(readFileSync(destination)).digest("hex") !== file.digest) throw new Error("A workspace input changed while copying.");
+      }
+    }
+    await git(worktree, ["add", "-A"]);
+    if (!source.sourceCommit || (await git(worktree, ["status", "--porcelain"])).trim()) {
+      await git(worktree, ["-c", "user.name=Factory Worker", "-c", "user.email=worker@localhost", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "Capture worker input snapshot"]);
+    }
+    const workingDirectory = resolve(worktree, relative(source.repository, source.directory));
+    if (!existsSync(workingDirectory)) mkdirSync(workingDirectory, { recursive: true, mode: 0o700 });
+    return { inputCommit: (await git(worktree, ["rev-parse", "HEAD"])).trim(), workingDirectory };
+  } catch (error) {
+    if (snapshotRepository) {
+      if (snapshotWorktreeCreated) {
+        await git(snapshotRepository, ["worktree", "remove", "--force", worktree]).catch(() => {});
+        rmSync(worktree, { recursive: true, force: true });
+      }
+      rmSync(snapshotRepository, { recursive: true, force: true });
+    }
+    throw error;
   }
-  const workingDirectory = resolve(worktree, relative(source.repository, source.directory));
-  if (!existsSync(workingDirectory)) mkdirSync(workingDirectory, { recursive: true, mode: 0o700 });
-  return { inputCommit: (await git(worktree, ["rev-parse", "HEAD"])).trim(), workingDirectory };
 }

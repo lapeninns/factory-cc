@@ -1,8 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+
+vi.mock("node:fs", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, mkdirSync: vi.fn(actual.mkdirSync) };
+});
 
 const auth = vi.hoisted(() => ({ prepareSubscription: vi.fn() }));
 vi.mock("../../src/workers/subscription-auth.js", async importOriginal => ({
@@ -11,6 +16,8 @@ vi.mock("../../src/workers/subscription-auth.js", async importOriginal => ({
 }));
 
 import { APIWorkerService, type APIWorkerServiceOptions, type WorkerRunContext } from "../../src/workers/service.js";
+import { createWorkerServiceOptions } from "../../scripts/factory-workers.js";
+import { inspectWorkerWorkspace, prepareWorkerWorkspace } from "../../src/workers/workspace.js";
 
 const runtimeSupport = () => ({ executable: "/fixture/unmodified-claude", sdkVersion: "0.3.300", cliVersion: "2.1.300", sha256: "fixture" });
 const git = (repository: string, args: string[]) => execFileSync("git", ["-C", repository, ...args], { encoding: "utf8" }).trim();
@@ -122,12 +129,25 @@ describe("private owned-Git repository policy", () => {
     expect(readFileSync(join(child, "input.txt"), "utf8")).toBe("untracked input\n");
   });
 
-  it.each([false, true])("snapshots an owned ordinary or unborn folder without changing its original Git state (%s)", async unborn => {
+  it.each([false, true])("admits an ordinary or unborn snapshot through the actual native lease (%s)", async unborn => {
     const source = join(root, unborn ? "new-repo" : "ordinary-folder"); mkdirSync(source);
     if (unborn) git(source, ["init", "-q"]);
     writeFileSync(join(source, "notes.txt"), "source note\n");
     writeFileSync(join(source, ".env"), "SECRET=fixture\n");
-    const value = service({ repositoryPolicy: "owned-workspace", allowedRepositories: [], run: async context => {
+    const nativeState = join(root, "native-state");
+    const options = createWorkerServiceOptions({
+      enabled: true, provider: "subscription", subscriptionProfile: "team1",
+      stateRoot: join(root, "state-native"), workspaceRoot: join(root, "workers-native"),
+      allowedRepositories: [], repositoryPolicy: "owned-workspace",
+      nativeRuntimePath: resolve("native-runtime"), sharedStateRoot: nativeState,
+      port: 18999, clientTokenFile: join(root, "unused-token"), approvalGuardVerified: true,
+      maxMs: 5000, maxTurns: 2,
+    });
+    const value = service({ ...options, run: async context => {
+      expect(lstatSync(join(context.worker.worktree, ".git")).isFile()).toBe(true);
+      const gitDirectory = realpathSync(git(context.worker.worktree, ["rev-parse", "--absolute-git-dir"]));
+      const commonDirectory = realpathSync(resolve(context.worker.worktree, git(context.worker.worktree, ["rev-parse", "--git-common-dir"])));
+      expect(gitDirectory).not.toBe(commonDirectory);
       expect(readFileSync(join(context.worker.worktree, "notes.txt"), "utf8")).toBe("source note\n");
       expect(readdirSync(context.worker.worktree)).not.toContain(".env");
       expect(git(context.worker.worktree, ["status", "--porcelain"])).toBe("");
@@ -136,11 +156,61 @@ describe("private owned-Git repository policy", () => {
     } });
     const worker = await start(value, source);
     await until(() => value.status(worker.id).state === "completed");
-    expect(value.status(worker.id).sourceKind).toBe(unborn ? "unborn" : "folder");
+    expect(value.status(worker.id)).toMatchObject({
+      sourceKind: unborn ? "unborn" : "folder", cleanupVerified: true, leaseReleased: true,
+    });
+    const jobs = readdirSync(join(nativeState, "jobs")).filter(name => name.endsWith(".json"));
+    expect(jobs).toHaveLength(1);
+    expect(JSON.parse(readFileSync(join(nativeState, "jobs", jobs[0]!), "utf8")))
+      .toMatchObject({ state: "completed", cleanupVerified: null, externalCleanupRequired: false, worktree: worker.worktree });
+    expect(existsSync(worker.worktree + ".snapshot-source")).toBe(true);
     expect(readFileSync(join(source, "notes.txt"), "utf8")).toBe("source note\n");
     expect(readdirSync(source)).not.toContain("result.txt");
     expect(readdirSync(source).includes(".git")).toBe(unborn);
     if (unborn) expect(() => git(source, ["rev-parse", "--verify", "HEAD"])).toThrow();
+  });
+
+  it("removes only owned snapshot state when source verification fails during preparation", async () => {
+    const source = join(root, "changing-folder"); mkdirSync(source);
+    writeFileSync(join(source, "notes.txt"), "before\n");
+    const inspected = await inspectWorkerWorkspace(source, true);
+    writeFileSync(join(source, "notes.txt"), "changed\n");
+    const target = join(root, "failed-worker");
+    await expect(prepareWorkerWorkspace(inspected, target, "worker-fixture"))
+      .rejects.toThrow(/changed during snapshot preparation/);
+    expect(existsSync(target)).toBe(false);
+    expect(existsSync(target + ".snapshot-source")).toBe(false);
+    expect(readFileSync(join(source, "notes.txt"), "utf8")).toBe("changed\n");
+  });
+
+  it("refuses pre-existing snapshot paths without changing their files", async () => {
+    const source = join(root, "existing-folder"); mkdirSync(source);
+    writeFileSync(join(source, "notes.txt"), "source\n");
+    const inspected = await inspectWorkerWorkspace(source, true);
+    const target = join(root, "existing-worker"); mkdirSync(target);
+    writeFileSync(join(target, "keep.txt"), "existing\n");
+    await expect(prepareWorkerWorkspace(inspected, target, "worker-fixture"))
+      .rejects.toThrow(/must be unused/);
+    expect(readFileSync(join(target, "keep.txt"), "utf8")).toBe("existing\n");
+    expect(existsSync(target + ".snapshot-source")).toBe(false);
+  });
+
+  it("preserves a concurrently created workspace when its atomic ownership claim fails", async () => {
+    const source = join(root, "racing-folder"); mkdirSync(source);
+    writeFileSync(join(source, "notes.txt"), "source\n");
+    const inspected = await inspectWorkerWorkspace(source, true);
+    const target = join(root, "racing-worker");
+    const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+    vi.mocked(mkdirSync).mockImplementationOnce(((path, options) => {
+      const result = actual.mkdirSync(path, options);
+      actual.mkdirSync(target);
+      writeFileSync(join(target, "foreign.txt"), "concurrent owner\n");
+      return result;
+    }) as typeof mkdirSync);
+    await expect(prepareWorkerWorkspace(inspected, target, "worker-fixture"))
+      .rejects.toMatchObject({ code: "EEXIST" });
+    expect(readFileSync(join(target, "foreign.txt"), "utf8")).toBe("concurrent owner\n");
+    expect(existsSync(target + ".snapshot-source")).toBe(false);
   });
 
   it("rejects symlink escapes and tracked credentials before authentication", async () => {

@@ -473,6 +473,27 @@ describe("Factory supervised API workers", () => {
     expect(releaseFailed.status(b.id).settledAt).toBeUndefined();
   });
 
+  it.each(["desktop_job_workspace", "desktop_job_binding"])("preserves a confirmed pre-admission %s refusal without finalizing a nonexistent lease", async code => {
+    const finalizeLease = vi.fn(async () => { throw new Error("No lease was created"); });
+    const run = vi.fn(async (context: WorkerRunContext) => { success(context); });
+    const runtime = service({ acquireLease: async () => { throw new BridgeError(422, code, "Fixture admission refusal"); }, finalizeLease, run });
+    const item = await runtime.start({ repository: repo, task: "fixture", workflow: "investigate" });
+    await until(() => runtime.status(item.id).state === "failed");
+    expect(runtime.status(item.id)).toMatchObject({ reason: code, resultState: "failed", cleanupVerified: true,
+      leaseReleased: true, failure: { stage: "admission", code } });
+    expect(finalizeLease).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("retains uncertain admission when the control channel fails without proof of rejection", async () => {
+    const finalizeLease = vi.fn(async () => { throw new Error("Release remains unconfirmed"); });
+    const runtime = service({ acquireLease: async () => { throw new BridgeError(503, "desktop_job_channel", "Fixture transport failure"); }, finalizeLease });
+    const item = await runtime.start({ repository: repo, task: "fixture", workflow: "investigate" });
+    await until(() => runtime.status(item.id).state === "unknown");
+    expect(finalizeLease).toHaveBeenCalledTimes(1);
+    expect(runtime.status(item.id)).toMatchObject({ cleanupVerified: true, leaseReleased: false, reason: "shared_lease_release_unproven" });
+  });
+
   it("persists a bounded error code and phase without the native error message", async () => {
     const runtime = service({ run: async () => { throw Object.assign(new Error("private token text"), { code: "ECONNRESET" }); } });
     const item = await runtime.start({ repository: repo, task: "fixture", workflow: "investigate" });

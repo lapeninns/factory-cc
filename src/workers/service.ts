@@ -446,6 +446,7 @@ export class APIWorkerService {
     const generation = ++live.generation;
     let deadline = false;
     let stage: "admission" | "execution" = "admission";
+    let admissionRejected = false;
     const timer = setTimeout(() => { deadline = true; live.controller.abort(); this.denyApprovals(live); }, this.options.maxMs);
     timer.unref();
     try {
@@ -538,10 +539,14 @@ export class APIWorkerService {
       if (!live.sawResult && !live.cancelRequested && !deadline) record.reason = "native_result_missing";
       this.save(live);
     } catch (error) {
+      // These fixed helper refusals occur while validating the initial request,
+      // before a lease is registered. Transport failures remain uncertain.
+      admissionRejected = stage === "admission" && error instanceof BridgeError
+        && ["desktop_job_workspace", "desktop_job_binding"].includes(error.code);
       record.resultState = live.cancelRequested ? "cancelled" : "failed";
       record.state = "cleaning";
       record.backoff ??= workerBackoff(error);
-      record.reason = live.cancelRequested ? "cancelled" : deadline ? "deadline_exceeded" : record.backoff ? "native_" + record.backoff.kind : "native_execution_failed";
+      record.reason = live.cancelRequested ? "cancelled" : deadline ? "deadline_exceeded" : admissionRejected ? (error as BridgeError).code : record.backoff ? "native_" + record.backoff.kind : "native_execution_failed";
       record.error = "Worker execution did not complete successfully. Review its recorded state and approvals.";
       record.failure = safeFailure(error, stage, record.reason);
       this.save(live);
@@ -570,7 +575,7 @@ export class APIWorkerService {
       const leaseResult: WorkerLeaseResult = { state: record.state === "unknown" ? "unknown" : record.resultState ?? "failed", cleanupVerified: record.cleanupVerified === true, usage: live.providerEvidence ? { ...live.usage.providerTotals(), estimated: false } : undefined, sdkSessionId: record.sdkSessionId };
       try {
         if (lease) await lease.release(leaseResult);
-        else await this.options.finalizeLease?.(record, leaseResult);
+        else if (!admissionRejected) await this.options.finalizeLease?.(record, leaseResult);
         record.leaseReleased = true;
         if (record.cleanupVerified === true) {
           record.state = record.resultState ?? "failed";
