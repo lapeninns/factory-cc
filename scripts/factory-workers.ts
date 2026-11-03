@@ -76,7 +76,7 @@ export function createWorkerServiceOptions(config: WorkerServerConfig): APIWorke
   const workflows = Object.fromEntries(["implement", "investigate", "release-prepare"].map(name => [name, readFileSync(join(runtime, "workflows", name + ".md"), "utf8")]));
   const leases = { pythonExecutable: "/usr/bin/python3", runtimePackagePath: runtime, stateRoot: config.sharedStateRoot, maxRunning: 2 };
   return { stateRoot: config.stateRoot, workspaceRoot: config.workspaceRoot,
-    allowedRepositories: config.allowedRepositories, repositoryPolicy: config.repositoryPolicy, approvalPolicy: config.approvalPolicy,
+    allowedRepositories: config.allowedRepositories, repositoryPolicy: config.repositoryPolicy, approvalPolicy: config.approvalPolicy ?? (config.provider === "subscription" ? "bypass" : "ask"),
     provider: config.provider === "subscription" ? { kind: "subscription", profile: config.subscriptionProfile!, mappingPath: config.profileMappingPath } : { kind: config.provider }, maxConcurrent: config.provider === "subscription" ? 1 : 2,
     maxBudgetUsd: config.maxBudgetUsd, maxMs: config.maxMs, maxTurns: config.maxTurns, maxPendingWorkers: config.maxPendingWorkers, sourceEnv,
     policyText: policy, workflowText: workflows,
@@ -119,7 +119,7 @@ export async function runFactoryWorkers(argv = process.argv.slice(2), options: {
     try { key = privateFile(config.apiKeyFile!, 16384).trim() || undefined; } catch { if (config.enabled) throw new Error("Configured API credential is unavailable or unsafe."); }
   }
   if (check) {
-    console.log(JSON.stringify({ configured: true, enabled: config.enabled, provider: config.provider, subscriptionProfile: config.subscriptionProfile, subscriptionLoginVerified, apiCredentialUsed: Boolean(key), approvalGuardVerified: config.approvalGuardVerified, approvalPolicy: config.approvalPolicy ?? "ask", repositoryPolicy: config.repositoryPolicy ?? "allowlist", repositoryCount: config.allowedRepositories.length, modelRequestsMade: false }));
+    console.log(JSON.stringify({ configured: true, enabled: config.enabled, provider: config.provider, subscriptionProfile: config.subscriptionProfile, subscriptionLoginVerified, apiCredentialUsed: Boolean(key), approvalGuardVerified: config.approvalGuardVerified, approvalPolicy: config.approvalPolicy ?? (config.provider === "subscription" ? "bypass" : "ask"), repositoryPolicy: config.repositoryPolicy ?? "allowlist", repositoryCount: config.allowedRepositories.length, modelRequestsMade: false }));
     return;
   }
   const clientToken = privateFile(config.clientTokenFile, 1024).trim();

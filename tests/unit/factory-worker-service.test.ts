@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { APIWorkerService, type APIWorkerServiceOptions, type WorkerRunContext } from "../../src/workers/service.js";
+import { WORKSTREAM_DECISION_POLICY } from "../../src/runtime/decision-policy.js";
 import { BridgeError } from "../../src/types.js";
 import { WorkerStartRejected } from "../../src/workers/start-rejection.js";
 import { startWorkerControl } from "../../src/workers/control.js";
@@ -98,6 +99,31 @@ describe("Factory supervised API workers", () => {
     expect(options.env!.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
     expect(options.env!.CLAUDE_CONFIG_DIR).toContain(item.id);
     expect(options.systemPrompt).toMatchObject({ type: "preset", preset: "claude_code", append: expect.stringContaining("Investigation guide.") });
+    expect(options.systemPrompt).toMatchObject({ append: expect.stringContaining(WORKSTREAM_DECISION_POLICY) });
+    expect(options.systemPrompt).toMatchObject({ append: expect.stringContaining("Shared policy marker.") });
+    expect(options.systemPrompt).toMatchObject({ append: expect.stringContaining("return a final blocked handoff containing the exact question, available options and relevant context to the controller.") });
+    expect(options.systemPrompt).toMatchObject({ append: expect.stringContaining("Do not invoke AskUserQuestion or another questionnaire tool to collect user choices from this worker, and never invent a user answer.") });
+  });
+  it("includes routine decision autonomy with the default worker policy while preserving permission gates", async () => {
+    let captured: WorkerRunContext | undefined;
+    let decision: unknown;
+    const input = { command: "deploy --recommended", description: "Deploy production (Recommended)" };
+    const runtime = service({ run: async (context) => {
+      captured = context;
+      decision = await context.options.canUseTool!("Bash", input, { signal: context.options.abortController!.signal, toolUseID: "recommended-action", requestId: "recommended-request" });
+      success(context);
+    } });
+    const item = await runtime.start({ repository: repo, task: "Prepare a reviewable change.", workflow: "implement" });
+    await until(() => runtime.status(item.id).state === "waiting_approval");
+    expect(captured!.options.systemPrompt).toMatchObject({ type: "preset", preset: "claude_code", append: expect.stringContaining(WORKSTREAM_DECISION_POLICY) });
+    expect(captured!.options.systemPrompt).toMatchObject({ append: expect.stringContaining("This worker's approval transport carries allow/deny decisions and cannot deliver selected AskUserQuestion answers.") });
+    expect(captured!.options.permissionMode).toBe("default");
+    expect(decision).toBeUndefined();
+    const pending = runtime.status(item.id).approvals[0]!;
+    expect(pending).toMatchObject({ toolName: "Bash", input });
+    runtime.approve({ id: item.id, approvalId: pending.id, decision: "deny" });
+    await until(() => runtime.status(item.id).state === "completed");
+    expect(decision).toMatchObject({ behavior: "deny" });
   });
   it("requires explicit matching approval and never persists the tool input", async () => {
     let decision: unknown;

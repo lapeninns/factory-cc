@@ -1,3 +1,4 @@
+import { WORKSTREAM_DECISION_POLICY } from "./decision-policy.js";
 import { WorkflowPermits, workflowAllowed, workflowProviderAllowed, validateWorkflowInput } from './native-workflows.js';
 import { assertNativeWorkflowSupport } from './native-workflow-support.js';
 import { desktopActionQuestion, desktopJobPolicy, desktopWorkflowApproved, desktopWorkflowQuestion, type DesktopWorkflowQuestion } from "./desktop-workflow-approval.js";
@@ -1050,7 +1051,9 @@ export class SdkRuntime implements BridgeRuntime {
               + "The worker pool routes across its eight configured accounts. Use factory_worker_accounts to inspect actual availability and assignment counts. Keep one stable operationId for each worker assignment and reuse it after transport uncertainty. "
               + "Use bounded factory_worker_wait calls and check messages and status between waits. Do not use long shell sleeps to wait for workers. Report queue, approval, failure, cleanup and completion separately. "
               + "For an ordinary folder or a workspace the worker cannot isolate, use authorized Factory host tools. Keep all actions within the user's task and current Factory permission mode."
-            : this.config.controllerReadOnly ? "\nThis Factory controller is read-only. Inspect with the allowed read tools, discover only allowed tools with ToolSearch, and ask the user with AskUser. Delegate all implementation to the configured supervised worker tools. Never use Execute, Create, Edit, Task, SpawnAgent, unrelated MCP tools or native side effects." : "") },
+            : this.config.controllerReadOnly ? "\nThis Factory controller is read-only. Inspect with the allowed read tools, discover only allowed tools with ToolSearch, and use AskUser for essential missing information or new permissions. Delegate all implementation to the configured supervised worker tools. Never use Execute, Create, Edit, Task, SpawnAgent, unrelated MCP tools or native side effects." : "")
+          + (this.config.desktopProfile || this.config.desktopJobs ? "\n\n" + WORKSTREAM_DECISION_POLICY
+            + "\nWhen a worker returns a blocked handoff, its completed attempt does not complete the user task. Collect essential answers or new permissions with AskUser and provide the actual answer in a new worker assignment." : "") },
       canUseTool: async (name: string, toolInput: Record<string, unknown>, context?: NativePermissionContext) => live.queryEpoch === epoch
         ? this.canUseTool(live, name, toolInput, context)
         : { behavior: "deny", message: "This native query has been retired." },

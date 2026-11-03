@@ -77,6 +77,7 @@ it("denies a rejection and does not confuse a different question with approval",
   await runtime.handle(answer(base, call, "Deny this workflow"));
   expect(fake.decision).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
   const q = desktopWorkflowQuestion(base.request, process.cwd(), { script: "x" })!;
+  expect(desktopWorkflowApproved(q, { content: `1. [question] ${q.question}\n[answer] Allow this workflow once (Recommended)` })).toBe(false);
   expect(desktopWorkflowApproved(q, { content: "1. [question] different\n[answer] Allow this workflow once" })).toBe(false);
   expect(desktopWorkflowApproved(q, { content: `1. [question] ${q.question}\n[answer] Allow this workflow once`, is_error: true })).toBe(false);
 });

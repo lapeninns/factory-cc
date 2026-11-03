@@ -5,6 +5,7 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { query, type CanUseTool, type Options } from "@anthropic-ai/claude-agent-sdk";
 import { assertNativeWorkflowSupport, type NativeWorkflowSupport } from "../runtime/native-workflow-support.js";
+import { WORKSTREAM_DECISION_POLICY } from "../runtime/decision-policy.js";
 import { OwnedProcesses } from "../runtime/owned-processes.js";
 import { UsageLedger } from "../runtime/usage.js";
 import { validateWorkflowInput } from "../runtime/native-workflows.js";
@@ -24,7 +25,7 @@ import { inspectWorkerWorkspace, prepareWorkerWorkspace, type WorkerWorkspaceSou
 const exec = promisify(execFile);
 const TERMINAL = new Set(["completed", "failed", "cancelled", "unknown"]);
 const EXECUTING = new Set(["starting", "running", "waiting_approval"]);
-const DEFAULT_POLICY = "You are a supervised worker delegated by a Factory Workstream. Read this repository's AGENTS.md and CLAUDE.md instructions. Work only in your assigned worktree. Preserve source checkout changes. Follow the user's QA/e2e and Local CI rules. Produce evidence and a reviewable result. Never infer permission to publish, deploy, merge, change production, buy credits or borrow another account. Permissions require the controller's explicit decision. Report checks actually executed and unresolved limitations. The small workflow guideline is advice, not a hard agent or spend cap.";
+const DEFAULT_POLICY = "You are a supervised worker delegated by a Factory Workstream. Read this repository's AGENTS.md and CLAUDE.md instructions. Work only in your assigned worktree. Preserve source checkout changes. Follow the user's QA/e2e and Local CI rules. Produce evidence and a reviewable result. Never infer permission to publish, deploy, merge, change production, buy credits or borrow another account. Use the authority explicitly delegated by the controller and request its decision when new permissions are needed. Report checks actually executed and unresolved limitations. The small workflow guideline is advice, not a hard agent or spend cap.";
 const BLOCKED_TOOLS = ["EnterWorktree", "ExitWorktree", "RemoteTrigger", "CronCreate", "CronDelete", "CronList", "ScheduleTask"];
 
 export interface WorkerApproval {
@@ -586,7 +587,9 @@ export class APIWorkerService {
   }
   private policy(record: WorkerRecord): string {
     return (this.options.policyText ?? DEFAULT_POLICY) + "\n\nSelected workflow: " + record.workflow + ".\n" + (this.options.workflowText?.[record.workflow] ?? "")
-      + (this.approvalPolicy === "bypass" ? "\nThe local operator explicitly enabled automatic worker tool approval for this subscription connection. This removes extra tool approval prompts; it does not expand the task's authority or override repository, production, sandbox, or workspace rules." : "")
+      + "\n\n" + WORKSTREAM_DECISION_POLICY
+      + "\nWorker escalation: If essential missing information, new permissions, or an explicitly requested user decision blocks progress, complete only independent authorised work, then return a final blocked handoff containing the exact question, available options and relevant context to the controller. Stop dependent work. The controller must collect a real answer and provide it in a new assignment; this worker cannot receive follow-up answers while running. This worker's approval transport carries allow/deny decisions and cannot deliver selected AskUserQuestion answers. Do not invoke AskUserQuestion or another questionnaire tool to collect user choices from this worker, and never invent a user answer."
+      + (this.approvalPolicy === "bypass" ? "\nThis subscription connection uses automatic worker tool approval. This removes extra tool approval prompts; it does not expand the task's authority or override repository, production, sandbox, or workspace rules." : "")
       + "\nAssigned worktree: " + record.worktree + ". Write within the assigned working directory: " + (record.workingDirectory ?? record.worktree)
       + ". Source checkout is read-only context: " + record.repository + "."
       + " Read applicable AGENTS.md and CLAUDE.md instructions from that source when absent from the snapshot. Keep private credentials and excluded application state out of task output."

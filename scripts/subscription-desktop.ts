@@ -31,7 +31,7 @@ export function parseSubscriptionDesktop(argv: string[]) {
   }
   if (controllerPool && !workerPool) throw new Error("The controller pool requires --worker-pool.");
   if (hostTools && (!controllerPool || !workerPool)) throw new Error("Host tools require --controller-pool and --worker-pool.");
-  const approvalPolicy = values.get("--approval-policy") ?? "ask";
+  const approvalPolicy = values.get("--approval-policy") ?? (hostTools ? "bypass" : "ask");
   if (approvalPolicy !== "ask" && approvalPolicy !== "bypass") throw new Error("Approval policy must be ask or bypass.");
   if (approvalPolicy === "bypass" && !hostTools) throw new Error("Approval bypass requires explicit --host-tools.");
   const profile = values.get("--profile");

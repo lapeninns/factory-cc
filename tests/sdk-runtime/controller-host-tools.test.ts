@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { WORKSTREAM_DECISION_POLICY } from "../../src/runtime/decision-policy.js";
 import { loadConfig } from "../../src/config.js";
 import { SUBSCRIPTION_PROFILES } from "../../src/runtime/desktop-jobs.js";
 import { StableDroidToolNames } from "../../src/runtime/droid-mcp-catalog.js";
@@ -12,6 +13,7 @@ import { sanitizedSubscriptionEnvironment } from "../../src/workers/subscription
 const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
 const ask = { name: "AskUser", input_schema: { type: "object", properties: { questionnaire: { type: "string" } }, required: ["questionnaire"], additionalProperties: false } };
 const actions = {
+  AskUser: { questionnaire: "1. [question] Which production account should receive the release?\n[topic] Essential account selection\n[option] Account A (Recommended)\n[option] Account B" },
   Execute: { command: "df -h ." },
   Create: { file_path: "/fixture/report.txt", content: "report" },
   Edit: { file_path: "/fixture/report.txt", old_str: "old", new_str: "new" },
@@ -112,6 +114,18 @@ describe("exactly approved Factory host operations", () => {
     expect(action).toMatchObject({ name: original, input: actions[original] });
     expect((await runtime.handle(toolResult(base, action.id, "host result"))).response.stop_reason).toBe("end_turn");
     expect(fake.observedResult).toMatchObject({ isError: false });
+  });
+
+  it("includes the shared policy and leaves essential recommended questions waiting for a real answer", async () => {
+    const { runtime, fake, base, control } = setup({ original: "AskUser", approvalPolicy: "bypass", askTool: false });
+    const question = callFrom(await runtime.handle(base));
+    expect(fake.calls[0]!.options.systemPrompt.append).toContain(WORKSTREAM_DECISION_POLICY);
+    expect(question).toMatchObject({ name: "AskUser", input: actions.AskUser });
+    expect(fake.observedResult).toBeUndefined();
+    expect(runtime.pendingHostCalls(base.session.bridgeSessionId)).toHaveLength(1);
+    expect(control.requestApproval).not.toHaveBeenCalled();
+    await runtime.handle(toolResult(base, question.id, "Account B"));
+    expect(fake.observedResult).toMatchObject({ content: [{ type: "text", text: "Account B" }] });
   });
 
   it("keeps detached spawning on the managed worker path", async () => {

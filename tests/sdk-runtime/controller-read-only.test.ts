@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { WORKSTREAM_DECISION_POLICY } from "../../src/runtime/decision-policy.js";
 import { loadConfig } from "../../src/config.js";
 import { SdkRuntime, type SdkHandle, type SdkUserInput } from "../../src/runtime/sdk-runtime.js";
 import { StableDroidToolNames } from "../../src/runtime/droid-mcp-catalog.js";
@@ -64,6 +65,7 @@ it("advertises only allowed host controls and exact configured worker tools", as
   // File reads retain the existing native read-tool path instead of duplicate MCP registrations.
   expect([...fake.handlers.keys()].sort()).toEqual(mapped(["ToolSearch", "AskUser", ...workerNames]).sort());
   expect(fake.calls[0].options.systemPrompt).toMatchObject({ append: expect.stringContaining("This Factory controller is read-only") });
+  expect((fake.calls[0].options.systemPrompt as { append: string }).append).toContain(WORKSTREAM_DECISION_POLICY);
   expect(fake.calls[0].options.disallowedTools).toEqual(expect.arrayContaining(["Bash", "Write", "Task", "Agent", "Workflow"]));
   for (const original of deniedNames) expect(fake.handlers.has(new StableDroidToolNames().toMcp(original))).toBe(false);
 });

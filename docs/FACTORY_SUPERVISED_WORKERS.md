@@ -113,8 +113,8 @@ The fixed-seat controller defaults to `controller-readonly`, which requires a
 Git checkout and blocks host mutations. The pool can explicitly enable
 `--host-tools` with `--controller-pool --worker-pool`. That policy accepts an
 existing canonical directory owned by the operator, including a non-Git folder.
-By default, Factory Execute, Create and Edit actions require an exact native
-AskUser decision before dispatch. The host-tools policy also supports advertised
+Factory Execute, Create and Edit actions follow the configured approval
+policy. With `ask`, dispatch requires an exact native AskUser decision. The host-tools policy also supports advertised
 synchronous Task and MCP operations, with conservative workspace reservations.
 Detached work uses the managed worker pool so its lifetime has an owner.
 Factory spec mode and native-tool permission boundaries continue to apply.
@@ -204,29 +204,35 @@ the matching private tokens, hook bindings, model connection and MCP namespace
 without replacing unrelated settings. The legacy `npm run desktop -- install`
 command remains the installer for the separate legacy bridge.
 
-## Optional bridge approval bypass
+## Routine decisions and approval policy
 
-The pooled subscription controller accepts `--approval-policy bypass` alongside
-`--host-tools --controller-pool --worker-pool`. This suppresses the extra
-bridge-generated AskUser questions for its allowed Execute, Create and Edit
-actions. Each subscription worker can separately set `"approvalPolicy":
-"bypass"` in its private service configuration to permit otherwise allowed
-native actions and validated workflows without a pending approval question.
-The default is `ask` for both, and API workers cannot select bypass.
+Controllers and workers choose the recommended option for routine, reversible
+decisions within the user's existing scope and authority. They record a concise
+assumption and continue. Without a recommendation, they choose a safe reversible
+default. They ask for essential information that cannot be retrieved or reasonably
+inferred, or for new permissions. Explicit instructions to ask or wait still apply.
+Workers return a blocked handoff with essential questions and their context. The
+controller collects the actual user response through Factory AskUser and supplies
+it in a new assignment. The worker service has no in-place question-answer channel.
 
-Bypass is broad within these execution boundaries: it also covers permitted
-writes and commands, not just read-only inspection. It does not change Factory's
-own autonomy setting, native SDK permission mode, sandbox, worker worktree
-boundaries, blocked tools, account identity checks, shared admission or cleanup
-requirements. Those independent restrictions still apply. The operator must
-explicitly choose this policy and restart idle services with matching private
-configuration; controller state markers reject policy drift. Keep the prior
-configuration and release for rollback.
+Pooled subscription controllers with `--host-tools --controller-pool --worker-pool`
+default to `--approval-policy bypass`. Subscription worker service configurations
+default to `"approvalPolicy": "bypass"`. These defaults suppress extra bridge
+confirmation for allowed host actions and native worker actions within the current
+execution boundaries. Set either policy explicitly to `ask` to retain those
+confirmations. Controllers without host tools and API workers use `ask`.
 
-The controller's `--check` output reports `approvalPolicy`; its authenticated
-runtime view reports `controllerApprovalPolicy`. Worker `--check` reports its
-effective `approvalPolicy`. Restoring `ask` requires the same deliberate
-configuration and restart process.
+The model policy determines when an essential question is necessary. A question
+that reaches Factory AskUser remains pending until its actual response arrives.
+A recommendation label never supplies consent or authorizes a new action.
+Factory permissions, spec and planning modes, workspace limits, blocked tools,
+account identity checks, shared admission and cleanup requirements still apply.
+
+Existing controller state markers reject policy drift, including the new default
+when an older marker records `ask`. Retain `--approval-policy ask` for that state,
+or perform a deliberate idle-service configuration migration. Controller and
+worker `--check` output reports the effective approval policy. Active services
+require a controlled restart to load these changes.
 
 ## Validation boundaries
 
