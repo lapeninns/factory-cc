@@ -948,9 +948,6 @@ export class SdkRuntime implements BridgeRuntime {
           if (live.retiredCandidates.has(call.id)) throw new BridgeError(409, "sdk_tool_rejected", "The native SDK already completed this tool invocation");
           if (!controllerHostToolAllowed(this.config, original)) throw new BridgeError(403, "controller_tool_denied", "The read-only Factory controller cannot invoke this tool.");
           if (!live.catalog?.has(original)) throw new BridgeError(409, "tool_not_advertised", `Droid no longer advertises ${original}`);
-          if (this.config.controllerHostTools && original === "Task" && (args.run_in_background === true || args.background === true)) {
-            throw new BridgeError(403, "untracked_background_task", "Use the managed worker pool for detached tasks so workspace ownership and completion remain tracked.");
-          }
           if (this.config.controllerHostTools && controllerHostAction(original, this.config)) {
             // Preserve the exact reviewed action even if a caller retains and
             // mutates its input object while the human question is pending.
@@ -1047,7 +1044,7 @@ export class SdkRuntime implements BridgeRuntime {
               + (this.config.controllerApprovalPolicy === "bypass"
                 ? "The operator disabled this bridge's extra confirmation for Factory Execute, Create and Edit. Use those advertised host tools within the user's task scope; Factory's own permissions still apply. "
                 : "General filesystem operations may use Factory Execute, Create or Edit only through the exact-action human approval; never bypass it with native tools. ")
-              + "Use the advertised Factory tools and delegate useful independent work to the configured worker pool. Use synchronous Factory Task calls when appropriate. Give each writer separate ownership and use one integration owner. "
+              + "Use the advertised Factory tools and delegate useful independent work through factory_worker_start in the configured worker pool. Factory Task and SpawnAgent are unavailable in this controller. Give each writer separate ownership and use one integration owner. "
               + "The worker pool routes across its eight configured accounts. Use factory_worker_accounts to inspect actual availability and assignment counts. Keep one stable operationId for each worker assignment and reuse it after transport uncertainty. "
               + "Use bounded factory_worker_wait calls and check messages and status between waits. Do not use long shell sleeps to wait for workers. Report queue, approval, failure, cleanup and completion separately. "
               + "For an ordinary folder or a workspace the worker cannot isolate, use authorized Factory host tools. Keep all actions within the user's task and current Factory permission mode."
@@ -2018,7 +2015,7 @@ function queryPolicy(input: RuntimeRequest, config: BridgeConfig): string {
 }
 function controllerHostToolAllowed(config: BridgeConfig, name: string): boolean {
   if (!config.controllerReadOnly) return true;
-  if (config.controllerHostTools) return name !== "SpawnAgent";
+  if (config.controllerHostTools) return name !== "Task" && name !== "SpawnAgent";
   if (["Read", "LS", "Grep", "Glob", "ToolSearch", "AskUser"].includes(name)) return true;
   const prefix = config.workerMcpPrefix;
   return !!prefix && ["factory_worker_start", "factory_worker_status", "factory_worker_wait", "factory_worker_list", "factory_worker_cancel", "factory_worker_accounts"].some((tool) => name === prefix + tool);

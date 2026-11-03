@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
+import { generateKeyPairSync } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { rootCertificates } from "node:tls";
 
 vi.mock("node:fs", async importOriginal => {
   const actual = await importOriginal<typeof import("node:fs")>();
@@ -21,6 +23,9 @@ import { inspectWorkerWorkspace, prepareWorkerWorkspace } from "../../src/worker
 
 const runtimeSupport = () => ({ executable: "/fixture/unmodified-claude", sdkVersion: "0.3.300", cliVersion: "2.1.300", sha256: "fixture" });
 const git = (repository: string, args: string[]) => execFileSync("git", ["-C", repository, ...args], { encoding: "utf8" }).trim();
+const publicFixture = generateKeyPairSync("ed25519");
+const publicPem = publicFixture.publicKey.export({ format: "pem", type: "spki" }).toString();
+const privatePem = publicFixture.privateKey.export({ format: "pem", type: "pkcs8" }).toString();
 function complete(context: WorkerRunContext) {
   context.message({ type: "result", subtype: "success", is_error: false, session_id: "fixture-session", result: "Completed isolated repository check." });
 }
@@ -221,6 +226,62 @@ describe("private owned-Git repository policy", () => {
     writeFileSync(join(requested, ".env"), "SECRET=fixture\n");
     git(requested, ["add", ".env"]);
     await expect(start(value, requested)).rejects.toThrow(/tracked credential/);
+    expect(auth.prepareSubscription).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["verification-public.pem", publicPem],
+    ["verification-public.key", publicPem],
+    ["rsa-public.pem", generateKeyPairSync("rsa", { modulusLength: 1024 }).publicKey.export({ format: "pem", type: "pkcs1" }).toString()],
+    ["certificate.pem", rootCertificates[0]!],
+  ])("copies a tracked validated public PEM into the worker snapshot: %s", async (name, content) => {
+    writeFileSync(join(requested, name), content);
+    git(requested, ["add", name]);
+    const value = service({ repositoryPolicy: "owned-workspace", run: async context => {
+      expect(readFileSync(join(context.worker.worktree, name), "utf8")).toBe(content);
+      complete(context);
+    } });
+    const worker = await start(value, requested);
+    await until(() => value.status(worker.id).state === "completed");
+    expect(readFileSync(join(requested, name), "utf8")).toBe(content);
+  });
+
+  it.each([
+    ["private key", privatePem],
+    ["public key followed by private key", publicPem + privatePem],
+    ["multiple public blocks", publicPem + publicPem],
+    ["credential suffix", publicPem + "API_KEY=private-fixture-value\n"],
+    ["credential prefix", "API_KEY=private-fixture-value\n" + publicPem],
+    ["malformed public key", "-----BEGIN PUBLIC KEY-----\nZmFrZQ==\n-----END PUBLIC KEY-----\n"],
+    ["extra data inside DER", "-----BEGIN PUBLIC KEY-----\n" + Buffer.concat([
+      publicFixture.publicKey.export({ format: "der", type: "spki" }), Buffer.from("private-fixture-value"),
+    ]).toString("base64") + "\n-----END PUBLIC KEY-----\n"],
+  ])("rejects a tracked PEM containing %s before authentication", async (_name, content) => {
+    writeFileSync(join(requested, "verification-public.pem"), content);
+    git(requested, ["add", "verification-public.pem"]);
+    const value = service({ repositoryPolicy: "owned-workspace" });
+    await expect(start(value, requested)).rejects.toThrow(/tracked credential/);
+    expect(auth.prepareSubscription).not.toHaveBeenCalled();
+    expect(readdirSync(join(root, "workers-0"))).toEqual([]);
+  });
+
+  it("keeps public PEM exceptions out of credential directories and untracked inputs", async () => {
+    mkdirSync(join(requested, ".ssh"));
+    writeFileSync(join(requested, ".ssh", "verification-public.pem"), publicPem);
+    git(requested, ["add", ".ssh/verification-public.pem"]);
+    await expect(inspectWorkerWorkspace(requested, true)).rejects.toThrow(/tracked credential/);
+    git(requested, ["reset", "--", ".ssh/verification-public.pem"]);
+    writeFileSync(join(requested, "untracked-public.pem"), publicPem);
+    const source = await inspectWorkerWorkspace(requested, true);
+    expect(source.snapshot.excluded).toContainEqual({ path: "untracked-public.pem", reason: "Credential or private environment file" });
+  });
+
+  it("rejects tracked public PEM symlinks before authentication", async () => {
+    writeFileSync(join(requested, "public.txt"), publicPem);
+    symlinkSync("public.txt", join(requested, "verification-public.pem"));
+    git(requested, ["add", "verification-public.pem"]);
+    const value = service({ repositoryPolicy: "owned-workspace" });
+    await expect(start(value, requested)).rejects.toThrow(/public PEM input must be a regular file/);
     expect(auth.prepareSubscription).not.toHaveBeenCalled();
   });
 

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, createPublicKey, X509Certificate } from "node:crypto";
 import { execFile } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, type Stats } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -33,16 +33,29 @@ function pathName(value: string): string {
   return value;
 }
 
-function excluded(path: string, tracked: boolean): string | undefined {
+function excluded(path: string, tracked: boolean, publicPemCandidate = false): string | undefined {
   const names = path.split(/[\\/]/);
   if (names.includes(".git")) return "Git metadata";
   if (names.some(name => PRIVATE_STATE.has(name))) return "Private application or credential state";
   if (names.some((name, index) => [".factory", ".claude", ".codex"].includes(name) && APPLICATION_STATE.has(names[index + 1] ?? ""))) return "Private application runtime state";
   if (names.some(name => /^\.env(?:\.|$)/i.test(name) && !/^\.env\.(example|sample|template)$/i.test(name)
       || /^(?:credentials(?:\.json)?|\.credentials(?:\.json)?|id_rsa|id_ed25519|\.npmrc|\.netrc)$/i.test(name)
-      || /\.(?:pem|key|p12|pfx)$/i.test(name))) return "Credential or private environment file";
+      || /\.(?:p12|pfx)$/i.test(name)
+      || (!publicPemCandidate && /\.(?:pem|key)$/i.test(name)))) return "Credential or private environment file";
   if (!tracked && names.some(name => CACHES.has(name))) return "Generated dependency or cache directory";
   return undefined;
+}
+
+function containsOnlyPublicPem(bytes: Buffer): boolean {
+  const match = /^\s*-----BEGIN (PUBLIC KEY|RSA PUBLIC KEY|CERTIFICATE)-----\r?\n([A-Za-z0-9+/=\r\n]+)\r?\n-----END \1-----\s*$/.exec(bytes.toString("utf8"));
+  if (!match) return false;
+  const encoded = match[2]!.replace(/[\r\n]/g, ""), der = Buffer.from(encoded, "base64");
+  if (der.toString("base64") !== encoded) return false;
+  try {
+    const parsed = match[1] === "CERTIFICATE" ? new X509Certificate(bytes).raw
+      : createPublicKey(bytes).export({ format: "der", type: match[1] === "RSA PUBLIC KEY" ? "pkcs1" : "spki" });
+    return parsed.equals(der);
+  } catch { return false; }
 }
 
 function containsCredentialConfig(path: string, bytes: Buffer): boolean {
@@ -111,7 +124,8 @@ export async function inspectWorkerWorkspace(path: string, allowFolders: boolean
   let bytes = 0;
   for (const path of candidates.sort()) {
     if (files.length >= MAX_FILES || exclusions.length >= MAX_FILES) throw new Error("Workspace exceeds the 10000-file snapshot limit.");
-    const reason = excluded(path, tracked.has(path));
+    const publicPemCandidate = tracked.has(path) && /\.(?:pem|key)$/i.test(path);
+    const reason = excluded(path, tracked.has(path), publicPemCandidate);
     if (reason) {
       if (tracked.has(path)) throw new Error("A tracked credential file cannot enter a worker snapshot. Remove it from the task input before continuing.");
       exclusions.push({ path, reason }); continue;
@@ -123,6 +137,7 @@ export async function inspectWorkerWorkspace(path: string, allowFolders: boolean
     if (!inside(repository, realpathSync(source))) throw new Error("A workspace input resolves outside the assigned source.");
     if (stat.uid !== process.getuid?.()) throw new Error("Every workspace input must be owned by this user.");
     if (stat.isSymbolicLink()) {
+      if (publicPemCandidate) throw new Error("A tracked public PEM input must be a regular file.");
       const target = realpathSync(source);
       if (!inside(repository, target)) throw new Error("A workspace symlink points outside the assigned source.");
       if (excluded(relative(repository, target), false)) throw new Error("A workspace symlink resolves into an excluded input.");
@@ -130,6 +145,7 @@ export async function inspectWorkerWorkspace(path: string, allowFolders: boolean
     } else if (stat.isFile()) {
       if (bytes + stat.size > MAX_BYTES) throw new Error("Workspace exceeds the 64 MiB snapshot limit.");
       const content = readFileSync(source);
+      if (publicPemCandidate && !containsOnlyPublicPem(content)) throw new Error("A tracked credential file cannot enter a worker snapshot. Only a single validated public key or certificate is allowed.");
       if (containsCredentialConfig(path, content)) {
         if (tracked.has(path)) throw new Error("A tracked credential configuration cannot enter a worker snapshot.");
         exclusions.push({ path, reason: "Credential-bearing application configuration" }); continue;

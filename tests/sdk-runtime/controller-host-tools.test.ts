@@ -20,6 +20,7 @@ const actions = {
   Task: { subagent_type: "general", prompt: "Inspect the owned fixture" },
   SpawnAgent: { task: "Inspect the owned fixture" },
   "factory-workers-pool___factory_worker_accounts": {},
+  "factory-workers-pool___factory_worker_start": { repository: "/fixture/repository", task: "Inspect the owned fixture", workflow: "investigate", operationId: "fixture-inspection" },
 };
 const roots: string[] = [], runtimes: SdkRuntime[] = [];
 
@@ -108,7 +109,7 @@ afterEach(async () => {
 });
 
 describe("exactly approved Factory host operations", () => {
-  it.each(["Task", "factory-workers-pool___factory_worker_accounts"] as const)("forwards advertised %s with host tools enabled", async original => {
+  it.each(["factory-workers-pool___factory_worker_accounts", "factory-workers-pool___factory_worker_start"] as const)("forwards advertised %s with host tools enabled", async original => {
     const { runtime, fake, base } = setup({ original, approvalPolicy: "bypass" });
     const action = callFrom(await runtime.handle(base));
     expect(action).toMatchObject({ name: original, input: actions[original] });
@@ -128,10 +129,41 @@ describe("exactly approved Factory host operations", () => {
     expect(fake.observedResult).toMatchObject({ content: [{ type: "text", text: "Account B" }] });
   });
 
-  it("keeps detached spawning on the managed worker path", async () => {
-    const { runtime, fake, base } = setup({ original: "SpawnAgent", invoke: false, approvalPolicy: "bypass" });
+  it.each(["Task", "SpawnAgent"] as const)("keeps %s delegation on the managed worker path", async original => {
+    const { runtime, fake, base } = setup({ original, invoke: false, approvalPolicy: "bypass" });
     await runtime.handle(base);
-    expect(fake.handlers.has(new StableDroidToolNames().toMcp("SpawnAgent"))).toBe(false);
+    const name = `mcp__droid__${new StableDroidToolNames().toMcp(original)}`;
+    expect(fake.handlers.has(name.slice("mcp__droid__".length))).toBe(false);
+    const options = fake.calls[0]!.options;
+    expect(await options.hooks.PreToolUse[0].hooks[0]({ tool_name: name, tool_input: actions[original] }))
+      .toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+    expect(await options.canUseTool(name, actions[original])).toMatchObject({ behavior: "deny" });
+    expect(options.systemPrompt.append).toContain("delegate useful independent work through factory_worker_start");
+    expect(options.systemPrompt.append).not.toContain("Use synchronous Factory Task");
+  });
+
+  it("keeps newly discovered Factory Task and SpawnAgent tools outside the active catalog", async () => {
+    const { runtime, fake, base } = setup({ invoke: false, approvalPolicy: "bypass" });
+    await runtime.handle(base);
+    const discovered = {
+      ...base,
+      request: {
+        ...base.request,
+        messages: [{ role: "user" as const, content: "Continue with the newly discovered tools" }],
+        tools: [...base.request.tools!, ...(["Task", "SpawnAgent"] as const).map(name => ({
+          name, input_schema: { type: "object" as const },
+        }))],
+      },
+    };
+    await runtime.handle(discovered);
+    const options = fake.calls[0]!.options;
+    for (const original of ["Task", "SpawnAgent"] as const) {
+      const name = `mcp__droid__${new StableDroidToolNames().toMcp(original)}`;
+      expect(fake.handlers.has(name.slice("mcp__droid__".length))).toBe(false);
+      expect(await options.hooks.PreToolUse[0].hooks[0]({ tool_name: name, tool_input: actions[original] }))
+        .toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+      expect(await options.canUseTool(name, actions[original])).toMatchObject({ behavior: "deny" });
+    }
   });
 
   it("records authenticated completion without resuming the SDK before admission", async () => {

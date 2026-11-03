@@ -114,9 +114,10 @@ Git checkout and blocks host mutations. The pool can explicitly enable
 `--host-tools` with `--controller-pool --worker-pool`. That policy accepts an
 existing canonical directory owned by the operator, including a non-Git folder.
 Factory Execute, Create and Edit actions follow the configured approval
-policy. With `ask`, dispatch requires an exact native AskUser decision. The host-tools policy also supports advertised
-synchronous Task and MCP operations, with conservative workspace reservations.
-Detached work uses the managed worker pool so its lifetime has an owner.
+policy. With `ask`, dispatch requires an exact native AskUser decision. The host-tools policy supports advertised
+MCP operations, with conservative workspace reservations. Delegation uses the
+managed worker pool; Factory `Task` and `SpawnAgent` are excluded so child work
+retains the pool's account routing, workspace ownership and completion tracking.
 Factory spec mode and native-tool permission boundaries continue to apply.
 
 Workers default to an explicit repository allowlist. Subscription workers can
@@ -128,7 +129,9 @@ and unborn repositories through a private Git snapshot. Snapshots are bounded
 to 10,000 files and 64 MiB. Folder and unborn snapshots use a private backing
 repository and a linked worker worktree so native admission validates the same
 workspace contract. Retain the backing repository with its worker worktree. Recorded exclusions cover generated caches and
-private credential state. Tracked credentials and escaping symlinks cause a
+private credential state. Tracked PEM files containing exactly one validated
+public key or certificate are admitted. Private keys, mixed PEM content and
+escaping symlinks cause a
 pre-execution refusal. Repository instructions and skills remain available in
 the snapshot. Native scheduling rejects conflicting parent/child host workspaces
 and worker worktrees while retaining conservative cleanup accounting.
