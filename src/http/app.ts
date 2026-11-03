@@ -10,6 +10,7 @@ import { apiError } from "../protocol/messages.js";
 import { explicitSessionId, historyMessageHashes, historyPrefixHash, resolveSession, roleFromHeaders, sessionContextHash } from "../sessions/correlate.js";
 import { droidReasoningLevel } from "../runtime/reasoning.js";
 import { isEnded, type SessionRecord } from "../sessions/state.js";
+import { droidEndedTools } from "../sessions/droid-turn-outcomes.js";
 import { HUMAN_WAIT_TOOLS, MISSION_SPAWN_TOOLS, MISSION_WORKER_END_TOOL } from "../runtime/mission-tools.js";
 import { compactedSummaryText, lastSummarizedToolCall, sameToolInput, summaryQuote } from "../sessions/compaction.js";
 import { hostAllowsAnyTools } from "../runtime/native-tool-policy.js";
@@ -142,6 +143,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
   const maintenance = setInterval(() => {
     if (maintenanceRunning || closing) return;
     maintenanceRunning = (async () => {
+      if (config.droidSessionsDir) await releaseEndedDroidTurns(config.droidSessionsDir);
       const protectedIds = new Set(store.list().filter((session) => activeRequests.has(session.bridgeSessionId)
         || control.hasLiveHost(session.bridgeSessionId) || control.hasApprovals(session.bridgeSessionId)
         || runtime.pendingHostCalls?.(session.bridgeSessionId).length).map((session) => session.bridgeSessionId));
@@ -159,6 +161,36 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     })().catch(() => logger.error("session_maintenance_failed")).finally(() => { maintenanceRunning = undefined; });
   }, 60_000);
   maintenance.unref();
+
+  function isUnownedParked(session: SessionRecord): boolean {
+    const id = session.bridgeSessionId;
+    return session.state === "WAITING_DROID_TOOL" && session.pendingToolIds.length > 0
+      && !activeRequests.has(id) && !control.hasLiveHost(id) && !control.hasApprovals(id);
+  }
+
+  async function releaseEndedDroidTurns(directory: string): Promise<void> {
+    const parked = store.list().filter(isUnownedParked).map((session) => ({
+      id: session.bridgeSessionId, updatedAt: session.updatedAt, pending: [...session.pendingToolIds],
+    }));
+    if (!parked.length) return;
+    const since = Math.min(...parked.map((session) => Date.parse(session.updatedAt))) - 5_000;
+    const ended = await droidEndedTools(directory, new Set(parked.flatMap((session) => session.pending)), since);
+    const cancellations: Promise<void>[] = [];
+    for (const { id, updatedAt, pending } of parked) {
+      const outcome = ended.get(pending[0]!);
+      if (!outcome || !pending.every((tool) => ended.get(tool) === outcome)) continue;
+      const current = store.get(id);
+      if (closing || !current || !isUnownedParked(current) || current.updatedAt !== updatedAt
+          || current.pendingToolIds.join("\n") !== pending.join("\n")) continue;
+      clearWorkerEnd(id);
+      store.interrupt(id, "droid-turn-ended");
+      cancellations.push(runtime.cancel(id, "droid-turn-ended").then(
+        () => logger.info("droid_turn_released", { sessionId: id }),
+        () => logger.error("runtime_cancel_failed", { sessionId: id, reason: "droid-turn-ended" }),
+      ));
+    }
+    await Promise.all(cancellations);
+  }
 
   /**
    * Run a step that takes a session slot. At the limit, free one slot first by

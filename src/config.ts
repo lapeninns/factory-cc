@@ -2,6 +2,7 @@ import { assertClaudeCredential, readClaudeConfig, claudeConfigModels, loadClaud
 import { randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync } from "node:fs";
 import { isIPv6 } from "node:net";
+import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import type { BridgeMode } from "./types.js";
 import { parseAuthMode, preflightAuth, type AuthMode } from "./upstream/auth-env.js";
@@ -52,6 +53,7 @@ export interface BridgeConfig {
   workflowProvider?: "anthropic" | "openrouter";
   workflowMaxBudgetUsd?: number;
   workflowMaxMs?: number;
+  droidSessionsDir?: string;
   host: string;
   port: number;
   mode: BridgeMode;
@@ -371,6 +373,8 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
     nativeWorkflows,
     ...(nativeWorkflows ? { workflowProvider: workflowProvider as "anthropic" | "openrouter" } : {}),
     ...(nativeWorkflows ? { workflowMaxBudgetUsd, workflowMaxMs } : {}),
+    droidSessionsDir: overrides.droidSessionsDir ?? (desktopProfile && mode === "sdk" && authMode === "claude-config"
+      ? resolve(env("FACTORY_HOME_OVERRIDE") ?? homedir(), ".factory", "sessions") : undefined),
     host,
     port: overrides.port ?? intEnv("BRIDGE_PORT", 18787),
     mode,
