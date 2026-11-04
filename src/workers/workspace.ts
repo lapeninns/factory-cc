@@ -1,12 +1,13 @@
 import { createHash, createPublicKey, X509Certificate } from "node:crypto";
 import { execFile } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, type Stats } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
 const MAX_FILES = 10_000;
 const MAX_BYTES = 64 * 1024 * 1024;
+const MAX_GIT_BYTES = 128 * 1024 * 1024;
 const CACHES = new Set(["node_modules", ".next", ".venv", "__pycache__", ".cache", ".turbo"]);
 const PRIVATE_STATE = new Set([".ssh", ".aws", ".gnupg", ".kube"]);
 const APPLICATION_STATE = new Set(["sessions", "logs", "backups", "workers", "subscription-runtime", "team-runtime", "auth", "projects", "debug", "session-env"]);
@@ -62,8 +63,35 @@ function containsCredentialConfig(path: string, bytes: Buffer): boolean {
   if (!/(?:^|[\\/])\.(?:factory|claude|codex)(?:[\\/]|\.json$)/.test(path)) return false;
   if (!/\.(?:json|jsonc|toml|ya?ml)$/i.test(path)) return false;
   const text = bytes.toString("utf8");
-  return /(?:["']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|password|client[_-]?secret|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)["']?\s*[:=]\s*["']?[^\s"'\]}]+)/i.test(text)
+  const credentialFields = credentialScanText(path, text);
+  return /(?:["']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|password|client[_-]?secret|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)["']?\s*[:=]\s*["']?[^\s"'\]}]+)/i.test(credentialFields)
     || /(?:sk-ant-(?:api|oat)[A-Za-z0-9_-]{20,}|sk-or-v1-[A-Za-z0-9]{20,})/.test(text);
+}
+
+function credentialScanText(path: string, text: string): string {
+  if (!/(?:^|[\\/])\.claude[\\/]launch\.json$/.test(path)) return text;
+  try {
+    const launch = JSON.parse(text);
+    if (!Array.isArray(launch?.configurations)) return text;
+    let credentialFields = text;
+    for (const configuration of launch.configurations) {
+      if (typeof configuration?.runtimeExecutable !== "string"
+          || !["sh", "bash", "zsh"].includes(basename(configuration.runtimeExecutable))
+          || !Array.isArray(configuration.runtimeArgs) || configuration.runtimeArgs[0] !== "-c"
+          || typeof configuration.runtimeArgs[1] !== "string") continue;
+      const command = configuration.runtimeArgs[1];
+      // Recognize only leading, unquoted assignment words. Quoting, expansion
+      // and shell operators end this prefix and retain the original scan.
+      const prefix = /^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:@%+,\-]*[ \t]+)+/.exec(command)?.[0];
+      if (!prefix) continue;
+      // KEY= NEXT=value clears KEY. Keep NEXT available for credential checks.
+      const scannedCommand = prefix.replace(/\b[A-Za-z_][A-Za-z0-9_]*=(?=[ \t]+[A-Za-z_][A-Za-z0-9_]*=)/g, "=")
+        + command.slice(prefix.length);
+      // Retain the original JSON, including duplicate fields, for the scan.
+      credentialFields = credentialFields.replaceAll(JSON.stringify(command), JSON.stringify(scannedCommand));
+    }
+    return credentialFields;
+  } catch { return text; }
 }
 
 async function git(repository: string, args: string[]): Promise<string> {
@@ -121,7 +149,10 @@ export async function inspectWorkerWorkspace(path: string, allowFolders: boolean
     walk("");
   }
   const files: SnapshotFile[] = [];
+  const maxBytes = kind === "git" ? MAX_GIT_BYTES : MAX_BYTES;
+  const snapshotLimitError = `Workspace exceeds the ${maxBytes / (1024 * 1024)} MiB snapshot limit.`;
   let bytes = 0;
+  let untrackedBytes = 0;
   for (const path of candidates.sort()) {
     if (files.length >= MAX_FILES || exclusions.length >= MAX_FILES) throw new Error("Workspace exceeds the 10000-file snapshot limit.");
     const publicPemCandidate = tracked.has(path) && /\.(?:pem|key)$/i.test(path);
@@ -143,15 +174,19 @@ export async function inspectWorkerWorkspace(path: string, allowFolders: boolean
       if (excluded(relative(repository, target), false)) throw new Error("A workspace symlink resolves into an excluded input.");
       files.push({ path, mode: stat.mode & 0o777, link: relative(dirname(source), target) });
     } else if (stat.isFile()) {
-      if (bytes + stat.size > MAX_BYTES) throw new Error("Workspace exceeds the 64 MiB snapshot limit.");
+      if (bytes + stat.size > maxBytes) throw new Error(snapshotLimitError);
+      const untrackedGitInput = kind === "git" && !tracked.has(path);
+      if (untrackedGitInput && untrackedBytes + stat.size > MAX_BYTES) throw new Error("Workspace exceeds the 64 MiB untracked input limit.");
       const content = readFileSync(source);
       if (publicPemCandidate && !containsOnlyPublicPem(content)) throw new Error("A tracked credential file cannot enter a worker snapshot. Only a single validated public key or certificate is allowed.");
       if (containsCredentialConfig(path, content)) {
         if (tracked.has(path)) throw new Error("A tracked credential configuration cannot enter a worker snapshot.");
         exclusions.push({ path, reason: "Credential-bearing application configuration" }); continue;
       }
-      bytes += stat.size;
-      if (bytes > MAX_BYTES || files.length >= MAX_FILES) throw new Error("Workspace exceeds the 64 MiB or 10000-file snapshot limit.");
+      bytes += content.length;
+      if (untrackedGitInput) untrackedBytes += content.length;
+      if (bytes > maxBytes) throw new Error(snapshotLimitError);
+      if (untrackedBytes > MAX_BYTES) throw new Error("Workspace exceeds the 64 MiB untracked input limit.");
       files.push({ path, mode: stat.mode & 0o777, digest: createHash("sha256").update(content).digest("hex") });
     } else if (stat.isDirectory() && tracked.has(path)) throw new Error("Submodule directories need their own explicit worker workspace.");
     else if (!stat.isDirectory()) throw new Error("Unsupported workspace input file type.");

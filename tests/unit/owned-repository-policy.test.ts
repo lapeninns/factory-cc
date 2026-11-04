@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { rootCertificates } from "node:tls";
@@ -229,6 +229,39 @@ describe("private owned-Git repository policy", () => {
     expect(auth.prepareSubscription).not.toHaveBeenCalled();
   });
 
+  it("admits committed Git input above 64 MiB while retaining the 128 MiB total limit", async () => {
+    const large = join(requested, "committed-evidence.bin");
+    writeFileSync(large, "");
+    truncateSync(large, 64 * 1024 * 1024 + 1);
+    git(requested, ["add", "committed-evidence.bin"]);
+    git(requested, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "committed evidence"]);
+    const source = await inspectWorkerWorkspace(requested, true);
+    expect(source.kind).toBe("git");
+    expect(source.files).toContainEqual(expect.objectContaining({ path: "committed-evidence.bin" }));
+    expect(source.snapshot.bytes).toBe(64 * 1024 * 1024 + 1 + Buffer.byteLength("committed\n"));
+    truncateSync(large, 128 * 1024 * 1024 + 1);
+    await expect(inspectWorkerWorkspace(requested, true)).rejects.toThrow("128 MiB snapshot limit");
+  }, 15_000);
+
+  it("keeps combined untracked input in committed Git bounded at 64 MiB", async () => {
+    for (const name of ["untracked-first.bin", "untracked-second.bin"]) {
+      const large = join(requested, name);
+      writeFileSync(large, "");
+      truncateSync(large, 32 * 1024 * 1024 + 1);
+    }
+    await expect(inspectWorkerWorkspace(requested, true)).rejects.toThrow("64 MiB untracked input limit");
+  });
+
+  it.each([false, true])("keeps ordinary and unborn workspaces bounded at 64 MiB (unborn=%s)", async unborn => {
+    const folder = join(root, "large-folder");
+    mkdirSync(folder);
+    if (unborn) git(folder, ["init", "-q"]);
+    const large = join(folder, "evidence.bin");
+    writeFileSync(large, "");
+    truncateSync(large, 64 * 1024 * 1024 + 1);
+    await expect(inspectWorkerWorkspace(folder, true)).rejects.toThrow("64 MiB snapshot limit");
+  });
+
   it.each([
     ["verification-public.pem", publicPem],
     ["verification-public.key", publicPem],
@@ -325,6 +358,61 @@ describe("private owned-Git repository policy", () => {
     await expect(start(value, requested)).rejects.toThrow(/tracked credential/);
     expect(auth.prepareSubscription).not.toHaveBeenCalled();
     expect(readdirSync(join(root, "workers-0"))).toEqual([]);
+  });
+
+  it.each([
+    "OPENAI_API_KEY= WEBHOOKS_ENABLED=false pnpm exec next dev --port 3200",
+    "OPENAI_API_KEY= ANTHROPIC_API_KEY= WEBHOOKS_ENABLED=false pnpm dev",
+  ])("copies launch commands that clear credentials before another environment assignment: %s", async command => {
+    mkdirSync(join(requested, ".claude"));
+    const content = JSON.stringify({ configurations: [{ runtimeExecutable: "sh", runtimeArgs: ["-c", command] }] });
+    writeFileSync(join(requested, ".claude", "launch.json"), content);
+    git(requested, ["add", ".claude/launch.json"]);
+    const value = service({ repositoryPolicy: "owned-workspace", run: async context => {
+      expect(readFileSync(join(context.worker.worktree, ".claude", "launch.json"), "utf8")).toBe(content);
+      complete(context);
+    } });
+    const worker = await start(value, requested);
+    await until(() => value.status(worker.id).state === "completed");
+    expect(value.status(worker.id).cleanupVerified).toBe(true);
+  });
+
+  it.each([
+    ["launch.json", JSON.stringify({ command: "OPENAI_API_KEY=private-fixture-value WEBHOOKS_ENABLED=false pnpm dev" })],
+    ["launch.json", JSON.stringify({ command: "OPENAI_API_KEY='private fixture value' pnpm dev" })],
+    ["launch.json", JSON.stringify({ command: 'OPENAI_API_KEY="private fixture value" pnpm dev' })],
+    ["launch.json", JSON.stringify({ command: "OPENAI_API_KEY= ANTHROPIC_API_KEY=private-fixture-value pnpm dev" })],
+    ["launch.json", '{"configurations":[{"runtimeExecutable":"sh","runtimeArgs":["-c","OPENAI_API_KEY= WEBHOOKS_ENABLED=false pnpm dev"]}],"api_key":"private-fixture-value","api_key":""}'],
+    ["settings.json", '{ "api_key" : "private-fixture-value" }'],
+    ["settings.json", '{ "api_key" : "OPENAI_API_KEY= WEBHOOKS_ENABLED=false" }'],
+    ["settings.toml", 'api_key = "private-fixture-value"'],
+    ["settings.toml", "api_key = 'private-fixture-value'"],
+    ["settings.toml", "api_key = 123456"],
+    ["settings.toml", "api_key= foo=bar"],
+  ])("rejects actual credential values after empty-assignment handling in %s", async (name, content) => {
+    mkdirSync(join(requested, ".claude"));
+    writeFileSync(join(requested, ".claude", name), content);
+    git(requested, ["add", ".claude/" + name]);
+    const value = service({ repositoryPolicy: "owned-workspace" });
+    await expect(start(value, requested)).rejects.toThrow(/tracked credential/);
+    expect(auth.prepareSubscription).not.toHaveBeenCalled();
+    expect(value.list()).toEqual([]);
+    expect(readdirSync(join(root, "workers-0"))).toEqual([]);
+  });
+
+  it.each([
+    "  OPENAI_API_KEY=' PASSWORD= WEBHOOKS_ENABLED=false' pnpm dev",
+    '  OPENAI_API_KEY=" PASSWORD= WEBHOOKS_ENABLED=false" pnpm dev',
+    "OPENAI_API_KEY= ANTHROPIC_API_KEY=private-fixture-value pnpm dev",
+  ])("keeps nonempty credentials in recognized shell launch commands rejected: %s", async command => {
+    mkdirSync(join(requested, ".claude"));
+    writeFileSync(join(requested, ".claude", "launch.json"), JSON.stringify({
+      configurations: [{ runtimeExecutable: "/bin/sh", runtimeArgs: ["-c", command] }],
+    }));
+    git(requested, ["add", ".claude/launch.json"]);
+    const value = service({ repositoryPolicy: "owned-workspace" });
+    await expect(start(value, requested)).rejects.toThrow(/tracked credential/);
+    expect(auth.prepareSubscription).not.toHaveBeenCalled();
   });
 
   it("rejects symlinked repository paths and redirected Git metadata", async () => {
