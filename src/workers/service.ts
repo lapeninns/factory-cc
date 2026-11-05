@@ -5,6 +5,7 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { query, type CanUseTool, type Options } from "@anthropic-ai/claude-agent-sdk";
 import { assertNativeWorkflowSupport, type NativeWorkflowSupport } from "../runtime/native-workflow-support.js";
+import { WORKSTREAM_DECISION_POLICY } from "../runtime/decision-policy.js";
 import { OwnedProcesses } from "../runtime/owned-processes.js";
 import { UsageLedger } from "../runtime/usage.js";
 import { validateWorkflowInput } from "../runtime/native-workflows.js";
@@ -12,16 +13,19 @@ import { buildChildEnv, MODEL_SLOT_NAMES } from "../upstream/auth-env.js";
 import type { UpstreamSelection } from "../upstream/providers.js";
 import { redactJson, redactValue } from "../security/redact.js";
 import type { Logger } from "../logging.js";
-import type { Usage } from "../types.js";
-import { privateDirectory, readWorkers, workerId, writeWorker, type WorkerRecord, type WorkerWorkflow } from "./worker-state.js";
+import { BridgeError, type Usage } from "../types.js";
+import { WorkerStartRejected, type WorkerStartRejectionCode } from "./start-rejection.js";
+import { privateDirectory, readWorkers, readWorkerTask, removeWorkerTask, validOperationId, workerId, writeWorker, writeWorkerTask, type WorkerOperation, type WorkerRecord, type WorkerStartInput, type WorkerWorkflow } from "./worker-state.js";
 import { prepareSubscription, verifyNativeSubscription, type SubscriptionIdentity } from "./subscription-auth.js";
 import type { SubscriptionProfile } from "../runtime/desktop-jobs.js";
 import { upstreamError } from "../runtime/upstream-error.js";
 import { approvalSummary, MAX_WORKER_APPROVAL_SUMMARY_CHARS } from "./approval.js";
+import { inspectWorkerWorkspace, prepareWorkerWorkspace, type WorkerWorkspaceSource } from "./workspace.js";
 
 const exec = promisify(execFile);
 const TERMINAL = new Set(["completed", "failed", "cancelled", "unknown"]);
-const DEFAULT_POLICY = "You are a supervised worker delegated by a Factory Workstream. Read this repository's AGENTS.md and CLAUDE.md instructions. Work only in your assigned worktree. Preserve source checkout changes. Follow the user's QA/e2e and Local CI rules. Produce evidence and a reviewable result. Never infer permission to publish, deploy, merge, change production, buy credits or borrow another account. Permissions require the controller's explicit decision. Report checks actually executed and unresolved limitations. The small workflow guideline is advice, not a hard agent or spend cap.";
+const EXECUTING = new Set(["starting", "running", "waiting_approval"]);
+const DEFAULT_POLICY = "You are a supervised worker delegated by a Factory Workstream. Read this repository's AGENTS.md and CLAUDE.md instructions. Work only in your assigned worktree. Preserve source checkout changes. Follow the user's QA/e2e and Local CI rules. Produce evidence and a reviewable result. Never infer permission to publish, deploy, merge, change production, buy credits or borrow another account. Use the authority explicitly delegated by the controller and request its decision when new permissions are needed. Report checks actually executed and unresolved limitations. The small workflow guideline is advice, not a hard agent or spend cap.";
 const BLOCKED_TOOLS = ["EnterWorktree", "ExitWorktree", "RemoteTrigger", "CronCreate", "CronDelete", "CronList", "ScheduleTask"];
 
 export interface WorkerApproval {
@@ -47,15 +51,27 @@ export interface WorkerRunContext {
   options: Options;
   message(value: Record<string, unknown>): void;
 }
-export type WorkerRepositoryPolicy = "allowlist" | "owned-git";
+export interface WorkerExecutionHost {
+  start(worker: Readonly<WorkerRecord>, task: string): Promise<WorkerView>;
+  status(worker: Readonly<WorkerRecord>): WorkerView;
+  cancel(worker: Readonly<WorkerRecord>): Promise<WorkerView>;
+  approve(worker: Readonly<WorkerRecord>, input: { id: string; approvalId: string; decision: "allow" | "deny" }): Promise<WorkerView>;
+  detach(): Promise<void>;
+}
+export type WorkerRepositoryPolicy = "allowlist" | "owned-git" | "owned-workspace";
+export type WorkerApprovalPolicy = "ask" | "bypass";
 export interface APIWorkerServiceOptions {
   stateRoot: string;
   workspaceRoot: string;
   allowedRepositories: string[];
   /** Private operator policy. Request inputs cannot expand repository access. */
   repositoryPolicy?: WorkerRepositoryPolicy;
+  /** Explicit local operator policy; subscription workers only. */
+  approvalPolicy?: WorkerApprovalPolicy;
   provider: { kind: "anthropic" | "openrouter" } | { kind: "subscription"; profile: SubscriptionProfile; mappingPath?: string; executable?: string };
   maxConcurrent?: number;
+  /** Includes queued, running and uncertain workers, before allocating another snapshot. */
+  maxPendingWorkers?: number;
   maxBudgetUsd?: number;
   maxMs: number;
   maxTurns?: number;
@@ -69,6 +85,10 @@ export interface APIWorkerServiceOptions {
   acquireLease?: (worker: Readonly<WorkerRecord>, signal: AbortSignal) => Promise<WorkerLease>;
   /** Finish a parked shared record after native cleanup, without reacquiring inference capacity. */
   finalizeLease?: (worker: Readonly<WorkerRecord>, result: WorkerLeaseResult) => Promise<void>;
+  /** Independent job executors retain native continuations when the API service restarts. */
+  executionHost?: WorkerExecutionHost;
+  /** An executor adopts exactly one already prepared worker without replaying start. */
+  managedWorkerId?: string;
 }
 interface PendingApproval { view: WorkerApproval; settle(decision: "allow" | "deny"): void }
 interface SubscriptionApprovalBatch {
@@ -95,6 +115,7 @@ interface LiveWorker {
   children: Map<string, { id: string; state: "running" | "completed" | "failed" | "cancelled" }>;
   lease?: WorkerLease;
   approvalBatch?: SubscriptionApprovalBatch;
+  launchPending?: boolean;
 }
 const silentLogger = { info() {}, warn() {}, error() {} } as unknown as Logger;
 
@@ -104,21 +125,35 @@ export class APIWorkerService {
   private readonly workspaces: string;
   private readonly repositories: Set<string>;
   private readonly repositoryPolicy: WorkerRepositoryPolicy;
+  private readonly approvalPolicy: WorkerApprovalPolicy;
   private readonly workers = new Map<string, LiveWorker>();
   private readonly active = new Set<string>();
   private readonly creating = new Set<Promise<unknown>>();
+  private readonly operations = new Map<string, { digest: string; promise: Promise<WorkerView> }>();
   private readonly processes = new OwnedProcesses(silentLogger);
   private readonly capacity: number;
+  private readonly pendingLimit: number;
+  private readonly admissions = new Set<object>();
+  private readonly executorPoll?: NodeJS.Timeout;
   private closed = false;
 
   constructor(private readonly options: APIWorkerServiceOptions) {
+    if (options.managedWorkerId) workerId(options.managedWorkerId);
+    if (options.managedWorkerId && options.executionHost) throw new Error("An executor cannot delegate its own execution.");
+    this.approvalPolicy = options.approvalPolicy ?? "ask";
+    if (!["ask", "bypass"].includes(this.approvalPolicy)
+        || (this.approvalPolicy === "bypass" && options.provider.kind !== "subscription")) {
+      throw new Error("Automatic worker approvals require an explicit subscription policy.");
+    }
     this.repositoryPolicy = options.repositoryPolicy === undefined ? "allowlist" : options.repositoryPolicy;
-    if (!["allowlist", "owned-git"].includes(this.repositoryPolicy)
-        || (this.repositoryPolicy === "owned-git" && options.provider.kind !== "subscription")) {
-      throw new Error("Owned Git repository access requires an explicit subscription worker policy.");
+    if (!["allowlist", "owned-git", "owned-workspace"].includes(this.repositoryPolicy)
+        || (this.repositoryPolicy !== "allowlist" && options.provider.kind !== "subscription")) {
+      throw new Error("Owned workspace access requires an explicit subscription worker policy.");
     }
     this.capacity = options.maxConcurrent ?? 2;
     if (!Number.isSafeInteger(this.capacity) || this.capacity < 1 || this.capacity > 2) throw new Error("Worker concurrency must be one or two.");
+    this.pendingLimit = options.maxPendingWorkers ?? 16;
+    if (!Number.isSafeInteger(this.pendingLimit) || this.pendingLimit < 1 || this.pendingLimit > 64) throw new Error("Pending worker admission must be from one to 64.");
     if (options.provider.kind !== "subscription" && (!Number.isFinite(options.maxBudgetUsd) || options.maxBudgetUsd! <= 0)) throw new Error("An explicit positive estimated budget is required.");
     if (options.provider.kind === "subscription" && options.maxBudgetUsd !== undefined) throw new Error("Subscription workers do not use an API spend budget.");
     if (!Number.isSafeInteger(options.maxMs) || options.maxMs < 1000 || options.maxMs > 2 * 60 * 60_000) throw new Error("Worker deadline must be from one second to two hours.");
@@ -131,8 +166,9 @@ export class APIWorkerService {
     // An owned-Git policy does not depend on previously registered paths still
     // existing. Each requested repository is verified before it is used.
     this.repositories = new Set(this.repositoryPolicy === "allowlist" ? options.allowedRepositories.map(path => canonicalRepository(path)) : []);
-    for (const record of readWorkers(this.root)) {
-      if (!TERMINAL.has(record.state)) {
+    for (const record of readWorkers(this.root).sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))) {
+      if (options.managedWorkerId && record.id !== options.managedWorkerId) continue;
+      if (!options.executionHost && !options.managedWorkerId && !TERMINAL.has(record.state)) {
         record.state = "unknown";
         record.reason = "service_restarted_without_process_ownership";
         record.cleanupVerified = null;
@@ -140,69 +176,176 @@ export class APIWorkerService {
         record.updatedAt = now();
         writeWorker(this.root, record);
       }
-      const live = this.live(record);
+      let task = options.executionHost ? readWorkerTask(this.root, record.id) : undefined;
+      if (options.executionHost && !options.managedWorkerId && record.state === "starting" && !record.executorLaunchRequested) {
+        // The previous frontend stopped during workspace preparation, before
+        // any executor launch. Record it like a failed preparation instead of
+        // leaving a starting record that the scheduler will never launch.
+        record.state = "unknown";
+        record.reason = "workspace_preparation_unconfirmed";
+        record.failure = { stage: "workspace", code: record.reason, message: "Workspace preparation did not confirm completion. Inspect the recorded workspace before replacing this operation." };
+        record.cleanupVerified = null;
+        record.pendingApprovalCount = 0;
+        record.updatedAt = now();
+        writeWorker(this.root, record);
+        task = undefined;
+      }
+      const live = this.live(record, task);
       this.workers.set(record.id, live);
-      if (record.state === "unknown") this.active.add(record.id);
+      if (record.state === "unknown" || options.executionHost && !TERMINAL.has(record.state) && (record.executorLaunchRequested || task === undefined)) this.active.add(record.id);
+    }
+    if (options.executionHost) {
+      this.executorPoll = setInterval(() => this.refreshExecutors(), 500);
+      this.executorPoll.unref();
+      queueMicrotask(() => this.refreshExecutors());
     }
   }
 
-  start(input: { repository: string; task: string; workflow: WorkerWorkflow }): Promise<WorkerView> {
-    if (this.closed) return Promise.reject(new Error("Worker service is closed."));
-    const creating = this.startImpl(input);
+  async executePrepared(id: string, task: string): Promise<void> {
+    if (this.options.managedWorkerId !== id) throw new Error("This executor does not own the prepared worker.");
+    const live = this.find(id);
+    if (live.done || live.record.state !== "queued" || !task.trim() || task.length > 100_000) throw new Error("The prepared worker is not eligible for execution.");
+    live.task = task;
+    this.active.add(id);
+    live.done = this.execute(live).finally(() => { if (live.record.cleanupVerified && live.record.leaseReleased) this.active.delete(id); });
+    await live.done;
+  }
+
+  start(input: WorkerStartInput): Promise<WorkerView> {
+    if (this.closed) return Promise.reject(new WorkerStartRejected("service_unavailable", "Worker service is closed."));
+    let operation: WorkerOperation | undefined;
+    try { operation = workerOperation(input); }
+    catch (error) { return Promise.reject(error); }
+    const key = operation ? operation.owner + ":" + operation.id : undefined;
+    if (operation) {
+      const existing = this.lookup(operation.id, operation.owner);
+      if (!("found" in existing)) {
+        if (existing.operation?.requestDigest !== operation.requestDigest) return Promise.reject(new WorkerStartRejected("invalid_request", "The worker operation already has different input."));
+        return Promise.resolve(existing);
+      }
+      const creating = this.operations.get(key!);
+      if (creating) return creating.digest === operation.requestDigest ? creating.promise
+        : Promise.reject(new WorkerStartRejected("invalid_request", "The worker operation already has different input."));
+    }
+    const unfinished = [...this.workers.keys()].filter(id => !["completed", "failed", "cancelled"].includes(this.status(id).state)).length;
+    if (unfinished + this.admissions.size >= this.pendingLimit) return Promise.reject(new WorkerStartRejected("capacity_unavailable"));
+    const reservation = {};
+    this.admissions.add(reservation);
+    const creating = this.startImpl(input, operation, () => this.admissions.delete(reservation));
+    if (key) this.operations.set(key, { digest: operation!.requestDigest, promise: creating });
     this.creating.add(creating);
-    void creating.finally(() => this.creating.delete(creating)).catch(() => undefined);
+    void creating.finally(() => { this.creating.delete(creating); this.admissions.delete(reservation); if (key) this.operations.delete(key); }).catch(() => undefined);
     return creating;
   }
 
-  private async startImpl(input: { repository: string; task: string; workflow: WorkerWorkflow }): Promise<WorkerView> {
-    if (typeof input.task !== "string" || !input.task.trim() || input.task.length > 100_000) throw new Error("A bounded nonempty worker task is required.");
-    if (!["implement", "investigate", "release-prepare"].includes(input.workflow)) throw new Error("Unknown worker workflow.");
-    const repository = canonicalRepository(input.repository, this.repositoryPolicy === "owned-git");
-    if (this.repositoryPolicy === "allowlist" && !this.repositories.has(repository)) throw new Error("Repository is not in the worker allowlist.");
-    if (this.repositoryPolicy === "allowlist") await this.prepareRuntime();
-    if (this.repositoryPolicy === "owned-git") {
-      const marker = lstatSync(join(repository, ".git"));
-      if ((!marker.isDirectory() && !marker.isFile()) || marker.isSymbolicLink() || marker.uid !== process.getuid?.()) {
-        throw new Error("Owned Git repository metadata is required.");
+  lookup(operationId: string, operationOwner: string): WorkerView | { found: false } {
+    if (!validOperationId(operationId) || !/^[a-f0-9]{64}$/.test(operationOwner)) throw new Error("A valid worker operation and owner are required.");
+    const worker = [...this.workers.values()].find(live => live.record.operation?.id === operationId && live.record.operation.owner === operationOwner);
+    return worker ? this.status(worker.record.id) : { found: false };
+  }
+
+  private async startImpl(input: WorkerStartInput, operation: WorkerOperation | undefined, releaseAdmission: () => void): Promise<WorkerView> {
+    let repository: string, sourceCommit: string, sourceDirty: boolean;
+    let workspace: WorkerWorkspaceSource | undefined;
+    let rejectionCode: WorkerStartRejectionCode = "invalid_request";
+    try {
+      if (typeof input.task !== "string" || !input.task.trim() || input.task.length > 100_000) throw new Error("A bounded nonempty worker task is required.");
+      if (!["implement", "investigate", "release-prepare"].includes(input.workflow)) throw new Error("Unknown worker workflow.");
+      rejectionCode = "repository_rejected";
+      if (this.repositoryPolicy === "allowlist") {
+        repository = canonicalRepository(input.repository);
+        if (!this.repositories.has(repository)) throw new Error("Repository is not in the worker allowlist.");
+        rejectionCode = this.options.provider.kind === "subscription" ? "subscription_preflight_failed" : "runtime_unverified";
+        await this.prepareRuntime();
+        rejectionCode = "repository_rejected";
+        const sourceRoot = await git(repository, ["rev-parse", "--show-toplevel"]);
+        if (realpathSync(sourceRoot) !== repository) throw new Error("Use the repository root.");
+        sourceCommit = await git(repository, ["rev-parse", "--verify", "HEAD^{commit}"]);
+        if (!/^[a-f0-9]{40,64}$/.test(sourceCommit)) throw new Error("An exact committed source revision is required.");
+        sourceDirty = Boolean(await git(repository, ["status", "--porcelain", "--untracked-files=normal"]));
+      } else {
+        workspace = await inspectWorkerWorkspace(input.repository, this.repositoryPolicy === "owned-workspace");
+        repository = workspace.repository;
+        sourceCommit = workspace.sourceCommit ?? "pending-input-snapshot";
+        sourceDirty = workspace.sourceDirty;
+        rejectionCode = this.options.provider.kind === "subscription" ? "subscription_preflight_failed" : "runtime_unverified";
+        await this.prepareRuntime();
+        rejectionCode = "repository_rejected";
+        canonicalRepository(repository, true);
       }
-      if (await git(repository, ["rev-parse", "--is-bare-repository"]) !== "false") throw new Error("Use a non-bare Git repository.");
-      const gitDir = realpathSync(await git(repository, ["rev-parse", "--absolute-git-dir"]));
-      const gitInfo = lstatSync(gitDir);
-      if (!gitInfo.isDirectory() || gitInfo.uid !== process.getuid?.()) throw new Error("Owned Git repository metadata is required.");
+      if (this.closed) throw new WorkerStartRejected("service_unavailable", "Worker service is closed.");
+    } catch (error) {
+      if (error instanceof WorkerStartRejected) throw error;
+      if (error instanceof BridgeError && error.code === "workflow_runtime_unverified") rejectionCode = "runtime_unverified";
+      throw new WorkerStartRejected(rejectionCode, error instanceof Error ? error.message : undefined);
     }
-    const sourceRoot = await git(repository, ["rev-parse", "--show-toplevel"]);
-    if (realpathSync(sourceRoot) !== repository) throw new Error("Use the repository root.");
-    const sourceCommit = await git(repository, ["rev-parse", "--verify", "HEAD^{commit}"]);
-    if (!/^[a-f0-9]{40,64}$/.test(sourceCommit)) throw new Error("An exact committed source revision is required.");
-    const sourceDirty = Boolean(await git(repository, ["status", "--porcelain", "--untracked-files=normal"]));
-    if (this.repositoryPolicy === "owned-git") {
-      await this.prepareRuntime();
-      canonicalRepository(repository, true);
-    }
-    if (this.closed) throw new Error("Worker service is closed.");
     const id = "worker-" + randomUUID(), worktree = join(this.workspaces, id), branch = "factory-workers/" + id;
-    await git(repository, ["worktree", "add", "-b", branch, worktree, sourceCommit]);
     const timestamp = now();
-    const record: WorkerRecord = { version: 1, id, state: "queued", repository, worktree: realpathSync(worktree), branch,
+    const record: WorkerRecord = { version: 1, id, state: "starting", repository, worktree, branch, ...(operation ? { operation } : {}),
       sourceCommit, sourceDirty, workflow: input.workflow, requested: { model: "claude-opus-5-5", effort: "medium", ultracode: true },
       createdAt: timestamp, updatedAt: timestamp, observedModels: [], pendingApprovalCount: 0, cleanupVerified: null, checkEvidence: [],
       authentication: this.options.provider.kind, ...(this.options.provider.kind === "subscription" ? { subscriptionProfile: this.options.provider.profile } : {}) };
     const live = this.live(record, input.task);
-    this.workers.set(id, live);
+    // Persist the accepted operation before Git can create any workspace state.
+    if (this.options.executionHost) writeWorkerTask(this.root, id, input.task);
     this.save(live);
+    this.workers.set(id, live);
+    releaseAdmission();
+    try {
+      if (workspace) {
+        const prepared = await prepareWorkerWorkspace(workspace, worktree, branch);
+        record.inputCommit = prepared.inputCommit;
+        record.workingDirectory = prepared.workingDirectory;
+        record.sourceKind = workspace.kind;
+        record.inputSnapshot = workspace.snapshot;
+        record.sourceCommit = workspace.sourceCommit ?? prepared.inputCommit;
+      } else await git(repository, ["worktree", "add", "-b", branch, worktree, sourceCommit]);
+      record.worktree = realpathSync(worktree);
+      record.state = "queued";
+      this.save(live);
+    } catch {
+      record.state = "unknown"; record.reason = "workspace_preparation_unconfirmed";
+      record.failure = { stage: "workspace", code: record.reason, message: "Workspace preparation did not confirm completion. Inspect the recorded workspace before replacing this operation." };
+      live.task = undefined;
+      this.active.add(id);
+      this.save(live);
+      return this.view(live);
+    }
     if (this.closed) {
       record.state = "cancelled"; record.reason = "service_closed_before_admission";
       record.cleanupVerified = true; record.endedAt = now(); this.save(live);
+      if (this.options.executionHost) removeWorkerTask(this.root, id);
+    } else if (this.options.executionHost) {
+      this.schedule();
+      return this.status(id);
     } else this.schedule();
     return this.view(live);
   }
 
-  status(id: string): WorkerView { return this.view(this.find(id)); }
-  list(): WorkerView[] { return [...this.workers.values()].map((worker) => this.view(worker)); }
+  status(id: string): WorkerView {
+    const live = this.find(id);
+    if (live.launchPending) return { ...this.view(live), state: "starting" };
+    if (this.options.executionHost && (live.record.executorLaunchRequested || live.task === undefined) && !TERMINAL.has(live.record.state)) return this.options.executionHost.status(live.record);
+    return this.view(live);
+  }
+  list(): WorkerView[] { return [...this.workers.values()].map(worker => this.status(worker.record.id)); }
 
   async cancel(id: string): Promise<WorkerView> {
     const live = this.find(id);
+    if (this.options.executionHost) {
+      if (live.record.state === "queued" && !live.record.executorLaunchRequested) {
+        live.record.state = "cancelled"; live.record.reason = "cancelled_before_executor_launch";
+        live.record.cleanupVerified = true; live.record.leaseReleased = true;
+        live.record.endedAt = live.record.settledAt = now();
+        live.task = undefined; removeWorkerTask(this.root, id); this.save(live);
+        return this.view(live);
+      }
+      const result = await this.options.executionHost.cancel(live.record);
+      this.refreshExecutors();
+      return result;
+    }
     if (TERMINAL.has(live.record.state)) return this.view(live);
+    if (live.record.state === "result_ready" || live.record.state === "cleaning") { await live.done; return this.view(live); }
     live.cancelRequested = true;
     live.controller.abort();
     this.denyApprovals(live);
@@ -214,9 +357,11 @@ export class APIWorkerService {
     return this.view(live);
   }
 
-  approve(input: { id: string; approvalId: string; decision: "allow" | "deny" }): WorkerView {
+  approve(input: { id: string; approvalId: string; decision: "allow" | "deny" }): WorkerView | Promise<WorkerView> {
     if (input.decision !== "allow" && input.decision !== "deny") throw new Error("Approval decision must be allow or deny.");
-    const live = this.find(input.id), pending = live.approvals.get(input.approvalId);
+    const live = this.find(input.id);
+    if (this.options.executionHost) return this.options.executionHost.approve(live.record, input);
+    const pending = live.approvals.get(input.approvalId);
     if (!pending || live.controller.signal.aborted || TERMINAL.has(live.record.state)) throw new Error("Approval is missing, expired or already resolved.");
     pending.settle(input.decision);
     return this.view(live);
@@ -224,7 +369,9 @@ export class APIWorkerService {
 
   async close(): Promise<void> {
     this.closed = true;
+    if (this.executorPoll) clearInterval(this.executorPoll);
     await Promise.allSettled([...this.creating]);
+    if (this.options.executionHost) { await this.options.executionHost.detach(); await this.processes.close(); return; }
     await Promise.allSettled([...this.workers.values()].filter((live) => !TERMINAL.has(live.record.state)).map((live) => this.cancel(live.record.id)));
     await this.processes.close();
   }
@@ -246,13 +393,42 @@ export class APIWorkerService {
     for (const live of this.workers.values()) {
       if (this.active.size >= this.capacity) break;
       if (live.record.state !== "queued" || live.done) continue;
+      if (this.options.executionHost) {
+        if (live.record.executorLaunchRequested || live.task === undefined) continue;
+        this.active.add(live.record.id);
+        live.record.executorLaunchRequested = true;
+        this.save(live);
+        const task = live.task;
+        live.launchPending = true;
+        live.done = this.options.executionHost.start(live.record, task).then(() => {
+          live.task = undefined;
+          removeWorkerTask(this.root, live.record.id);
+        }).catch(() => undefined).finally(() => { live.launchPending = false; });
+        continue;
+      }
       this.active.add(live.record.id);
       live.done = this.execute(live).finally(() => {
-        if (live.record.cleanupVerified === true) this.active.delete(live.record.id);
+        if (live.record.cleanupVerified === true && live.record.leaseReleased !== false) this.active.delete(live.record.id);
         this.schedule();
       });
       void live.done.catch(() => undefined);
     }
+  }
+
+  private refreshExecutors(): void {
+    if (this.closed || !this.options.executionHost) return;
+    for (const id of this.active) {
+      const live = this.workers.get(id);
+      if (!live) continue;
+      if (live.launchPending) continue;
+      let current: WorkerView;
+      try { current = this.options.executionHost.status(live.record); } catch { continue; }
+      if (["completed", "failed", "cancelled"].includes(current.state) && current.cleanupVerified === true && current.leaseReleased !== false) {
+        this.active.delete(id);
+        removeWorkerTask(this.root, id);
+      }
+    }
+    this.schedule();
   }
 
   private environment(): Record<string, string> {
@@ -282,6 +458,8 @@ export class APIWorkerService {
     const { record } = live;
     const generation = ++live.generation;
     let deadline = false;
+    let stage: "admission" | "execution" = "admission";
+    let admissionRejected = false;
     const timer = setTimeout(() => { deadline = true; live.controller.abort(); this.denyApprovals(live); }, this.options.maxMs);
     timer.unref();
     try {
@@ -289,21 +467,22 @@ export class APIWorkerService {
       live.lease = await this.options.acquireLease?.(record, live.controller.signal);
       if (live.controller.signal.aborted) throw new Error("Worker stopped before execution.");
       const { support, env, identity } = await this.prepareRuntime();
+      stage = "execution";
       if (this.options.provider.kind !== "subscription") env.CLAUDE_CONFIG_DIR = privateDirectory(join(this.root, "native-config", record.id));
       const permission: CanUseTool = (tool, input, options) => this.requestPermission(live, tool, input, options.signal, options.toolUseID);
       const options: Options = {
-        cwd: record.worktree, env, abortController: live.controller, model: "claude-opus-5-5", effort: "medium",
+        cwd: record.workingDirectory ?? record.worktree, env, abortController: live.controller, model: "claude-opus-5-5", effort: "medium",
         pathToClaudeCodeExecutable: support.executable, permissionMode: "default", permissionPrompts: "host", canUseTool: permission,
         settingSources: [], strictMcpConfig: true, mcpServers: {},
         settings: { ultracode: true, enableWorkflows: true, workflowSizeGuideline: "small" },
         disallowedTools: BLOCKED_TOOLS,
         systemPrompt: { type: "preset", preset: "claude_code", append: this.policy(record) },
         ...(this.options.provider.kind !== "subscription" ? { maxBudgetUsd: this.options.maxBudgetUsd } : {}), maxTurns: this.options.maxTurns ?? 32,
-        sandbox: { enabled: true, failIfUnavailable: true, autoAllowBashIfSandboxed: false, allowUnsandboxedCommands: false, filesystem: { allowWrite: [record.worktree] } },
+        sandbox: { enabled: true, failIfUnavailable: true, autoAllowBashIfSandboxed: false, allowUnsandboxedCommands: false, filesystem: { allowWrite: [record.workingDirectory ?? record.worktree] } },
         hooks: { PreToolUse: [{ hooks: [async (event, toolUseId, context) => {
           if (event.hook_event_name !== "PreToolUse") return {};
           const deny = (reason: string) => ({ hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "deny" as const, permissionDecisionReason: reason } });
-          const active = () => this.workers.get(record.id) === live && live.generation === generation && !live.controller.signal.aborted && !context.signal.aborted && !TERMINAL.has(record.state);
+          const active = () => this.workers.get(record.id) === live && live.generation === generation && !live.controller.signal.aborted && !context.signal.aborted && EXECUTING.has(record.state);
           if (!active()) return deny("This worker execution has ended.");
           if (BLOCKED_TOOLS.includes(event.tool_name)) return deny("This worker cannot create another workspace, remote execution or a scheduled task.");
           if (event.tool_name === "Workflow") {
@@ -313,7 +492,8 @@ export class APIWorkerService {
             const id = toolUseId ?? event.tool_use_id;
             if (!id) return deny("Workflow execution requires an exact tool-use identity.");
             // Workflow can be classified as safe by the native permission engine.
-            // Ask explicitly here before it can run, regardless of canUseTool.
+            // Apply the operator's approval policy here even when the native
+            // permission engine would not call canUseTool for this workflow.
             const decision = await this.requestPermission(live, "Workflow", input!, context.signal, id);
             if (!active()) return deny("The worker was cancelled or its execution changed while awaiting approval.");
             if (!decision || decision.behavior !== "allow") return deny(decision?.message ?? "Workflow was not approved.");
@@ -327,7 +507,7 @@ export class APIWorkerService {
           if (["Write", "Edit", "MultiEdit", "NotebookEdit"].includes(event.tool_name)) {
             const raw = event.tool_input as Record<string, unknown>;
             const path = raw.file_path ?? raw.notebook_path;
-            if (typeof path !== "string" || !insideWorktree(record.worktree, path)) return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "Writes must stay in this worker's assigned worktree." } };
+            if (typeof path !== "string" || !insideWorktree(record.workingDirectory ?? record.worktree, path)) return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "Writes must stay in this worker's assigned directory." } };
           }
           return {};
         }] }] },
@@ -365,15 +545,24 @@ export class APIWorkerService {
       const children = [...live.children.values()];
       const childFailed = children.some((child) => child.state === "failed" || child.state === "cancelled");
       const childrenPending = children.some((child) => child.state === "running");
-      record.state = live.cancelRequested ? "cancelled" : deadline ? "failed" : live.sawResult && live.resultSucceeded && !childFailed && !childrenPending ? "completed" : "failed";
+      record.resultState = live.cancelRequested ? "cancelled" : deadline ? "failed" : live.sawResult && live.resultSucceeded && !childFailed && !childrenPending ? "completed" : "failed";
+      record.state = record.resultState === "completed" ? "result_ready" : "cleaning";
       if (childFailed) record.reason = "child_task_failed";
       else if (childrenPending) record.reason = "child_completion_unproven";
       if (!live.sawResult && !live.cancelRequested && !deadline) record.reason = "native_result_missing";
+      this.save(live);
     } catch (error) {
-      record.state = live.cancelRequested ? "cancelled" : "failed";
+      // These fixed helper refusals occur while validating the initial request,
+      // before a lease is registered. Transport failures remain uncertain.
+      admissionRejected = stage === "admission" && error instanceof BridgeError
+        && ["desktop_job_workspace", "desktop_job_binding"].includes(error.code);
+      record.resultState = live.cancelRequested ? "cancelled" : "failed";
+      record.state = "cleaning";
       record.backoff ??= workerBackoff(error);
-      record.reason = live.cancelRequested ? "cancelled" : deadline ? "deadline_exceeded" : record.backoff ? "native_" + record.backoff.kind : "native_execution_failed";
+      record.reason = live.cancelRequested ? "cancelled" : deadline ? "deadline_exceeded" : admissionRejected ? (error as BridgeError).code : record.backoff ? "native_" + record.backoff.kind : "native_execution_failed";
       record.error = "Worker execution did not complete successfully. Review its recorded state and approvals.";
+      record.failure = safeFailure(error, stage, record.reason);
+      this.save(live);
     } finally {
       live.generation++;
       clearTimeout(timer);
@@ -382,33 +571,70 @@ export class APIWorkerService {
       approvalBatch?.controller.abort();
       this.denyApprovals(live);
       if (approvalBatch) await Promise.allSettled([approvalBatch.parked, approvalBatch.resuming]);
+      record.state = "cleaning";
+      record.leaseReleased = false;
+      this.save(live);
       try {
         if (this.options.cleanup) await this.options.cleanup(record.id);
         else await this.processes.stop(record.id);
         record.cleanupVerified = true;
       } catch {
         record.cleanupVerified = false; record.state = "unknown"; record.reason = "owned_process_cleanup_unproven";
+        record.failure = { stage: "cleanup", code: record.reason, message: "Owned process cleanup did not confirm completion." };
       }
-      record.endedAt = now();
+      this.save(live);
       const lease = live.lease;
       live.lease = undefined;
-      const leaseResult: WorkerLeaseResult = { state: record.state === "completed" ? "completed" : record.state === "cancelled" ? "cancelled" : record.state === "unknown" ? "unknown" : "failed", cleanupVerified: record.cleanupVerified === true, usage: live.providerEvidence ? { ...live.usage.providerTotals(), estimated: false } : undefined, sdkSessionId: record.sdkSessionId };
+      const leaseResult: WorkerLeaseResult = { state: record.state === "unknown" ? "unknown" : record.resultState ?? "failed", cleanupVerified: record.cleanupVerified === true, usage: live.providerEvidence ? { ...live.usage.providerTotals(), estimated: false } : undefined, sdkSessionId: record.sdkSessionId };
       try {
         if (lease) await lease.release(leaseResult);
-        else await this.options.finalizeLease?.(record, leaseResult);
+        else if (!admissionRejected) await this.options.finalizeLease?.(record, leaseResult);
+        record.leaseReleased = true;
+        if (record.cleanupVerified === true) {
+          record.state = record.resultState ?? "failed";
+          record.settledAt = now();
+        }
       }
-      catch { record.state = "unknown"; record.cleanupVerified = false; record.reason = "shared_lease_release_unproven"; }
+      catch {
+        record.state = "unknown"; record.reason = "shared_lease_release_unproven";
+        record.failure = { stage: "lease_release", code: record.reason, message: "Shared lease release did not confirm completion." };
+      }
+      record.endedAt = now();
       this.save(live);
     }
   }
   private policy(record: WorkerRecord): string {
     return (this.options.policyText ?? DEFAULT_POLICY) + "\n\nSelected workflow: " + record.workflow + ".\n" + (this.options.workflowText?.[record.workflow] ?? "")
-      + "\nAssigned worktree: " + record.worktree + ". Source checkout is read-only context: " + record.repository + ".";
+      + "\n\n" + WORKSTREAM_DECISION_POLICY
+      + "\nWorker escalation: If essential missing information, new permissions, or an explicitly requested user decision blocks progress, complete only independent authorised work, then return a final blocked handoff containing the exact question, available options and relevant context to the controller. Stop dependent work. The controller must collect a real answer and provide it in a new assignment; this worker cannot receive follow-up answers while running. This worker's approval transport carries allow/deny decisions and cannot deliver selected AskUserQuestion answers. Do not invoke AskUserQuestion or another questionnaire tool to collect user choices from this worker, and never invent a user answer."
+      + (this.approvalPolicy === "bypass" ? "\nThis subscription connection uses automatic worker tool approval. This removes extra tool approval prompts; it does not expand the task's authority or override repository, production, sandbox, or workspace rules." : "")
+      + "\nAssigned worktree: " + record.worktree + ". Write within the assigned working directory: " + (record.workingDirectory ?? record.worktree)
+      + ". Source checkout is read-only context: " + record.repository + "."
+      + " Read applicable AGENTS.md and CLAUDE.md instructions from that source when absent from the snapshot. Keep private credentials and excluded application state out of task output."
+      + (record.inputSnapshot?.ignoredUntrackedFiles ? "\nThe input snapshot excludes Gitignored untracked files." : "")
+      + (record.inputSnapshot?.excluded.length ? "\nInput snapshot exclusions: " + JSON.stringify(record.inputSnapshot.excluded) + ". If an excluded file is needed, report the missing input." : "");
   }
   private requestPermission(live: LiveWorker, tool: string, input: Record<string, unknown>, signal: AbortSignal, toolUseId?: string): ReturnType<CanUseTool> {
-    if (live.controller.signal.aborted || signal.aborted || TERMINAL.has(live.record.state)) return Promise.resolve({ behavior: "deny", message: "The worker is no longer accepting actions." });
+    if (live.controller.signal.aborted || signal.aborted || !EXECUTING.has(live.record.state)) return Promise.resolve({ behavior: "deny", message: "The worker is no longer accepting actions." });
+    // The optional approval bypass does not bypass the worker's tool or
+    // workspace boundaries, including direct native permission callbacks.
+    let refused: string | undefined;
+    if (BLOCKED_TOOLS.includes(tool)) refused = "This worker cannot create another workspace, remote execution or a scheduled task.";
+    if (["Write", "Edit", "MultiEdit", "NotebookEdit"].includes(tool)) {
+      const path = input.file_path ?? input.notebook_path;
+      if (typeof path !== "string" || !insideWorktree(live.record.workingDirectory ?? live.record.worktree, path)) refused = "Writes must stay in this worker's assigned directory.";
+    }
+    if (tool === "Workflow") refused = validateWorkflowInput(input);
     const id = randomUUID(), snapshot = structuredClone(input);
     const view: WorkerApproval = { id, toolName: tool.slice(0, 160), input: redactJson(snapshot), requestedAt: now(), ...(toolUseId ? { toolUseId } : {}) };
+    if (refused || this.approvalPolicy === "bypass") {
+      // An existing parked batch must reacquire its seat before any native
+      // continuation, including an automatically approved concurrent action.
+      if (this.options.provider.kind === "subscription" && this.options.acquireLease && live.approvalBatch) {
+        return this.subscriptionPermission(live, snapshot, view, signal, refused ? { decision: "deny", message: refused } : { decision: "allow" });
+      }
+      return Promise.resolve(refused ? { behavior: "deny", message: refused } : { behavior: "allow", updatedInput: snapshot });
+    }
     // Apply the exact display/decision bound before creating a pending action or
     // parking a subscription lease. An unreadable action must return a denial
     // to the SDK so it can continue with a smaller operation.
@@ -417,7 +643,7 @@ export class APIWorkerService {
       // Another concurrent action may already have parked this worker's lease.
       // Its automatic denial must respect that handoff before native work resumes.
       if (this.options.provider.kind === "subscription" && this.options.acquireLease && live.approvalBatch) {
-        return this.subscriptionPermission(live, snapshot, view, signal, message);
+        return this.subscriptionPermission(live, snapshot, view, signal, { decision: "deny", message });
       }
       return Promise.resolve({ behavior: "deny", message });
     }
@@ -430,7 +656,7 @@ export class APIWorkerService {
         settled = true;
         signal.removeEventListener("abort", abort); live.controller.signal.removeEventListener("abort", abort);
         live.approvals.delete(id); live.record.pendingApprovalCount = live.approvals.size;
-        if (!TERMINAL.has(live.record.state)) live.record.state = live.approvals.size ? "waiting_approval" : "running";
+        if (EXECUTING.has(live.record.state)) live.record.state = live.approvals.size ? "waiting_approval" : "running";
         this.save(live);
         resolvePermission(decision === "allow" ? { behavior: "allow", updatedInput: snapshot } : { behavior: "deny", message: "Denied by the Factory controller or worker cancellation." });
       };
@@ -440,7 +666,8 @@ export class APIWorkerService {
       if (signal.aborted || live.controller.signal.aborted) abort();
     });
   }
-  private subscriptionPermission(live: LiveWorker, snapshot: Record<string, unknown>, view: WorkerApproval, signal: AbortSignal, denialMessage?: string): ReturnType<CanUseTool> {
+  private subscriptionPermission(live: LiveWorker, snapshot: Record<string, unknown>, view: WorkerApproval, signal: AbortSignal,
+    automatic?: { decision: "allow" | "deny"; message?: string }): ReturnType<CanUseTool> {
     let batch = live.approvalBatch;
     if (!batch) {
       const controller = new AbortController(), abort = () => controller.abort();
@@ -457,23 +684,23 @@ export class APIWorkerService {
     const current = batch, id = view.id;
     return new Promise(resolvePermission => {
       const abort = () => settle("deny");
-      const pending = { decision: (denialMessage ? "deny" : undefined) as "allow" | "deny" | undefined, finish: (allowed: boolean) => {
+      const pending = { decision: automatic?.decision as "allow" | "deny" | undefined, finish: (allowed: boolean) => {
         signal.removeEventListener("abort", abort);
         live.controller.signal.removeEventListener("abort", abort);
         resolvePermission(allowed && !signal.aborted ? { behavior: "allow", updatedInput: snapshot }
-          : { behavior: "deny", message: denialMessage ?? "Denied by the Factory controller or worker cancellation." });
+          : { behavior: "deny", message: automatic?.message ?? "Denied by the Factory controller or worker cancellation." });
       } };
       const settle = (decision: "allow" | "deny") => {
         if (pending.decision !== undefined) return;
         pending.decision = decision;
         live.approvals.delete(id);
         live.record.pendingApprovalCount = live.approvals.size;
-        if (!TERMINAL.has(live.record.state)) live.record.state = live.approvals.size ? "waiting_approval" : "starting";
+        if (EXECUTING.has(live.record.state)) live.record.state = live.approvals.size ? "waiting_approval" : "starting";
         this.save(live);
         this.resumeApprovedBatch(live, current);
       };
       current.requests.set(id, pending);
-      if (!denialMessage) {
+      if (!automatic) {
         live.approvals.set(id, { view, settle });
         live.record.pendingApprovalCount = live.approvals.size;
         live.record.state = "waiting_approval"; this.save(live);
@@ -481,13 +708,13 @@ export class APIWorkerService {
       signal.addEventListener("abort", abort, { once: true });
       live.controller.signal.addEventListener("abort", abort, { once: true });
       if (signal.aborted || live.controller.signal.aborted) abort();
-      if (denialMessage) this.resumeApprovedBatch(live, current);
+      if (automatic) this.resumeApprovedBatch(live, current);
     });
   }
   private resumeApprovedBatch(live: LiveWorker, batch: SubscriptionApprovalBatch): void {
     if (batch.resuming || [...batch.requests.values()].some(request => request.decision === undefined)) return;
     const active = () => this.workers.get(live.record.id) === live && live.approvalBatch === batch
-      && live.generation === batch.generation && !live.controller.signal.aborted && !batch.controller.signal.aborted && !TERMINAL.has(live.record.state);
+      && live.generation === batch.generation && !live.controller.signal.aborted && !batch.controller.signal.aborted && EXECUTING.has(live.record.state);
     const finish = (allow: boolean) => {
       if (live.approvalBatch === batch) live.approvalBatch = undefined;
       batch.detach();
@@ -515,7 +742,7 @@ export class APIWorkerService {
   }
   private denyApprovals(live: LiveWorker): void { for (const item of [...live.approvals.values()]) item.settle("deny"); }
   private message(live: LiveWorker, value: Record<string, unknown>): void {
-    if (live.controller.signal.aborted || TERMINAL.has(live.record.state)) return;
+    if (live.controller.signal.aborted || !EXECUTING.has(live.record.state)) return;
     const record = live.record;
     const childId = typeof value.parent_tool_use_id === "string" && value.parent_tool_use_id ? value.parent_tool_use_id : undefined;
     const isChild = childId !== undefined;
@@ -597,6 +824,23 @@ export function workerBackoff(error: unknown): WorkerRecord["backoff"] {
   const usage = mapped.extra.usage_limit === true;
   const seconds = typeof mapped.extra.retry_after === "number" && Number.isFinite(mapped.extra.retry_after) ? mapped.extra.retry_after : usage ? 3600 : 60;
   return { kind: usage ? "usage_limit" : mapped.code === "rate_limit_error" ? "rate_limit" : "overloaded", retryAfterSeconds: Math.max(1, Math.min(86400, Math.ceil(seconds))) };
+}
+
+function workerOperation(input: WorkerStartInput): WorkerOperation | undefined {
+  if (!input || typeof input !== "object") throw new WorkerStartRejected("invalid_request", "A worker request is required.");
+  if (input.operationId === undefined && input.operationOwner === undefined) return undefined;
+  if (!validOperationId(input.operationId) || typeof input.operationOwner !== "string" || !/^[a-f0-9]{64}$/.test(input.operationOwner)) {
+    throw new WorkerStartRejected("invalid_request", "A valid operation ID and owner are required together.");
+  }
+  const requestDigest = createHash("sha256").update(JSON.stringify({ repository: input.repository, task: input.task, workflow: input.workflow })).digest("hex");
+  return { id: input.operationId, owner: input.operationOwner, requestDigest };
+}
+
+function safeFailure(error: unknown, stage: "admission" | "execution", fallback: string): NonNullable<WorkerRecord["failure"]> {
+  const value = object(error);
+  const nativeCode = error instanceof BridgeError ? error.code : value?.code;
+  const code = typeof nativeCode === "string" && /^[A-Za-z0-9_.-]{1,80}$/.test(nativeCode) ? nativeCode : fallback;
+  return { stage, code, message: stage === "admission" ? "Worker admission or runtime preflight failed." : "Native worker execution failed. The result and completed child records are retained." };
 }
 
 function now(): string { return new Date().toISOString(); }

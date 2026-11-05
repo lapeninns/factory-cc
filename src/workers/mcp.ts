@@ -2,9 +2,12 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { createHash } from "node:crypto";
 import { approvalSummary } from "./control.js";
+import { WorkerStartRejected } from "./start-rejection.js";
+import type { WorkerStartInput } from "./worker-state.js";
 
 export interface WorkerController {
-  start(input: { repository: string; task: string; workflow: "implement" | "investigate" | "release-prepare" }): Promise<unknown>;
+  start(input: WorkerStartInput): Promise<unknown>;
+  lookup?(operationId: string, operationOwner: string): unknown;
   status(id: string): unknown;
   list(): unknown;
   cancel(id: string): Promise<unknown>;
@@ -27,7 +30,8 @@ export function createWorkerMcp(controller: WorkerController, options: { approva
   });
   const properties = { id: { type: "string" } };
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [
-    { name: "factory_worker_start", description: "Start one supervised worker in its own worktree using this connection's fixed authentication route.", inputSchema: { type: "object", properties: { repository: { type: "string" }, task: { type: "string" }, workflow: { type: "string", enum: ["implement", "investigate", "release-prepare"] } }, required: ["repository", "task"], additionalProperties: false } },
+    { name: "factory_worker_start", description: "Start one supervised worker in its own worktree using this connection's fixed authentication route. Reuse the same operation identity to recover a lost acknowledgement.", inputSchema: { type: "object", properties: { repository: { type: "string" }, task: { type: "string" }, workflow: { type: "string", enum: ["implement", "investigate", "release-prepare"] }, operationId: { type: "string" }, operationOwner: { type: "string" } }, required: ["repository", "task"], additionalProperties: false } },
+    ...(controller.lookup ? [{ name: "factory_worker_lookup", description: "Recover the recorded worker for an exact operation and owner without starting work.", inputSchema: { type: "object" as const, properties: { operationId: { type: "string" }, operationOwner: { type: "string" } }, required: ["operationId", "operationOwner"], additionalProperties: false }, annotations: { readOnlyHint: true } }] : []),
     { name: "factory_worker_status", description: "Read worker state, result, usage and any pending human permission request.", inputSchema: { type: "object", properties, required: ["id"], additionalProperties: false }, annotations: { readOnlyHint: true } },
     { name: "factory_worker_wait", description: "Wait up to 20 seconds for a worker state change, then return current progress.", inputSchema: { type: "object", properties, required: ["id"], additionalProperties: false }, annotations: { readOnlyHint: true } },
     { name: "factory_worker_list", description: "List supervised workers and their current recorded state.", inputSchema: { type: "object", properties: {}, additionalProperties: false }, annotations: { readOnlyHint: true } },
@@ -51,8 +55,16 @@ export function createWorkerMcp(controller: WorkerController, options: { approva
       if (request.params.name === "factory_worker_start") {
         const workflow = args.workflow ?? "implement";
         if (!["implement", "investigate", "release-prepare"].includes(String(workflow))) throw new Error("Unknown workflow.");
-        result = await controller.start({ repository: string(args.repository), task: string(args.task), workflow: workflow as "implement" | "investigate" | "release-prepare" });
-      } else if (request.params.name === "factory_worker_status") result = controller.status(string(args.id));
+        const input: WorkerStartInput = { repository: string(args.repository), task: string(args.task), workflow: workflow as "implement" | "investigate" | "release-prepare",
+          ...(args.operationId !== undefined ? { operationId: string(args.operationId) } : {}),
+          ...(args.operationOwner !== undefined ? { operationOwner: string(args.operationOwner) } : {}) };
+        try { result = await controller.start(input); }
+        catch (error) {
+          if (!(error instanceof WorkerStartRejected)) throw error;
+          return { isError: true, content: [{ type: "text", text: JSON.stringify({ type: "worker_start_rejected", code: error.code, executionStarted: false }) }] };
+        }
+      } else if (request.params.name === "factory_worker_lookup" && controller.lookup) result = controller.lookup(string(args.operationId), string(args.operationOwner));
+      else if (request.params.name === "factory_worker_status") result = controller.status(string(args.id));
       else if (request.params.name === "factory_worker_list") result = controller.list();
       else if (request.params.name === "factory_worker_cancel") result = await controller.cancel(string(args.id));
       else if (request.params.name === "factory_worker_wait") {

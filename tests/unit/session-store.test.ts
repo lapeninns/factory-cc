@@ -37,6 +37,34 @@ describe("session capacity and durable identity", () => {
     expect(store.require(waiting.bridgeSessionId).pendingToolIds).toEqual(["tool-a"]);
   });
 
+  it("persists an authenticated completion before its next admitted model turn", () => {
+    const dir = temporaryDir();
+    const store = new SessionStore(dir, true, 2);
+    const record = store.create(input);
+    store.update(record.bridgeSessionId, { state: "WAITING_DROID_TOOL", pendingToolIds: ["tool-a"] });
+    const completion = { toolUseId: "tool-a", toolName: "Execute", input: { command: "fixture append" }, content: "done" };
+    expect(store.recordHostCompletion(record.bridgeSessionId, completion)).toBe("accepted");
+    expect(store.recordHostCompletion(record.bridgeSessionId, { ...completion, isError: false })).toBe("duplicate");
+    expect(() => store.recordHostCompletion(record.bridgeSessionId, { ...completion, content: "different" }))
+      .toThrowError(expect.objectContaining({ code: "conflicting_host_completion" }));
+    const loaded = new SessionStore(dir, true, 2).require(record.bridgeSessionId);
+    expect(loaded.hostCompletionReceipts).toEqual([{ ...completion, isError: false, terminal: false }]);
+    // Restart preserves the evidence while retaining the conservative disposition of the lost callback.
+    expect(loaded.hostEnded).toBe("interrupted");
+  });
+
+  it("rejects receipts for an unowned action and bounds pending receipt data", () => {
+    const store = new SessionStore(temporaryDir(), false, 2);
+    const record = store.create(input);
+    const completion = { toolUseId: "tool-a", toolName: "Execute", input: {}, content: "done" };
+    expect(() => store.recordHostCompletion(record.bridgeSessionId, completion))
+      .toThrowError(expect.objectContaining({ code: "unknown_tool_use_id" }));
+    store.update(record.bridgeSessionId, { pendingToolIds: ["tool-a"] });
+    expect(() => store.recordHostCompletion(record.bridgeSessionId, { ...completion, content: "x".repeat(8 * 1024 * 1024) }))
+      .toThrowError(expect.objectContaining({ code: "host_completion_capacity" }));
+    expect(record.hostCompletionReceipts).toBeUndefined();
+  });
+
   it("also enforces the active limit when resuming an idle session", () => {
     const store = new SessionStore(temporaryDir(), false, 1);
     const idle = store.create(input);

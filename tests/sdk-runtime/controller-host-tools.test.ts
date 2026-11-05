@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { WORKSTREAM_DECISION_POLICY } from "../../src/runtime/decision-policy.js";
 import { loadConfig } from "../../src/config.js";
 import { SUBSCRIPTION_PROFILES } from "../../src/runtime/desktop-jobs.js";
 import { StableDroidToolNames } from "../../src/runtime/droid-mcp-catalog.js";
@@ -12,9 +13,14 @@ import { sanitizedSubscriptionEnvironment } from "../../src/workers/subscription
 const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
 const ask = { name: "AskUser", input_schema: { type: "object", properties: { questionnaire: { type: "string" } }, required: ["questionnaire"], additionalProperties: false } };
 const actions = {
+  AskUser: { questionnaire: "1. [question] Which production account should receive the release?\n[topic] Essential account selection\n[option] Account A (Recommended)\n[option] Account B" },
   Execute: { command: "df -h ." },
   Create: { file_path: "/fixture/report.txt", content: "report" },
   Edit: { file_path: "/fixture/report.txt", old_str: "old", new_str: "new" },
+  Task: { subagent_type: "general", prompt: "Inspect the owned fixture" },
+  SpawnAgent: { task: "Inspect the owned fixture" },
+  "factory-workers-pool___factory_worker_accounts": {},
+  "factory-workers-pool___factory_worker_start": { repository: "/fixture/repository", task: "Inspect the owned fixture", workflow: "investigate", operationId: "fixture-inspection" },
 };
 const roots: string[] = [], runtimes: SdkRuntime[] = [];
 
@@ -55,7 +61,7 @@ class Fake implements SdkHandle {
   }
 }
 
-function setup(options: { original?: keyof typeof actions; hostTools?: boolean; askTool?: boolean; invoke?: boolean } = {}) {
+function setup(options: { original?: keyof typeof actions; hostTools?: boolean; askTool?: boolean; invoke?: boolean; approvalPolicy?: "ask" | "bypass" } = {}) {
   const root = mkdtempSync(join(tmpdir(), "controller-host-tools-")); roots.push(root);
   mkdirSync(join(root, "policies")); mkdirSync(join(root, "workflows"));
   writeFileSync(join(root, "policies/team-policy.md"), "Fixture policy.\n");
@@ -64,7 +70,8 @@ function setup(options: { original?: keyof typeof actions; hostTools?: boolean; 
   vi.stubEnv("BRIDGE_SDK_CWD", root);
   const config = loadConfig({ mode: "sdk", authMode: "subscription", desktopProfile: true, desktopJobs: true, desktopLifecycle: true,
     desktopRuntimePath: root, desktopStateRoot: join(root, "state"), controllerReadOnly: true, workerPool: true, controllerPool: true,
-    controllerHostTools: options.hostTools !== false, workerControlFile: join(root, "control.json"), workerMcpPrefix: "factory-workers-pool___",
+    controllerHostTools: options.hostTools !== false, controllerApprovalPolicy: options.approvalPolicy,
+    workerControlFile: join(root, "control.json"), workerMcpPrefix: "factory-workers-pool___",
     subscriptionProfile: "team1", subscriptionExpectedEmail: "team1@example.invalid",
     subscriptionAccounts: SUBSCRIPTION_PROFILES.map(profile => ({ profile, expectedEmail: `${profile}@example.invalid`, weight: 1,
       env: sanitizedSubscriptionEnvironment({ PATH: process.env.PATH }, `/fixture/${profile}`) })),
@@ -102,6 +109,132 @@ afterEach(async () => {
 });
 
 describe("exactly approved Factory host operations", () => {
+  it.each(["factory-workers-pool___factory_worker_accounts", "factory-workers-pool___factory_worker_start"] as const)("forwards advertised %s with host tools enabled", async original => {
+    const { runtime, fake, base } = setup({ original, approvalPolicy: "bypass" });
+    const action = callFrom(await runtime.handle(base));
+    expect(action).toMatchObject({ name: original, input: actions[original] });
+    expect((await runtime.handle(toolResult(base, action.id, "host result"))).response.stop_reason).toBe("end_turn");
+    expect(fake.observedResult).toMatchObject({ isError: false });
+  });
+
+  it("includes the shared policy and leaves essential recommended questions waiting for a real answer", async () => {
+    const { runtime, fake, base, control } = setup({ original: "AskUser", approvalPolicy: "bypass", askTool: false });
+    const question = callFrom(await runtime.handle(base));
+    expect(fake.calls[0]!.options.systemPrompt.append).toContain(WORKSTREAM_DECISION_POLICY);
+    expect(question).toMatchObject({ name: "AskUser", input: actions.AskUser });
+    expect(fake.observedResult).toBeUndefined();
+    expect(runtime.pendingHostCalls(base.session.bridgeSessionId)).toHaveLength(1);
+    expect(control.requestApproval).not.toHaveBeenCalled();
+    await runtime.handle(toolResult(base, question.id, "Account B"));
+    expect(fake.observedResult).toMatchObject({ content: [{ type: "text", text: "Account B" }] });
+  });
+
+  it.each(["Task", "SpawnAgent"] as const)("keeps %s delegation on the managed worker path", async original => {
+    const { runtime, fake, base } = setup({ original, invoke: false, approvalPolicy: "bypass" });
+    await runtime.handle(base);
+    const name = `mcp__droid__${new StableDroidToolNames().toMcp(original)}`;
+    expect(fake.handlers.has(name.slice("mcp__droid__".length))).toBe(false);
+    const options = fake.calls[0]!.options;
+    expect(await options.hooks.PreToolUse[0].hooks[0]({ tool_name: name, tool_input: actions[original] }))
+      .toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+    expect(await options.canUseTool(name, actions[original])).toMatchObject({ behavior: "deny" });
+    expect(options.systemPrompt.append).toContain("delegate useful independent work through factory_worker_start");
+    expect(options.systemPrompt.append).not.toContain("Use synchronous Factory Task");
+  });
+
+  it("keeps newly discovered Factory Task and SpawnAgent tools outside the active catalog", async () => {
+    const { runtime, fake, base } = setup({ invoke: false, approvalPolicy: "bypass" });
+    await runtime.handle(base);
+    const discovered = {
+      ...base,
+      request: {
+        ...base.request,
+        messages: [{ role: "user" as const, content: "Continue with the newly discovered tools" }],
+        tools: [...base.request.tools!, ...(["Task", "SpawnAgent"] as const).map(name => ({
+          name, input_schema: { type: "object" as const },
+        }))],
+      },
+    };
+    await runtime.handle(discovered);
+    const options = fake.calls[0]!.options;
+    for (const original of ["Task", "SpawnAgent"] as const) {
+      const name = `mcp__droid__${new StableDroidToolNames().toMcp(original)}`;
+      expect(fake.handlers.has(name.slice("mcp__droid__".length))).toBe(false);
+      expect(await options.hooks.PreToolUse[0].hooks[0]({ tool_name: name, tool_input: actions[original] }))
+        .toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+      expect(await options.canUseTool(name, actions[original])).toMatchObject({ behavior: "deny" });
+    }
+  });
+
+  it("records authenticated completion without resuming the SDK before admission", async () => {
+    const { runtime, fake, base } = setup({ approvalPolicy: "bypass" });
+    const action = callFrom(await runtime.handle(base));
+    const receipt = { toolUseId: action.id, toolName: "Execute", input: action.input, content: "authenticated result [factory-cc-session:" + "a".repeat(64) + "]" };
+    runtime.validateHostToolCompletion(base.session.bridgeSessionId, receipt);
+    expect(await runtime.recordHostToolCompletion(base.session.bridgeSessionId, receipt)).toBe("accepted");
+    expect(await runtime.recordHostToolCompletion(base.session.bridgeSessionId, receipt)).toBe("duplicate");
+    expect(fake.observedResult).toBeUndefined();
+    expect(runtime.pendingHostCalls(base.session.bridgeSessionId)).toHaveLength(1);
+    const next = toolResult(base, action.id, "Droid display wrapper differs");
+    next.session = { ...base.session, hostCompletionReceipts: [receipt] };
+    expect((await runtime.handle(next)).response.stop_reason).toBe("end_turn");
+    expect(fake.observedResult).toMatchObject({ content: [{ type: "text", text: expect.stringContaining("authenticated result") }] });
+    expect(JSON.stringify(fake.observedResult)).not.toContain("factory-cc-session:");
+    expect(await runtime.recordHostToolCompletion(base.session.bridgeSessionId, receipt)).toBe("duplicate");
+  });
+
+  it("rejects conflicting authenticated completion and keeps the original pending action", async () => {
+    const { runtime, fake, base } = setup({ approvalPolicy: "bypass" });
+    const action = callFrom(await runtime.handle(base));
+    const receipt = { toolUseId: action.id, toolName: "Execute", input: action.input, content: "first result" };
+    await runtime.recordHostToolCompletion(base.session.bridgeSessionId, receipt);
+    await expect(runtime.recordHostToolCompletion(base.session.bridgeSessionId, { ...receipt, content: "changed" }))
+      .rejects.toMatchObject({ code: "conflicting_host_completion" });
+    expect(fake.observedResult).toBeUndefined();
+    await runtime.handle(toolResult(base, action.id, "first result"));
+  });
+
+  it.each(["Execute", "Create", "Edit"] as const)("explicit bypass publishes %s without the extra AskUser question", async original => {
+    const { runtime, fake, base, control } = setup({ original, approvalPolicy: "bypass", askTool: false });
+    const first = await runtime.handle(base), action = callFrom(first);
+    expect(action).toMatchObject({ name: original, id: "host-action", input: actions[original] });
+    expect(first.response.content.some(block => block.type === "tool_use" && block.name === "AskUser")).toBe(false);
+    expect(fake.calls[0]!.options).toMatchObject({ permissionMode: "default", allowDangerouslySkipPermissions: false });
+    expect(runtime.describe()).toMatchObject({ controllerHostTools: true, controllerApprovalPolicy: "bypass", permissionMode: "ask", pendingApprovals: 0 });
+    expect(fake.calls[0]!.options.systemPrompt.append).toContain("Factory's own permissions still apply");
+    expect((await runtime.handle(toolResult(base, action.id, "host result"))).response.stop_reason).toBe("end_turn");
+    expect(fake.observedResult).toMatchObject({ isError: false });
+    expect(control.requestApproval).not.toHaveBeenCalled();
+  });
+
+  it("keeps Factory spec mode authoritative with bridge approval bypass", async () => {
+    const { runtime, fake, base, setMode } = setup({ approvalPolicy: "bypass" });
+    setMode("spec");
+    const result = await runtime.handle(base);
+    expect(result.response.content.some(block => block.type === "tool_use")).toBe(false);
+    expect(fake.observedResult).toMatchObject({ isError: true });
+  });
+
+  it("bypass retains the input snapshot and rejects a stale handler after cancellation", async () => {
+    const { runtime, fake, base } = setup({ approvalPolicy: "bypass" });
+    const action = callFrom(await runtime.handle(base));
+    fake.input.command = "changed after dispatch";
+    expect(action.input).toEqual({ command: "df -h ." });
+    const handler = fake.handlers.get(new StableDroidToolNames().toMcp("Execute"))!;
+    await runtime.cancel(base.session.bridgeSessionId, "cancelled by test");
+    await expect(handler({ command: "pwd" })).rejects.toMatchObject({ code: "stale_native_query" });
+  });
+
+  it("bypass keeps direct native writes, shell, Workflow and agent spawning blocked", async () => {
+    const { runtime, fake, base } = setup({ approvalPolicy: "bypass", invoke: false });
+    await runtime.handle(base);
+    const options = fake.calls[0]!.options, hook = options.hooks.PreToolUse[0].hooks[0];
+    for (const tool of ["Bash", "Write", "Edit", "Workflow", "Task", "SpawnAgent"]) {
+      expect(await hook({ tool_name: tool, tool_input: {} })).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+      expect(await options.canUseTool(tool, {})).toMatchObject({ behavior: "deny" });
+    }
+  });
+
   it.each(["Execute", "Create", "Edit"] as const)("asks before publishing %s and then forwards the exact approved action", async original => {
     const { runtime, fake, base, control } = setup({ original });
     const first = await runtime.handle(base), question = callFrom(first);

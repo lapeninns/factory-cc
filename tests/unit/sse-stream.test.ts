@@ -147,6 +147,22 @@ describe("SSE keepalive", () => {
     writer.dispose();
   });
 
+  it("publishes queue activity immediately without adding model content", () => {
+    vi.useFakeTimers();
+    const { res, text } = collect();
+    const writer = new SseWriter(res, { id: "msg_queued", model: "relay-chat" });
+    writer.activity();
+    expect(writer.headersSent).toBe(true);
+    expect(text()).toContain("event: message_start");
+    expect(contentFromSse(text())).toEqual([]);
+    vi.advanceTimersByTime(15_000);
+    expect(pings(text())).toBe(1);
+    writer.fail(new BridgeError(503, "desktop_job_timeout", "Queue deadline reached", { retry_safe: true, phase: "admission" }));
+    expect(text()).toContain('"retry_safe":true');
+    expect(text()).not.toContain("event: message_stop");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it.each([
     ["finishes", (writer: SseWriter) => writer.finish(assistantMessage("relay-chat", [{ type: "text", text: "done" }], "end_turn"))],
     ["fails", (writer: SseWriter) => writer.fail(new BridgeError(504, "request_timeout", "timed out"))],

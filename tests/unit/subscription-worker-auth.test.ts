@@ -5,8 +5,17 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { prepareSubscription, sanitizedSubscriptionEnvironment, verifyNativeSubscription, type SubscriptionIdentity } from "../../src/workers/subscription-auth.js";
 
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  return { ...actual, userInfo: vi.fn(actual.userInfo) };
+});
+
+const actualUser = userInfo();
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+afterEach(() => {
+  vi.mocked(userInfo).mockReturnValue(actualUser);
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
 function fixture() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "subscription-auth-")));
   roots.push(root);
@@ -25,6 +34,35 @@ function fixture() {
 }
 
 describe("fixed-seat subscription worker authentication", () => {
+  it("keeps the default login CLI pinned when the mutable launcher is updated", async () => {
+    const f = fixture();
+    vi.mocked(userInfo).mockReturnValue({ ...actualUser, homedir: f.root });
+    const versions = join(f.root, ".local/share/claude/versions");
+    const bin = join(f.root, ".local/bin");
+    mkdirSync(versions, { recursive: true });
+    mkdirSync(bin, { recursive: true });
+    const pinned = join(versions, "2.1.316"), updated = join(versions, "2.1.317");
+    writeFileSync(pinned, "pinned-login-cli", { mode: 0o700 });
+    writeFileSync(updated, "updated-login-cli", { mode: 0o700 });
+    symlinkSync(updated, join(bin, "claude"));
+
+    const prepared = await prepareSubscription("team1", { mappingPath: f.mappingPath, runCli: f.runCli });
+    expect(prepared.runtime.executable).toBe(pinned);
+    expect(f.runCli.mock.calls.every(([executable]) => executable === pinned)).toBe(true);
+  });
+
+  it("reports a missing pinned login CLI without falling back to the mutable launcher", async () => {
+    const f = fixture();
+    vi.mocked(userInfo).mockReturnValue({ ...actualUser, homedir: f.root });
+    const bin = join(f.root, ".local/bin");
+    mkdirSync(bin, { recursive: true });
+    symlinkSync(f.executable, join(bin, "claude"));
+
+    await expect(prepareSubscription("team1", { mappingPath: f.mappingPath, runCli: f.runCli }))
+      .rejects.toThrow("Verify the pinned Claude CLI 2.1.316 installation");
+    expect(f.runCli).not.toHaveBeenCalled();
+  });
+
   it("selects exactly the configured profile and exposes only sanitized environment", async () => {
     const f = fixture();
     const prepared = await prepareSubscription("team1", { ...f, sourceEnv: {

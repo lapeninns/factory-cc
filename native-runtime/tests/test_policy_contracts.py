@@ -50,6 +50,26 @@ class PolicyBundleTests(unittest.TestCase):
         self.assertIn("once per branch", text)
         self.assertIn("not a hard agent", text)
 
+    def test_routine_decisions_preserve_user_authority_and_essential_questions(self):
+        text = " ".join((ROOT / "policies" / "team-policy.md").read_text().split())
+        for instruction in (
+            "routine, reversible decisions within the user's existing task scope and authority",
+            "choose the recommended option, record a concise assumption",
+            "proceed without asking for confirmation",
+            "choose the best safe, reversible default",
+            "Ask only for essential missing information or new permissions",
+            "cannot be retrieved or reasonably inferred",
+            "materially affects the requested result",
+            "Honor an explicit user instruction to ask, wait or obtain approval",
+            "Preserve spec and planning modes and their execution restrictions",
+            "repository, workspace, sandbox and runtime approval controls",
+            "A recommended label is not consent",
+            "Never fabricate a user answer, synthesize an approval response",
+            "Surface authentication and credential failures accurately",
+        ):
+            with self.subTest(instruction=instruction):
+                self.assertIn(instruction, text)
+
 
 if __name__ == "__main__":
     unittest.main()

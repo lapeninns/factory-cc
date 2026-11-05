@@ -45,6 +45,19 @@ afterEach(() => {
 });
 
 describe("fixed subscription Desktop admission", () => {
+  it("requires explicit immutable approval bypass on the host-enabled subscription pool", () => {
+    expect(controllerPool({ controllerHostTools: true }).controllerApprovalPolicy).toBe("ask");
+    const value = controllerPool({ controllerHostTools: true, controllerApprovalPolicy: "bypass" });
+    expect(value.controllerApprovalPolicy).toBe("bypass");
+    expect(value.permissionMode).toBe("ask");
+    expect(() => Object.defineProperty(value, "controllerApprovalPolicy", { value: "ask" })).toThrow();
+    expect(() => controllerPool({ controllerApprovalPolicy: "bypass" })).toThrow(/bypass requires/);
+    expect(() => controllerPool({ controllerHostTools: true, controllerApprovalPolicy: "always" as never })).toThrow(/must be ask or bypass/);
+    expect(() => config({ controllerApprovalPolicy: "bypass" })).toThrow(/bypass requires/);
+    vi.stubEnv("BRIDGE_CONTROLLER_APPROVAL_POLICY", "bypass");
+    expect(controllerPool({ controllerHostTools: true }).controllerApprovalPolicy).toBe("ask");
+  });
+
   it("requires explicit immutable host-tools opt-in on the pooled controller", () => {
     expect(controllerPool().controllerHostTools).toBe(false);
     const value = controllerPool({ controllerHostTools: true });

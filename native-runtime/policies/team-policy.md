@@ -19,8 +19,8 @@ granted authority take precedence over a default in this policy.
   committed revision; uncommitted source changes are not copied automatically.
   An explicitly enabled Factory host-operations controller may work in an owned
   ordinary directory without Git. Do not initialize Git or invent a revision
-  for a folder task. Its shell commands and file changes use the host's exact
-  action approval flow; coding workers still use isolated Git worktrees.
+  for a folder task. Its shell commands and file changes respect the configured
+  approval policy and Factory permissions; coding workers use isolated workspaces.
   Do not reset, clean, overwrite, delete or incorporate another person's work.
   An explicit request to use a shared checkout needs coordinated exclusive
   ownership, rather than two writers in the same directory.
@@ -33,9 +33,23 @@ granted authority take precedence over a default in this policy.
 
 ## Execute within the task
 
-- Make reasonable reversible implementation decisions and record significant
-  assumptions. Continue independent authorised work while a later decision is
-  pending. Ask only when missing information or authority blocks the next step.
+- For routine, reversible decisions within the user's existing task scope and
+  authority, choose the recommended option, record a concise assumption and
+  proceed without asking for confirmation. If no recommendation is available,
+  choose the best safe, reversible default. Do not ask the user to choose between
+  equivalent implementation details.
+- Ask only for essential missing information or new permissions. Information is
+  essential only when it cannot be retrieved or reasonably inferred from the
+  available context and materially affects the requested result. Continue
+  independent authorised work while awaiting an essential answer. Reuse
+  permissions already granted for the same scope.
+- Honor an explicit user instruction to ask, wait or obtain approval for a
+  particular decision. Preserve spec and planning modes and their execution
+  restrictions, along with repository, workspace, sandbox and runtime approval
+  controls. A recommended label is not consent. Never fabricate a user answer,
+  synthesize an approval response or bypass an actual permission gate because an
+  option is recommended. Surface authentication and credential failures
+  accurately and request any essential access or permission that is missing.
 - Parallelise independent work with disjoint ownership. Give a delegated worker
   the outcome, owned paths, relevant inputs, acceptance checks and permitted
   delivery actions. Do not assume it sees the parent conversation.

@@ -37,7 +37,7 @@ export async function startWorkerControl(controller: ApprovalController, path: s
       if (!pending || approvalDigest(pending.input) !== body.actionDigest) { response.writeHead(409).end(); return; }
       const summary = approvalSummary(pending);
       if (body.summary !== summary || summary.length > MAX_WORKER_APPROVAL_SUMMARY_CHARS) { response.writeHead(409).end(); return; }
-      controller.approve({ id: body.id, approvalId: body.approvalId, decision: body.decision });
+      await controller.approve({ id: body.id, approvalId: body.approvalId, decision: body.decision });
       response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ ok: true, decision: body.decision }));
     } catch { response.writeHead(400).end(JSON.stringify({ ok: false })); }
   });

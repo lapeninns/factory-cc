@@ -39,7 +39,7 @@ export interface PreparedSubscription {
 }
 
 function failure(): Error {
-  return new Error("Subscription authentication failed. Use this connection's assigned Team seat through native Claude login; no other account or API route will be selected.");
+  return new Error(`Subscription authentication failed. Verify the pinned Claude CLI ${EXPECTED_CLI_VERSION} installation and this connection's assigned Team seat through native Claude login; no other account or API route will be selected.`);
 }
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -105,10 +105,12 @@ export async function prepareSubscription(profile: string, options: Subscription
     const home = userInfo().homedir;
     const identity = readMapping(options.mappingPath ?? join(home, ".factory/config/native-ultracode-profiles.json"), profile);
     const env = sanitizedSubscriptionEnvironment(options.sourceEnv ?? process.env, identity.configDir);
-    const selectedExecutable = options.executable ?? join(home, ".local/bin/claude");
+    // The login CLI has its own verified version. The mutable launcher can
+    // advance independently of the separately pinned native workflow runtime.
+    const selectedExecutable = options.executable ?? join(home, ".local/share/claude/versions", EXPECTED_CLI_VERSION);
     if (!isAbsolute(selectedExecutable)) throw failure();
-    // Resolve the official installation symlink once so retargeting it cannot
-    // switch executables between the version and identity checks.
+    // Resolve once so an explicitly supplied symlink cannot switch executables
+    // between the version and identity checks.
     const executable = realpathSync(selectedExecutable), info = lstatSync(executable);
     if (!info.isFile() || !owned(info) || (info.mode & 0o022) !== 0 || (info.mode & 0o111) === 0) throw failure();
     const sdkPath = dirname(createRequire(import.meta.url).resolve("@anthropic-ai/claude-agent-sdk"));

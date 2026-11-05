@@ -17,6 +17,8 @@ export interface DesktopJobRelease {
   sdkSessionId?: string;
   /** Applies to tracked runtime processes, not arbitrary daemonisation. */
   cleanupVerified?: boolean;
+  /** A published host action keeps its workspace, without occupying inference. */
+  hostActionReservation?: boolean;
 }
 export interface DesktopJobAcquire {
   factorySessionId: string;
@@ -33,11 +35,14 @@ export interface DesktopLeaseOptions {
   pythonExecutable: string;
   runtimePackagePath: string;
   stateRoot: string;
+  /** Shared worker capacity; the native scheduler reserves one additional controller slot. */
   maxRunning?: number;
   admissionTimeoutMs?: number;
   releaseTimeoutMs?: number;
 }
 export interface DesktopJobsOptions extends DesktopLeaseOptions {
+  /** Exact configured namespace for independently supervised worker tools. */
+  workerMcpPrefix?: string;
   getBinding(input: RuntimeRequest): DesktopJobBinding | undefined;
   acquireLease?(request: DesktopJobAcquire, signal: AbortSignal): Promise<DesktopJobLease>;
   updateRecord?(request: DesktopJobAcquire, result: DesktopJobRelease): Promise<void>;
@@ -62,8 +67,19 @@ interface HeldHostPhase {
   usage?: Usage;
   sdkSessionId?: string;
   uncertain?: boolean;
+  parked?: boolean;
 }
-const HOST_ACTIONS = new Set(["Execute", "Create", "Edit"]);
+const HOST_READ_CONTROL_TOOLS = new Set(["Read", "LS", "Grep", "Glob", "ToolSearch", "AskUser", "ExitSpecMode", "TodoWrite", "ListAgents"]);
+const SUPERVISED_WORKER_TOOLS = new Set(["factory_worker_start", "factory_worker_status", "factory_worker_wait",
+  "factory_worker_list", "factory_worker_cancel", "factory_worker_accounts", "factory_worker_lookup"]);
+
+/** Unknown host tools may write or launch writers and must retain the workspace. */
+export function hostActionNeedsWorkspaceReservation(name: string, workerMcpPrefix?: string): boolean {
+  if (HOST_READ_CONTROL_TOOLS.has(name)) return false;
+  if (workerMcpPrefix && name.startsWith(workerMcpPrefix)
+      && SUPERVISED_WORKER_TOOLS.has(name.slice(workerMcpPrefix.length))) return false;
+  return true;
+}
 
 function failure(code: string, message: string): BridgeError { return new BridgeError(503, code, message); }
 
@@ -112,6 +128,8 @@ export class DesktopJobsRuntime implements BridgeRuntime {
   readonly interrupt?: BridgeRuntime["interrupt"];
   readonly pendingHostCalls?: BridgeRuntime["pendingHostCalls"];
   readonly completeHostTool?: BridgeRuntime["completeHostTool"];
+  readonly validateHostToolCompletion?: BridgeRuntime["validateHostToolCompletion"];
+  readonly recordHostToolCompletion?: BridgeRuntime["recordHostToolCompletion"];
   readonly endHostSession?: BridgeRuntime["endHostSession"];
   readonly protectedSessionIds?: BridgeRuntime["protectedSessionIds"];
   readonly isSessionUsable?: BridgeRuntime["isSessionUsable"];
@@ -127,9 +145,18 @@ export class DesktopJobsRuntime implements BridgeRuntime {
       return inner.interrupt!(sessionId, reason);
     };
     if (inner.pendingHostCalls) this.pendingHostCalls = (id) => inner.pendingHostCalls!(id);
+    if (inner.validateHostToolCompletion) this.validateHostToolCompletion = (...args) => inner.validateHostToolCompletion!(...args);
+    if (inner.recordHostToolCompletion) this.recordHostToolCompletion = async (id, completion) => {
+      const result = await inner.recordHostToolCompletion!(id, completion);
+      if (result === "accepted" || result === "duplicate") await this.acknowledgeHostReceipt(id, completion.toolUseId);
+      return result;
+    };
     if (inner.completeHostTool) this.completeHostTool = async (id, completion) => {
       const result = await inner.completeHostTool!(id, completion);
-      if (result === "accepted") this.heldHost.get(id)?.pending.delete(completion.toolUseId);
+      if (result === "accepted") {
+        if (completion.terminal) this.heldHost.get(id)?.pending.delete(completion.toolUseId);
+        else await this.acknowledgeHostReceipt(id, completion.toolUseId);
+      }
       if (completion.terminal) {
         await this.active.get(id)?.done?.catch(() => undefined);
         const held = this.heldHost.get(id);
@@ -140,11 +167,17 @@ export class DesktopJobsRuntime implements BridgeRuntime {
     };
     if (inner.endHostSession) this.endHostSession = async (id, reason): Promise<RuntimeHostEnd> => {
       this.markUnresolvedHostAction(id);
-      const result = await inner.endHostSession!(id, reason);
+      let result: RuntimeHostEnd;
+      try { result = await inner.endHostSession!(id, reason); }
+      catch (error) {
+        const held = this.heldHost.get(id);
+        if (held) await this.finishHeldHost(id, held, "unknown", false);
+        throw error;
+      }
       await this.active.get(id)?.done?.catch(() => undefined);
       if (!result.resumable) {
         const held = this.heldHost.get(id);
-        if (held) await this.finishHeldHost(id, held, held.pending.size ? "unknown" : "completed");
+        if (held) await this.finishHeldHost(id, held, held.pending.size ? "unknown" : "completed", true);
         else await this.update(id, { state: "completed", sdkSessionId: result.sdkSessionId, cleanupVerified: true });
       }
       return result;
@@ -191,7 +224,7 @@ export class DesktopJobsRuntime implements BridgeRuntime {
     }
     this.known.set(id, request);
     const phase: ActivePhase = { controller: new AbortController(), request,
-      ...(held ? { lease: held.lease, heldHost: held, acknowledgedHostIds: acknowledged } : {}) };
+      ...(held ? { ...(held.parked ? {} : { lease: held.lease }), heldHost: held, acknowledgedHostIds: acknowledged } : {}) };
     this.active.set(id, phase);
     phase.done = this.execute(input, sink, phase);
     return phase.done;
@@ -203,26 +236,31 @@ export class DesktopJobsRuntime implements BridgeRuntime {
     heartbeat.unref();
     try {
       phase.lease ??= await (this.options.acquireLease ?? ((request, signal) => acquireDesktopJobLease(this.options, request, signal)))(phase.request, phase.controller.signal);
+      if (phase.heldHost) { phase.heldHost.lease = phase.lease; phase.heldHost.parked = false; }
       if (phase.controller.signal.aborted) throw failure("desktop_job_cancelled", "The queued Factory job was cancelled.");
       clearInterval(heartbeat);
       const turn = await this.inner.handle(input, sink);
       const cancelledCleanly = phase.cleanup ? await phase.cleanup : undefined;
       if (phase.unresolvedHostIds?.size) {
         await this.finishHeldHost(id, phase.heldHost ?? { request: phase.request, lease: phase.lease,
-          pending: phase.unresolvedHostIds, usage: turn.response.usage, sdkSessionId: turn.sdkSessionId }, "unknown");
+          pending: phase.unresolvedHostIds, usage: turn.response.usage, sdkSessionId: turn.sdkSessionId }, "unknown", cancelledCleanly === true);
         return turn;
       }
       if (phase.request.workspacePolicy === "controller-host" && !phase.outcome) {
         const held: HeldHostPhase = phase.heldHost ?? { request: phase.request, lease: phase.lease, pending: new Set() };
         for (const callId of phase.acknowledgedHostIds ?? []) held.pending.delete(callId);
         for (const block of turn.response.content) {
-          if (block.type === "tool_use" && typeof block.name === "string" && HOST_ACTIONS.has(block.name)
+          if (block.type === "tool_use" && typeof block.name === "string"
+              && hostActionNeedsWorkspaceReservation(block.name, this.options.workerMcpPrefix)
               && typeof block.id === "string" && turn.pendingToolIds.includes(block.id)) held.pending.add(block.id);
         }
         held.usage = addUsage(held.usage, turn.response.usage);
         held.sdkSessionId = turn.sdkSessionId ?? held.sdkSessionId;
         if (held.pending.size) {
           this.heldHost.set(id, held);
+          await phase.lease.release({ state: "waiting_host", usage: held.usage,
+            sdkSessionId: held.sdkSessionId, cleanupVerified: false, hostActionReservation: true });
+          held.parked = true;
           return turn;
         }
         this.heldHost.delete(id);
@@ -239,10 +277,12 @@ export class DesktopJobsRuntime implements BridgeRuntime {
         const held = phase.heldHost ?? this.heldHost.get(id) ?? (phase.unresolvedHostIds?.size
           ? { request: phase.request, lease: phase.lease, pending: phase.unresolvedHostIds } : undefined);
         if (held?.pending.size) {
-          // Cancelling Claude is not proof that an already-published Factory
-          // command stopped. Keep the shared capacity and overlap reservation.
-          await this.inner.cancel(id, "desktop-host-phase-failed").catch(() => undefined);
-          await this.finishHeldHost(id, held, "unknown");
+          // Cancelling Claude cannot establish whether a published Factory
+          // command stopped. Retain its workspace independently of compute.
+          let nativeCleanupVerified = false;
+          try { await this.inner.cancel(id, "desktop-host-phase-failed"); nativeCleanupVerified = true; }
+          catch { this.faults.push("native_cleanup_failed"); }
+          await this.finishHeldHost(id, held, "unknown", nativeCleanupVerified);
           throw error;
         }
         try {
@@ -269,8 +309,12 @@ export class DesktopJobsRuntime implements BridgeRuntime {
   async cancel(sessionId: string, reason: string): Promise<void> {
     const held = this.heldHost.get(sessionId);
     if (held && !this.active.has(sessionId)) {
-      await this.inner.cancel(sessionId, reason);
-      await this.finishHeldHost(sessionId, held, held.pending.size ? "unknown" : "cancelled");
+      try { await this.inner.cancel(sessionId, reason); }
+      catch (error) {
+        await this.finishHeldHost(sessionId, held, "unknown", false);
+        throw error;
+      }
+      await this.finishHeldHost(sessionId, held, held.pending.size ? "unknown" : "cancelled", true);
       if (held.pending.size) throw failure("desktop_host_cleanup_unknown", "The host action may still be running; its workspace remains reserved.");
       return;
     }
@@ -283,6 +327,8 @@ export class DesktopJobsRuntime implements BridgeRuntime {
     if (phase) { phase.outcome = "cancelled"; phase.cleanup = cleanup; phase.controller.abort(); }
     const cleanupVerified = await cleanup;
     if (phase?.done) await phase.done.catch(() => undefined);
+    const unresolved = this.heldHost.get(sessionId);
+    if (unresolved?.pending.size && !unresolved.uncertain) await this.finishHeldHost(sessionId, unresolved, "unknown", cleanupVerified);
     if (this.heldHost.get(sessionId)?.uncertain) {
       throw failure("desktop_host_cleanup_unknown", "The host action may still be running; its workspace remains reserved.");
     }
@@ -307,15 +353,28 @@ export class DesktopJobsRuntime implements BridgeRuntime {
     await (this.options.updateRecord ?? ((item, outcome) => updateDesktopJobRecord(this.options, item, outcome)))(request, result);
   }
 
-  private async finishHeldHost(id: string, held: HeldHostPhase, state: "unknown" | "completed" | "cancelled"): Promise<void> {
+  private async acknowledgeHostReceipt(id: string, toolUseId: string): Promise<void> {
+    const held = this.heldHost.get(id);
+    if (!held) return;
+    held.pending.delete(toolUseId);
+    if (!held.pending.size && !this.active.has(id)) {
+      await this.update(id, { state: "waiting_host", cleanupVerified: false, hostActionReservation: false });
+      this.heldHost.delete(id);
+    }
+  }
+
+  private async finishHeldHost(id: string, held: HeldHostPhase, state: "unknown" | "completed" | "cancelled", nativeCleanupVerified = false): Promise<void> {
     const wasUncertain = held.uncertain === true;
     if (state === "unknown") {
       held.uncertain = true;
       this.heldHost.set(id, held);
     }
-    const result = { state, usage: held.usage, sdkSessionId: held.sdkSessionId, cleanupVerified: state !== "unknown" };
-    if (wasUncertain && state !== "unknown") await this.update(id, result);
-    else await held.lease.release(result);
+    const result = { state, usage: held.usage, sdkSessionId: held.sdkSessionId,
+      cleanupVerified: state !== "unknown" || nativeCleanupVerified };
+    const reservation = { ...result, hostActionReservation: state === "unknown" };
+    if (held.parked || (wasUncertain && state !== "unknown")) await this.update(id, reservation);
+    else await held.lease.release(reservation);
+    held.parked = true;
     if (state === "unknown") {
       held.uncertain = true;
       this.heldHost.set(id, held);
@@ -326,7 +385,8 @@ export class DesktopJobsRuntime implements BridgeRuntime {
   private markUnresolvedHostAction(id: string): void {
     const phase = this.active.get(id);
     if (phase?.request.workspacePolicy !== "controller-host" || !phase.lease) return;
-    const pending = (this.inner.pendingHostCalls?.(id) ?? []).filter(call => HOST_ACTIONS.has(call.toolName));
+    const pending = (this.inner.pendingHostCalls?.(id) ?? [])
+      .filter(call => hostActionNeedsWorkspaceReservation(call.toolName, this.options.workerMcpPrefix));
     if (pending.length) {
       phase.unresolvedHostIds = new Set(pending.map(call => call.toolUseId));
       phase.outcome = "unknown";
@@ -334,10 +394,11 @@ export class DesktopJobsRuntime implements BridgeRuntime {
   }
 
   describe(): Record<string, unknown> {
+    const workerSlots = this.options.maxRunning ?? 2;
     return { ...this.inner.describe?.(), desktopJobs: { activePhases: this.active.size,
-      maxRunning: this.options.maxRunning ?? 2, faults: this.faults.slice(-32),
+      maxRunning: workerSlots + 1, workerSlots, controllerSlots: 1, faults: this.faults.slice(-32),
       heldHostActions: this.heldHost.size,
-      scope: "active model phases; parked native sessions remain managed by the inner runtime" } };
+      scope: "active model phases; host action workspace reservations do not occupy compute; parked native processes remain managed by the inner runtime" } };
   }
 
   async close(): Promise<void> {
@@ -374,6 +435,8 @@ class LeaseChannel {
   private buffer = "";
   private settled = false;
   private admitted = false;
+  private deferring = false;
+  private deferred = false;
 
   constructor(options: DesktopLeaseOptions, first: WireMessage, private readonly signal?: AbortSignal) {
     if (!isAbsolute(options.pythonExecutable) || !isAbsolute(options.runtimePackagePath) || !isAbsolute(options.stateRoot)) throw new Error("Desktop supervisor paths must be absolute.");
@@ -388,7 +451,7 @@ class LeaseChannel {
       "--max-running", String(options.maxRunning ?? 2)], { stdio: ["pipe", "pipe", "pipe"],
       env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "", LC_ALL: "C",
         PYTHONPATH: packagePath, PYTHONDONTWRITEBYTECODE: "1" } });
-    this.timer = setTimeout(() => this.fail("desktop_job_timeout", "The Factory job admission timed out."), options.admissionTimeoutMs ?? 300_000);
+    this.timer = setTimeout(() => this.deferAdmission(options.releaseTimeoutMs ?? 5_000), options.admissionTimeoutMs ?? 300_000);
     this.timer.unref();
     this.child.stdout.on("data", (data: Buffer) => this.consume(data));
     // Error diagnostics from the helper may contain paths; never relay raw text.
@@ -400,7 +463,12 @@ class LeaseChannel {
       signal?.removeEventListener("abort", this.abort);
       if (this.settled) return;
       this.settled = true;
-      if (code === 0 && this.finalMessage) this.resolveExit();
+      if (code === 0 && this.finalMessage) {
+        this.resolveExit();
+        if (this.deferred) this.rejectReady(new BridgeError(503, "desktop_job_timeout",
+          "The scheduler deferred this request before model execution. Retry the same continuation.",
+          { retry_safe: true, phase: "admission" }));
+      }
       else this.rejectExit(failure("desktop_job_channel", "The Factory job helper ended without a verified release."));
       this.rejectReady(failure(signal?.aborted ? "desktop_job_cancelled" : "desktop_job_channel", "The Factory job helper ended before admission."));
     });
@@ -433,15 +501,27 @@ class LeaseChannel {
       }
       if (message.event === "ready") {
         clearTimeout(this.timer);
+        if (this.deferring) continue;
         if (this.signal?.aborted) this.abort();
         else {
           this.admitted = true;
           this.signal?.removeEventListener("abort", this.abort);
           this.resolveReady(message.jobId);
         }
+      } else if (message.event === "deferred" && this.deferring) {
+        this.deferred = true;
+        this.finalMessage = true;
       } else if (message.event === "released" || message.event === "updated" || message.event === "cancelled") this.finalMessage = true;
       else if (message.event !== "queued") this.fail("desktop_job_protocol", "Invalid Factory job helper response.");
     }
+  }
+  private deferAdmission(timeoutMs: number): void {
+    if (this.settled || this.admitted) return;
+    this.deferring = true;
+    this.send({ op: "defer" });
+    this.timer = setTimeout(() => this.fail("desktop_job_timeout",
+      "The scheduler admission deadline elapsed without a confirmed deferral."), timeoutMs);
+    this.timer.unref();
   }
   private fail(code: string, message: string, status = 503): void {
     if (this.settled) return;
@@ -473,6 +553,7 @@ function safeRelease(result: DesktopJobRelease): WireMessage {
     if (Number.isSafeInteger(value) && value! >= 0) usage[key] = value!;
   }
   return { state: result.state, cleanupVerified: result.cleanupVerified === true,
+    ...(result.hostActionReservation === undefined ? {} : { hostActionReservation: result.hostActionReservation }),
     ...(result.sdkSessionId ? { sdkSessionId: result.sdkSessionId } : {}), ...(Object.keys(usage).length ? { usage } : {}) };
 }
 

@@ -36,6 +36,11 @@ export class SseWriter {
     return this.started;
   }
 
+  /** Publish accepted, waiting work without inventing model content. */
+  activity(): void {
+    this.start();
+  }
+
   start(usage?: Pick<Usage, "input_tokens">): void {
     if (this.started || this.finished || this.res.destroyed) return;
     this.inputTokens = usage?.input_tokens ?? 0;

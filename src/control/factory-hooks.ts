@@ -1,18 +1,20 @@
 import { randomUUID } from "node:crypto";
-import { chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, fstatSync, readFileSync, readSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const FACTORY_HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionEnd", "Notification", "Stop", "SubagentStop"] as const;
 const MAX_HOOK_BYTES = 4 * 1024 * 1024;
+const MAX_SESSION_SETTINGS_BYTES = 128 * 1024;
 const CONFIG_FLAG = "--factory-cc-hook-config";
 const DESKTOP_FLAG = "--factory-cc-desktop-lifecycle";
 const DEFAULT_BINDING_ENV = "BRIDGE_FACTORY_BINDING";
 const BINDING_ENV_NAMES = new Set([DEFAULT_BINDING_ENV, "BRIDGE_FACTORY_BINDING_POOL", ...Array.from({ length: 8 }, (_, index) => `BRIDGE_FACTORY_BINDING_TEAM${index + 1}`)]);
 
 type JsonObject = Record<string, unknown>;
-interface HookConfig { url: string; hookToken?: string; command?: string; desktopLifecycle?: boolean; bindingEnv?: string }
+export interface FactoryHookModelScope { modelIds: string[]; sessionsDir: string }
+interface HookConfig { url: string; hookToken?: string; command?: string; desktopLifecycle?: boolean; bindingEnv?: string; modelScope?: FactoryHookModelScope }
 export interface FactoryHookInstallOptions {
   hooksPath: string;
   configPath: string;
@@ -24,6 +26,8 @@ export interface FactoryHookInstallOptions {
   desktopLifecycle?: boolean;
   /** Keep each fixed-seat controller's lifecycle generation separate. */
   bindingEnv?: string;
+  /** Apply this hook only to sessions whose persisted selected model matches. */
+  modelScope?: FactoryHookModelScope;
 }
 
 function object(value: unknown): value is JsonObject {
@@ -35,6 +39,41 @@ function bindingEnvironment(value: unknown = DEFAULT_BINDING_ENV): string {
     throw new Error("Invalid Factory binding environment name");
   }
   return value;
+}
+
+function modelScope(value: unknown): FactoryHookModelScope {
+  if (!object(value) || typeof value.sessionsDir !== "string" || !isAbsolute(value.sessionsDir)
+      || !Array.isArray(value.modelIds) || value.modelIds.length === 0 || value.modelIds.length > 64
+      || value.modelIds.some(id => typeof id !== "string" || !id.trim() || id !== id.trim() || id.length > 512)
+      || new Set(value.modelIds).size !== value.modelIds.length) {
+    throw new Error("Invalid Factory hook model scope");
+  }
+  return { sessionsDir: resolve(value.sessionsDir), modelIds: [...value.modelIds] as string[] };
+}
+
+/** Droid saves this small settings file before SessionStart. Never inspect transcript content. */
+function sessionModelMatches(scope: FactoryHookModelScope, event: unknown): boolean {
+  if (!object(event) || typeof event.session_id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(event.session_id)
+      || typeof event.transcript_path !== "string" || !isAbsolute(event.transcript_path)
+      || event.transcript_path !== resolve(event.transcript_path)
+      || basename(event.transcript_path) !== event.session_id + ".jsonl") return false;
+  let fd: number | undefined;
+  try {
+    const root = realpathSync(scope.sessionsDir);
+    const parent = realpathSync(dirname(event.transcript_path));
+    const within = relative(root, parent);
+    if (within === ".." || within.startsWith(".." + sep) || isAbsolute(within)) return false;
+    fd = openSync(join(parent, event.session_id + ".settings.json"), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const info = fstatSync(fd);
+    if (!info.isFile() || (process.getuid && info.uid !== process.getuid()) || info.mode & 0o022
+        || info.size > MAX_SESSION_SETTINGS_BYTES) return false;
+    const bytes = Buffer.alloc(MAX_SESSION_SETTINGS_BYTES + 1);
+    const length = readSync(fd, bytes, 0, bytes.length, 0);
+    if (length > MAX_SESSION_SETTINGS_BYTES) return false;
+    const settings: unknown = JSON.parse(bytes.subarray(0, length).toString("utf8"));
+    return object(settings) && typeof settings.model === "string" && scope.modelIds.includes(settings.model);
+  } catch { return false; }
+  finally { if (fd !== undefined) closeSync(fd); }
 }
 
 export function factoryHookEndpoint(base: string): string {
@@ -97,6 +136,7 @@ function withoutCommand(groups: unknown[], command: string): unknown[] {
 export function installFactoryHooks(options: FactoryHookInstallOptions): { hooksPath: string; configPath: string; events: readonly string[] } {
   factoryHookEndpoint(options.url);
   const bindingEnv = bindingEnvironment(options.bindingEnv);
+  const scope = options.modelScope === undefined ? undefined : modelScope(options.modelScope);
   if (!options.hookToken.trim()) throw new Error("Factory hooks require a nonempty hook token");
   if (!isAbsolute(options.hooksPath) || !isAbsolute(options.configPath)) throw new Error("Factory hook paths must be absolute");
   if (resolve(options.hooksPath) === resolve(options.configPath)) throw new Error("Factory hooks and private configuration require separate paths");
@@ -116,6 +156,7 @@ export function installFactoryHooks(options: FactoryHookInstallOptions): { hooks
   // Credentials never occur in hooks.json, process argv, or the return value.
   privateWrite(options.configPath, `${JSON.stringify({ url: options.url, hookToken: options.hookToken, command,
     ...(options.bindingEnv === undefined ? {} : { bindingEnv }),
+    ...(scope === undefined ? {} : { modelScope: scope }),
     ...(options.desktopLifecycle ? { desktopLifecycle: true } : {}) })}\n`);
   privateWrite(options.hooksPath, `${JSON.stringify(hooks, null, 2)}\n`);
   return { hooksPath: options.hooksPath, configPath: options.configPath, events: FACTORY_HOOK_EVENTS };
@@ -146,6 +187,7 @@ function readConfig(path: string): HookConfig {
     throw new Error("Invalid private Factory hook configuration");
   }
   if (config.bindingEnv !== undefined) bindingEnvironment(config.bindingEnv);
+  const scope = config.modelScope === undefined ? undefined : modelScope(config.modelScope);
   const hookToken = typeof config.hookToken === "string" && config.hookToken.trim() ? config.hookToken : undefined;
   const legacyAdmin = typeof config.adminToken === "string" && config.adminToken.trim();
   const command = typeof config.command === "string" ? config.command : undefined;
@@ -155,7 +197,8 @@ function readConfig(path: string): HookConfig {
   // Keep existing installations private even if an external editor broadened permissions.
   chmodSync(path, 0o600);
   return { url: config.url, hookToken, command, desktopLifecycle: config.desktopLifecycle === true,
-    ...(config.bindingEnv === undefined ? {} : { bindingEnv: config.bindingEnv as string }) };
+    ...(config.bindingEnv === undefined ? {} : { bindingEnv: config.bindingEnv as string }),
+    ...(scope === undefined ? {} : { modelScope: scope }) };
 }
 
 export async function forwardFactoryHook(
@@ -238,6 +281,12 @@ export async function factoryHookMain(argv = process.argv.slice(2), env: NodeJS.
   try { event = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { throw new Error("Invalid Factory lifecycle hook JSON"); }
   const bindingEnv = bindingEnvironment(config.bindingEnv);
   const bindingToken = env[bindingEnv];
+  // A global hook must leave other model connections untouched, including
+  // legacy sessions with no binding for this bridge. A previously owned end
+  // event may still settle its generation after the selected model changes.
+  const ownedSessionEnd = object(event) && event.hook_event_name === "SessionEnd"
+    && typeof bindingToken === "string" && /^[a-f0-9]{64}$/.test(bindingToken);
+  if (config.modelScope && !sessionModelMatches(config.modelScope, event) && !ownedSessionEnd) return;
   if (desktopLifecycle && object(event) && event.hook_event_name === "SessionStart"
       && (typeof event.CLAUDE_ENV_FILE !== "string" || !isAbsolute(event.CLAUDE_ENV_FILE))) {
     throw new Error("Direct Desktop SessionStart requires its official environment file");

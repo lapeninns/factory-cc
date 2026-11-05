@@ -37,6 +37,7 @@ export async function startWorkerMcp<T extends WorkerController>(factory: () => 
   const proxy: WorkerController = {
     start: input => controller!.start(input), status: id => controller!.status(id),
     list: () => controller!.list(), cancel: id => controller!.cancel(id),
+    lookup: (operationId, operationOwner) => controller!.lookup?.(operationId, operationOwner) ?? { found: false },
   };
   const server = await serveWorkerMcp(proxy, { ...options, ready: () => controller !== undefined });
   try { controller = factory(); return { server, controller }; }

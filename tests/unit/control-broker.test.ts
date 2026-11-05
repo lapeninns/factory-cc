@@ -372,3 +372,66 @@ describe("authentic Factory lifecycle", () => {
     expect(f.broker.describe().failures).toEqual(["host_cleanup_failed"]);
   });
 });
+
+describe("durable authenticated host completion", () => {
+  async function setup() {
+    const f = fixture();
+    const token = (await f.send("SessionStart")).bindingToken as string;
+    const id = f.session();
+    const call = { toolUseId: "host-read", toolName: "Execute", input: { command: "read fixture" } };
+    f.calls.set(id, [call]);
+    f.store.update(id, { pendingToolIds: [call.toolUseId] });
+    f.broker.bind(token, id);
+    return { ...f, token, id, call };
+  }
+
+  it("persists the exact completed action before queuing it and retains continuation ownership", async () => {
+    const f = await setup();
+    const order: string[] = [];
+    const persist = f.store.recordHostCompletion.bind(f.store);
+    vi.spyOn(f.store, "recordHostCompletion").mockImplementation((id, completion) => {
+      order.push("persist");
+      return persist(id, completion);
+    });
+    f.runtime.validateHostToolCompletion = vi.fn(() => { order.push("validate"); });
+    f.runtime.recordHostToolCompletion = vi.fn(async () => {
+      order.push("queue");
+      expect(f.store.require(f.id).hostCompletionReceipts).toMatchObject([{ toolUseId: f.call.toolUseId, content: "read completed" }]);
+      return "accepted" as const;
+    });
+    expect(await f.send("PostToolUse", f.token, { tool_name: f.call.toolName, tool_use_id: f.call.toolUseId,
+      tool_input: f.call.input, tool_response: "read completed" })).toMatchObject({ completionRecorded: true, receipt: "accepted" });
+    expect(order).toEqual(["validate", "persist", "queue"]);
+    expect(f.store.require(f.id).pendingToolIds).toEqual([f.call.toolUseId]);
+    expect(f.runtime.completeHostTool).not.toHaveBeenCalled();
+  });
+
+  it("rejects a conflicting receipt without releasing a runtime reservation", async () => {
+    const f = await setup();
+    f.runtime.recordHostToolCompletion = vi.fn(async () => "accepted" as const);
+    const event = { tool_name: f.call.toolName, tool_use_id: f.call.toolUseId, tool_input: f.call.input, tool_response: "completed once" };
+    await f.send("PostToolUse", f.token, event);
+    await expect(f.send("PostToolUse", f.token, { ...event, tool_response: "different result" }))
+      .rejects.toMatchObject({ code: "conflicting_host_completion" });
+    expect(f.runtime.recordHostToolCompletion).toHaveBeenCalledTimes(1);
+  });
+
+  it("never persists or queues a receipt rejected by live runtime validation", async () => {
+    const f = await setup();
+    f.runtime.validateHostToolCompletion = vi.fn(() => { throw new Error("inactive native action"); });
+    f.runtime.recordHostToolCompletion = vi.fn(async () => "accepted" as const);
+    await expect(f.send("PostToolUse", f.token, { tool_name: f.call.toolName, tool_use_id: f.call.toolUseId,
+      tool_input: f.call.input, tool_response: "done" })).rejects.toThrow("inactive native action");
+    expect(f.store.require(f.id).hostCompletionReceipts).toBeUndefined();
+    expect(f.runtime.recordHostToolCompletion).not.toHaveBeenCalled();
+  });
+
+  it("keeps runtime reservations when durable persistence fails", async () => {
+    const f = await setup();
+    vi.spyOn(f.store, "recordHostCompletion").mockImplementation(() => { throw new Error("journal unavailable"); });
+    f.runtime.recordHostToolCompletion = vi.fn(async () => "accepted" as const);
+    await expect(f.send("PostToolUse", f.token, { tool_name: f.call.toolName, tool_use_id: f.call.toolUseId,
+      tool_input: f.call.input, tool_response: "done" })).rejects.toThrow("journal unavailable");
+    expect(f.runtime.recordHostToolCompletion).not.toHaveBeenCalled();
+  });
+});

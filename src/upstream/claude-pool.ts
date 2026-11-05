@@ -1,3 +1,5 @@
+import { BridgeError } from "../types.js";
+
 /** Menu entries `pool/<model>` carry this profile id; each new session is assigned a real account. */
 export const POOL_PROFILE = "pool";
 /** The default Claude Code login (no extra profile directory). */
@@ -32,8 +34,11 @@ export class ClaudePool {
   pick(): string {
     const at = this.now();
     const ready = this.members.filter((member) => (this.coolUntil.get(member.id) ?? 0) <= at);
-    // Every account is cooling: use the one that recovers first rather than refuse work.
-    if (!ready.length) return [...this.members].sort((a, b) => this.coolUntil.get(a.id)! - this.coolUntil.get(b.id)!)[0]!.id;
+    if (!ready.length) {
+      const earliest = Math.min(...this.members.map(member => this.coolUntil.get(member.id) ?? at));
+      throw new BridgeError(429, "rate_limit_error", "All configured accounts are cooling. Retry after the earliest recovery.",
+        { retry_after: Math.max(1, Math.ceil((earliest - at) / 1000)), usage_limit: true });
+    }
     const total = ready.reduce((sum, member) => sum + member.weight, 0);
     let best = ready[0]!;
     for (const member of ready) {

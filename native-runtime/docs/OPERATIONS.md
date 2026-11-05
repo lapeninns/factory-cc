@@ -61,12 +61,15 @@ supervisor. They do not turn the wrapper into an OS security boundary.
 
 ## Capacity and session behaviour
 
-The initial policy allows one active job per profile and two active jobs across
-the four standalone profiles. Factory integration can admit all eight configured
-profiles through the same shared state root, subject to its explicit concurrency
-limit. Other jobs wait for a slot. This is a conservative starting
-point, not a measured optimum for the Mac. Change it only after observing memory
-pressure, responsiveness, queue wait and workload duration.
+The default policy allows two active worker jobs plus one reserved Factory
+controller, for three concurrent top-level jobs. Each profile can run one job
+in each queue. Both the four standalone profiles and all eight Factory profiles
+use the same shared state root. FIFO ordering applies separately to worker and
+controller requests, so busy workers leave capacity for coordination. Workspace
+conflicts remain global. An uncertain execution holds its queue slot and blocks
+the affected account across both queues until cleanup is verified. Other jobs
+wait for their queue's capacity. Observe memory pressure, responsiveness, queue
+wait and workload duration before increasing these limits.
 
 These admission limits count top-level supervised jobs. They are not a hard cap
 on the agents inside a native workflow, on all other Mac processes, or on other
@@ -216,7 +219,7 @@ OS identities or an authenticated per-person entry point are still required
 for person-level access isolation. This runtime adds no new OS accounts.
 
 The supervised Factory integration shares the native lease scheduler and its
-global and per-seat admission limits. Legacy or unmanaged Factory sessions and
+worker, controller and per-profile admission limits. Legacy or unmanaged Factory sessions and
 jobs launched outside the supervised commands remain outside that scheduler;
 their own limits and usage records do not cover native jobs. Report this
 boundary when describing server-wide capacity or health.

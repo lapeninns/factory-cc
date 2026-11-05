@@ -76,7 +76,7 @@ def prepare_changes(home):
         'from native_runtime.cli import fixed_profile_entry\n'
         'if len(sys.argv) < 2:\n    raise SystemExit("A fixed profile is required.")\n'
         'raise SystemExit(fixed_profile_entry(sys.argv[1], sys.argv[2:]))\n').encode()
-    for n in range(1, 5):
+    for n in range(1, 9):
         changes[home / '.local/bin' / ('claude-team' + str(n) + '-ultracode')] = (
             '#!/bin/sh\nexec /usr/bin/python3 ' + repr(str(home / '.factory/tools/native-team-ultracode.py')) +
             ' team' + str(n) + ' "$@"\n').encode()

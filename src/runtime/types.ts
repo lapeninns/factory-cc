@@ -105,6 +105,10 @@ export interface BridgeRuntime {
    */
   interrupt?(sessionId: string, reason: string): Promise<boolean>;
   pendingHostCalls?(sessionId: string): RuntimeHostCall[];
+  /** Validate an authenticated host receipt without resuming native execution. */
+  validateHostToolCompletion?(sessionId: string, completion: RuntimeHostCompletion): void;
+  /** Record a durable host receipt. Delivery waits for the next admitted phase. */
+  recordHostToolCompletion?(sessionId: string, completion: RuntimeHostCompletion): Promise<"accepted" | "duplicate">;
   completeHostTool?(sessionId: string, completion: RuntimeHostCompletion): Promise<"accepted" | "duplicate">;
   endHostSession?(sessionId: string, reason: string): Promise<RuntimeHostEnd>;
   describe?(): Record<string, unknown>;

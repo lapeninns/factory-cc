@@ -99,3 +99,31 @@ it("runs tool-free requests such as Droid compaction summaries in an empty Bridg
   expect(() => resolveRequestCwd({}, { ...summary, tools: [{ name: "Execute", input_schema: { type: "object" as const } }] }, config, {}))
     .toThrow("Open a project folder in Droid");
 });
+
+it("uses authenticated lifecycle cwd when old or compacted requests omit the environment reminder", () => {
+  const { project, config } = fixture();
+  expect(resolveRequestCwd({}, request("Continue the existing work."), config, {}, project)).toBe(project);
+  const compacted = request([{ type: "text", text: "A previous instance of Droid has summarized the conversation thus far as follows:\nOld work." }, { type: "text", text: "Continue." }]);
+  expect(resolveRequestCwd({}, compacted, config, {}, project)).toBe(project);
+});
+
+it("validates authenticated cwd and refuses conflicting or invalid supplied reminders", () => {
+  const { root, project, config } = fixture();
+  const other = join(root, "other"); mkdirSync(other);
+  expect(() => resolveRequestCwd({}, request([reminder(other)]), config, {}, project))
+    .toThrowError(expect.objectContaining({ code: "host_workspace_mismatch" }));
+  expect(() => resolveRequestCwd({}, request([reminder("/")]), config, {}, project))
+    .toThrowError(expect.objectContaining({ code: "invalid_project_directory" }));
+  for (const invalid of ["/", config.dataDir, join(root, "missing")]) {
+    expect(() => resolveRequestCwd({}, request("Continue."), config, {}, invalid))
+      .toThrowError(expect.objectContaining({ code: "invalid_project_directory" }));
+  }
+});
+
+it("keeps canonical authenticated aliases and refuses an explicit execution override mismatch", () => {
+  const { root, project, config } = fixture();
+  const alias = join(root, "project-alias"); symlinkSync(project, alias);
+  expect(resolveRequestCwd({}, request([reminder(alias)]), config, {}, project)).toBe(project);
+  expect(() => resolveRequestCwd({}, request("Continue."), config, { BRIDGE_SDK_CWD: root }, project))
+    .toThrowError(expect.objectContaining({ code: "host_workspace_mismatch" }));
+});

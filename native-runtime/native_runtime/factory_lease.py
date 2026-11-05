@@ -17,13 +17,16 @@ import time
 
 from .core import (RuntimeConfig, RuntimeRefused, matches, now, process_identity,
                    read_job, state_lock, write_job)
-from .supervisor import OCCUPIED, TERMINAL, _all_jobs, _host_workspace_conflict, _reconcile_locked
+from .supervisor import (CONTROLLER_SLOTS, OCCUPIED, TERMINAL, _all_jobs,
+                         _host_workspace_conflict, _reconcile_locked,
+                         execution_lane, holds_workspace, occupies_compute,
+                         profile_conflicts)
 from .workspace import git
 
 MAX_MESSAGE = 64 * 1024
 ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 RELEASE_STATES = frozenset(("waiting_host", "idle", "completed", "failed", "cancelled", "interrupted", "unknown"))
-UPDATE_STATES = frozenset(("completed", "failed", "cancelled", "interrupted"))
+UPDATE_STATES = frozenset(("idle", "waiting_host", "unknown", "completed", "failed", "cancelled", "interrupted"))
 TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 SUBSCRIPTION_PROFILES = frozenset("team" + str(number) for number in range(1, 9))
 
@@ -82,7 +85,7 @@ def _base_request(request, operation):
         raise ProtocolError("invalid_operation")
     allowed = {"op", "factorySessionId", "bridgeSessionId", "cwd", "role", "subscriptionProfile", "workspacePolicy"}
     if operation == "update":
-        allowed |= {"state", "usage", "sdkSessionId", "cleanupVerified"}
+        allowed |= {"state", "usage", "sdkSessionId", "cleanupVerified", "hostActionReservation"}
     if set(request) - allowed:
         raise ProtocolError("unexpected_fields")
     factory = _identifier(request.get("factorySessionId"))
@@ -147,12 +150,14 @@ def create_or_resume(config, request):
             if existing.get("externalCleanupRequired") or existing.get("state") in OCCUPIED or existing.get("state") == "waiting_slot":
                 raise ProtocolError("lease_already_active_or_uncertain")
             job = existing
+            previous_phase = {key: existing.get(key) for key in ("state", "hostActionReservation")}
             phase = {key: job.get(key) for key in ("attempt", "state", "startedAt", "endedAt")}
             job["attemptHistory"] = (job.get("attemptHistory", []) + [phase])[-32:]
             job["attempt"] = job.get("attempt", 0) + 1
             for key in ("cancelRequestedAt", "endedAt", "admittedAt", "startedAt", "reason"):
                 job.pop(key, None)
         else:
+            previous_phase = {"state": "idle", "hostActionReservation": False}
             if any(_workspace_conflict(job, workspace) and job.get("state") not in TERMINAL
                    and "controller-host" not in (job.get("workspacePolicy"), workspace.get("workspacePolicy"))
                    for job in jobs):
@@ -166,7 +171,8 @@ def create_or_resume(config, request):
             if subscription_profile is not None:
                 job.update(subscriptionProfile=subscription_profile, authMode="subscription")
         job.update(state="waiting_slot", queuedAt=now(), supervisorIdentity=supervisor,
-                   leaseOwnerIdentity=owner, externalCleanupRequired=False)
+                   leaseOwnerIdentity=owner, externalCleanupRequired=False,
+                   admissionPreviousPhase=previous_phase)
         write_job(config, job)
     return job
 
@@ -188,19 +194,23 @@ def reserve(config, job):
             return "cancelled"
         if not matches(job["leaseOwnerIdentity"]):
             return "owner_lost"
-        occupied = [item for item in jobs if item.get("state") in OCCUPIED]
-        if len(occupied) >= config.max_running:
+        occupied = [item for item in jobs if occupies_compute(item)]
+        reserved = [item for item in jobs if holds_workspace(item)]
+        lane = execution_lane(job)
+        lane_limit = CONTROLLER_SLOTS if lane == "controller" else config.max_running
+        if sum(execution_lane(item) == lane for item in occupied) >= lane_limit:
             return "wait"
-        busy_profiles = {item.get("profile") for item in occupied}
         eligible = [item for item in jobs if item.get("state") == "waiting_slot"
-                    and not any(_workspace_conflict(item, running) for running in occupied)
-                    and ((item.get("kind") == "factory-session" and item.get("profile") == "factory-api")
-                         or item.get("profile") not in busy_profiles)]
+                    and execution_lane(item) == lane
+                    and not any(_workspace_conflict(item, running) for running in reserved
+                                if running.get("id") != item.get("id"))
+                    and not profile_conflicts(item, occupied)]
         eligible.sort(key=lambda item: (item.get("queuedAt", ""), item["id"]))
         if not eligible or eligible[0]["id"] != job["id"]:
             return "wait"
         # Persist the conservative lease before telling the bridge it may start.
-        job.update(state="running", admittedAt=now(), startedAt=now(), externalCleanupRequired=True)
+        job.update(state="running", admittedAt=now(), startedAt=now(), externalCleanupRequired=True,
+                   hostActionReservation=False)
         write_job(config, job)
         return "ready"
 
@@ -217,22 +227,46 @@ def _completion_fields(sdk_session_id, cleanup_verified):
     return fields
 
 
-def finish(config, job, state, usage=None, reason="bridge_confirmed_phase_end", sdk_session_id=None, cleanup_verified=None):
+def finish(config, job, state, usage=None, reason="bridge_confirmed_phase_end", sdk_session_id=None, cleanup_verified=None,
+           host_action_reservation=False):
     if not isinstance(state, str) or state not in RELEASE_STATES:
         raise ProtocolError("invalid_release_state")
     counters = _usage(usage)
     fields = _completion_fields(sdk_session_id, cleanup_verified)
+    if not isinstance(host_action_reservation, bool) or (host_action_reservation and (
+            job.get("workspacePolicy") != "controller-host" or state not in ("waiting_host", "unknown"))):
+        raise ProtocolError("invalid_host_action_reservation")
     with state_lock(config):
         current = read_job(config, job["id"])
         if current.get("supervisorIdentity") != job["supervisorIdentity"]:
             raise ProtocolError("lease_generation_changed")
         current.update(state=state, endedAt=now(), externalCleanupRequired=state == "unknown",
-                       reason=reason, cleanupVerified=None, **fields)
+                       reason=reason, cleanupVerified=None, hostActionReservation=host_action_reservation, **fields)
+        current.pop("admissionPreviousPhase", None)
         if counters is not None:
             # Per-phase provider report, not independently verified billing.
             current["reportedPhaseUsage"] = counters
         write_job(config, current)
         return current
+
+
+def defer(config, job):
+    """Return an unexecuted phase to its durable checkpoint after admission timeout."""
+    with state_lock(config):
+        current = read_job(config, job["id"])
+        if current.get("supervisorIdentity") != job["supervisorIdentity"]:
+            raise ProtocolError("lease_generation_changed")
+        previous = current.pop("admissionPreviousPhase", {"state": "idle", "hostActionReservation": False})
+        current.update(state=previous["state"], hostActionReservation=previous.get("hostActionReservation") is True,
+                       externalCleanupRequired=False, reason="admission_deferred_before_execution", endedAt=now())
+        write_job(config, current)
+        return current
+
+
+def cancel_admission(config, job, reason):
+    if job.get("admissionPreviousPhase", {}).get("hostActionReservation") is True:
+        return defer(config, job)
+    return finish(config, job, "cancelled", reason=reason)
 
 
 def uncertain(config, job, reason):
@@ -250,6 +284,10 @@ def update(config, request):
         raise ProtocolError("invalid_update_state")
     counters = _usage(request.get("usage"))
     fields = _completion_fields(request.get("sdkSessionId"), request.get("cleanupVerified"))
+    reservation = request.get("hostActionReservation", False)
+    if not isinstance(reservation, bool) or (reservation and (
+            workspace.get("workspacePolicy") != "controller-host" or state not in ("waiting_host", "unknown"))):
+        raise ProtocolError("invalid_host_action_reservation")
     owner, _ = _owner()
     with state_lock(config):
         job = read_job(config, job_id)
@@ -258,10 +296,11 @@ def update(config, request):
             raise ProtocolError("active_helper_owns_lease")
         if job.get("state") == "waiting_slot":
             raise ProtocolError("queued_helper_owns_lease")
-        if job.get("externalCleanupRequired") and request.get("cleanupVerified") is not True:
+        if job.get("externalCleanupRequired") and request.get("cleanupVerified") is not True and state != "unknown":
             raise ProtocolError("cleanup_confirmation_required")
-        job.update(state=state, endedAt=now(), externalCleanupRequired=False,
-                   reason="bridge_confirmed_session_end", cleanupVerified=None, **fields)
+        job.update(state=state, endedAt=now(), externalCleanupRequired=state == "unknown",
+                   reason="bridge_confirmed_session_end", cleanupVerified=None,
+                   hostActionReservation=reservation, **fields)
         if counters is not None:
             job["reportedPhaseUsage"] = counters
         write_job(config, job)
@@ -327,14 +366,18 @@ def serve(config, input_fd=0):
         while not admitted:
             message = lines.poll(0)
             if message is not None:
+                if message == {"op": "defer"}:
+                    job = defer(config, job)
+                    emit("deferred", job)
+                    return 0
                 if message != {"op": "cancel"}:
                     raise ProtocolError("only_cancel_allowed_while_queued")
-                finish(config, job, "cancelled", reason="cancelled_before_admission")
+                cancel_admission(config, job, "cancelled_before_admission")
                 emit("cancelled", job)
                 return 0
             result = reserve(config, job)
             if result in ("cancelled", "owner_lost"):
-                finish(config, job, "cancelled", reason="cancelled_before_admission")
+                cancel_admission(config, job, "cancelled_before_admission")
                 emit("cancelled", job)
                 return 0
             if result == "ready":
@@ -348,10 +391,17 @@ def serve(config, input_fd=0):
                 if not matches(job["leaseOwnerIdentity"]):
                     raise ProtocolError("bridge_owner_lost")
                 continue
-            if message.get("op") != "release" or set(message) - {"op", "state", "usage", "sdkSessionId", "cleanupVerified"}:
+            if message == {"op": "defer"}:
+                # A ready response can race the bridge's admission timer. The
+                # bridge has not released its model call when it sends defer.
+                job = defer(config, job)
+                emit("deferred", job)
+                return 0
+            if message.get("op") != "release" or set(message) - {"op", "state", "usage", "sdkSessionId", "cleanupVerified", "hostActionReservation"}:
                 raise ProtocolError("release_required_after_admission")
             job = finish(config, job, message.get("state"), message.get("usage"),
-                         sdk_session_id=message.get("sdkSessionId"), cleanup_verified=message.get("cleanupVerified"))
+                         sdk_session_id=message.get("sdkSessionId"), cleanup_verified=message.get("cleanupVerified"),
+                         host_action_reservation=message.get("hostActionReservation", False))
             emit("released", job, state=job["state"])
             return 0
     except (EOFError, ProtocolError, RuntimeRefused, BrokenPipeError) as error:
@@ -359,7 +409,7 @@ def serve(config, input_fd=0):
             if admitted:
                 uncertain(config, job, "bridge_release_unconfirmed")
             else:
-                finish(config, job, "cancelled", reason="lease_connection_ended_before_admission")
+                cancel_admission(config, job, "lease_connection_ended_before_admission")
         # Fixed diagnostics only; inputs and underlying command errors stay private.
         try:
             response = {"ok": False, "error": "factory_lease_refused"}

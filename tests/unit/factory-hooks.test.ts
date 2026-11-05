@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createServer } from "node:http";
@@ -205,5 +205,151 @@ describe("Factory hook forwarding", () => {
     await expect(forwardFactoryHook(config, { ...start, hook_event_name: "Unsupported" }, { fetch: send })).rejects.toThrow("Invalid Factory lifecycle");
     await expect(forwardFactoryHook(config, { ...start, extra: "x".repeat(4 * 1024 * 1024) }, { fetch: send })).rejects.toThrow("size limit");
     expect(send).not.toHaveBeenCalled();
+  });
+});
+
+
+const scopedModel = "custom:Factory-Workstreams-Opus-5.5-eight-account-pool-0";
+const scopedSession = "4d199e9c-1e17-4c19-8498-b94ca53e29bb";
+
+async function scopedHookFixture() {
+  const location = paths();
+  const sessionsDir = join(location.configPath, "../sessions");
+  const sessionDir = join(sessionsDir, "owned-project");
+  mkdirSync(sessionDir, { recursive: true });
+  const settingsPath = join(sessionDir, scopedSession + ".settings.json");
+  const transcriptPath = join(sessionDir, scopedSession + ".jsonl");
+  const envFile = join(sessionDir, "session-env.sh");
+  writeFileSync(settingsPath, JSON.stringify({ model: scopedModel }));
+  writeFileSync(envFile, "export UNRELATED=preserved\n");
+  const received: Array<Record<string, any>> = [];
+  const server = createServer(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk.toString();
+    const envelope = JSON.parse(body);
+    received.push(envelope);
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: true, bindingToken: "a".repeat(64), additionalContext: "scoped-context" }));
+  });
+  await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Missing test listener");
+  installFactoryHooks({ ...location, url: `http://127.0.0.1:${address.port}`, hookToken: "fixture-only-token",
+    desktopLifecycle: true, bindingEnv: "BRIDGE_FACTORY_BINDING_POOL", modelScope: { modelIds: [scopedModel], sessionsDir } });
+  const invoke = async (name: string, options: { bindingToken?: string; event?: Record<string, unknown> } = {}) => {
+    const env = { ...process.env };
+    for (const key of ["BRIDGE_FACTORY_LAUNCH_ID", "BRIDGE_FACTORY_BINDING_POOL", "FORCE_COLOR", "NO_COLOR"]) delete env[key];
+    if (options.bindingToken !== undefined) env.BRIDGE_FACTORY_BINDING_POOL = options.bindingToken;
+    const child = spawn(process.execPath, ["--import", "tsx", resolve("scripts/factory-hook.ts"),
+      "--factory-cc-hook-config", location.configPath, "--factory-cc-desktop-lifecycle"],
+    { env, stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "", stderr = "";
+    child.stdout.on("data", chunk => { stdout += chunk.toString(); });
+    child.stderr.on("data", chunk => { stderr += chunk.toString(); });
+    const timer = setTimeout(() => child.kill("SIGTERM"), 5000);
+    const completed = new Promise<{ code: number | null; stdout: string; stderr: string }>((done, reject) => {
+      child.once("error", reject);
+      child.once("close", code => { clearTimeout(timer); done({ code, stdout, stderr }); });
+    });
+    child.stdin.end(JSON.stringify({ ...start, session_id: scopedSession, transcript_path: transcriptPath,
+      CLAUDE_ENV_FILE: envFile, hook_event_name: name, ...options.event }));
+    return completed;
+  };
+  const close = async () => {
+    server.closeAllConnections();
+    await new Promise<void>(done => server.close(() => done()));
+  };
+  return { ...location, sessionsDir, sessionDir, settingsPath, transcriptPath, envFile, received, invoke, close };
+}
+
+describe("model-scoped Factory lifecycle hooks", () => {
+  it("persists the exact model scope and refuses invalid scope before changing files", () => {
+    const location = paths();
+    const options = { ...location, url: "http://localhost:1", hookToken: "fixture-only-token", desktopLifecycle: true,
+      modelScope: { modelIds: [scopedModel], sessionsDir: join(location.configPath, "../sessions") } };
+    installFactoryHooks(options);
+    expect(JSON.parse(readFileSync(location.configPath, "utf8")).modelScope).toEqual({
+      modelIds: [scopedModel], sessionsDir: resolve(options.modelScope.sessionsDir),
+    });
+    const before = readFileSync(location.hooksPath, "utf8");
+    for (const modelScope of [{ modelIds: [], sessionsDir: "/sessions" }, { modelIds: [scopedModel], sessionsDir: "relative" },
+      { modelIds: [scopedModel, scopedModel], sessionsDir: "/sessions" }, { modelIds: [" "], sessionsDir: "/sessions" }]) {
+      expect(() => installFactoryHooks({ ...options, modelScope })).toThrow("Invalid Factory hook model scope");
+      expect(readFileSync(location.hooksPath, "utf8")).toBe(before);
+    }
+  });
+
+  it("uses only the selected model settings to bind and emit context through the actual entrypoint", async () => {
+    const fixture = await scopedHookFixture();
+    try {
+      // The transcript is intentionally absent. Only the small settings file is needed.
+      expect(existsSync(fixture.transcriptPath)).toBe(false);
+      const startResult = await fixture.invoke("SessionStart");
+      expect(startResult).toMatchObject({ code: 0, stderr: "" });
+      expect(JSON.parse(startResult.stdout)).toMatchObject({ hookSpecificOutput: { additionalContext: "scoped-context" } });
+      expect(readFileSync(fixture.envFile, "utf8")).toContain("export BRIDGE_FACTORY_BINDING_POOL='" + "a".repeat(64) + "'");
+      const prompt = await fixture.invoke("UserPromptSubmit", { bindingToken: "a".repeat(64) });
+      expect(prompt).toMatchObject({ code: 0, stderr: "" });
+      expect(JSON.parse(prompt.stdout)).toMatchObject({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: "scoped-context" } });
+      expect(fixture.received.map(item => item.event.hook_event_name)).toEqual(["SessionStart", "UserPromptSubmit"]);
+    } finally { await fixture.close(); }
+  });
+
+  it("leaves every legacy hook quiet without requiring a candidate binding or touching its environment", async () => {
+    const fixture = await scopedHookFixture();
+    try {
+      writeFileSync(fixture.settingsPath, JSON.stringify({ model: "custom:legacy-pool-0" }));
+      const before = readFileSync(fixture.envFile, "utf8");
+      for (const name of FACTORY_HOOK_EVENTS) {
+        expect(await fixture.invoke(name, { event: { CLAUDE_ENV_FILE: undefined } })).toEqual({ code: 0, stdout: "", stderr: "" });
+      }
+      expect(await fixture.invoke("UserPromptSubmit", { event: { model: scopedModel } })).toEqual({ code: 0, stdout: "", stderr: "" });
+      expect(fixture.received).toEqual([]);
+      expect(readFileSync(fixture.envFile, "utf8")).toBe(before);
+    } finally { await fixture.close(); }
+  });
+
+  it("stops injecting context after a model switch but lets its owned generation end", async () => {
+    const fixture = await scopedHookFixture();
+    try {
+      await fixture.invoke("SessionStart");
+      writeFileSync(fixture.settingsPath, JSON.stringify({ model: "custom:legacy-pool-0" }));
+      expect(await fixture.invoke("UserPromptSubmit", { bindingToken: "a".repeat(64) })).toEqual({ code: 0, stdout: "", stderr: "" });
+      expect(await fixture.invoke("SessionEnd", { bindingToken: "a".repeat(64) })).toEqual({ code: 0, stdout: "", stderr: "" });
+      expect(fixture.received.map(item => item.event.hook_event_name)).toEqual(["SessionStart", "SessionEnd"]);
+      expect(fixture.received[1].bindingToken).toBe("a".repeat(64));
+    } finally { await fixture.close(); }
+  });
+
+  it("ignores mismatched, traversing, foreign and symlinked settings paths without reading transcripts", async () => {
+    const fixture = await scopedHookFixture();
+    try {
+      const foreign = join(fixture.configPath, "../foreign");
+      mkdirSync(foreign);
+      const foreignSettings = join(foreign, scopedSession + ".settings.json");
+      writeFileSync(foreignSettings, JSON.stringify({ model: scopedModel }));
+      const escape = join(fixture.sessionsDir, "escape");
+      symlinkSync(foreign, escape);
+      const invalidEvents = [
+        { session_id: "another-session" },
+        { transcript_path: join(foreign, scopedSession + ".jsonl") },
+        { transcript_path: join(escape, scopedSession + ".jsonl") },
+        { transcript_path: fixture.sessionDir + "/../owned-project/" + scopedSession + ".jsonl" },
+        { transcript_path: fixture.transcriptPath + ".other" },
+      ];
+      for (const event of invalidEvents) expect(await fixture.invoke("SessionStart", { event })).toEqual({ code: 0, stdout: "", stderr: "" });
+      rmSync(fixture.settingsPath);
+      symlinkSync(foreignSettings, fixture.settingsPath);
+      expect(await fixture.invoke("SessionStart")).toEqual({ code: 0, stdout: "", stderr: "" });
+      rmSync(fixture.settingsPath);
+      writeFileSync(fixture.settingsPath, "x".repeat(128 * 1024 + 1));
+      expect(await fixture.invoke("SessionStart")).toEqual({ code: 0, stdout: "", stderr: "" });
+      writeFileSync(fixture.settingsPath, "{");
+      expect(await fixture.invoke("SessionStart")).toEqual({ code: 0, stdout: "", stderr: "" });
+      rmSync(fixture.settingsPath);
+      expect(await fixture.invoke("SessionStart")).toEqual({ code: 0, stdout: "", stderr: "" });
+      expect(fixture.received).toEqual([]);
+      expect(readFileSync(fixture.envFile, "utf8")).toBe("export UNRELATED=preserved\n");
+    } finally { await fixture.close(); }
   });
 });

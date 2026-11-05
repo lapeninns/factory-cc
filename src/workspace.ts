@@ -48,16 +48,22 @@ export function droidWorkingDirectory(request: MessagesRequest): string | undefi
 
 type RequestHeaders = Record<string, string | string[] | undefined>;
 type WorkspaceConfig = Pick<BridgeConfig, "sdkCwd" | "desktopProfile" | "dataDir">;
-export function resolveRequestCwd(headers: RequestHeaders, request: MessagesRequest, config: WorkspaceConfig, source?: NodeJS.ProcessEnv): string;
+/** trustedCwd comes from an authenticated ControlBroker host, never request metadata. */
+export function resolveRequestCwd(headers: RequestHeaders, request: MessagesRequest, config: WorkspaceConfig, source?: NodeJS.ProcessEnv, trustedCwd?: string): string;
 export function resolveRequestCwd(headers: RequestHeaders, request: MessagesRequest): string | undefined;
 export function resolveRequestCwd(
   headers: Record<string, string | string[] | undefined>, request: MessagesRequest,
   config?: WorkspaceConfig,
   source: NodeJS.ProcessEnv = process.env,
+  trustedCwd?: string,
 ): string | undefined {
   if (!config?.desktopProfile || source.BRIDGE_SDK_CWD) {
     const cwd = source.BRIDGE_SDK_CWD || header(headers, "x-bridge-cwd") || config?.sdkCwd;
-    return cwd ? canonicalWorkspacePath(cwd) : undefined;
+    const resolved = cwd ? canonicalWorkspacePath(cwd) : undefined;
+    if (resolved && trustedCwd && resolved !== canonicalWorkspacePath(trustedCwd)) {
+      throw new BridgeError(409, "host_workspace_mismatch", "Factory hook and native workspace differ.");
+    }
+    return resolved;
   }
   // A request that permits no tools cannot touch a workspace, and Droid's
   // compaction summaries carry no environment reminder. Give them an empty one.
@@ -66,14 +72,24 @@ export function resolveRequestCwd(
     mkdirSync(auxiliary, { recursive: true, mode: 0o700 });
     return realpathSync(auxiliary);
   }
-  const invalid = () => new BridgeError(400, "invalid_project_directory", "Open a project folder in Droid. Its initial environment reminder must contain a valid project working directory; root and Bridge state directories are refused.");
+  const invalid = () => new BridgeError(400, "invalid_project_directory", "Open a project folder in Droid. A valid authenticated workspace or initial environment reminder is required; root and Bridge state directories are refused.");
+  const validate = (raw: string): string => {
+    if (!raw || !isAbsolute(raw) || raw.includes("\0")) throw invalid();
+    try {
+      const cwd = realpathSync(raw), state = realpathSync(resolve(config.dataDir, ".."));
+      const data = realpathSync(config.dataDir);
+      const inside = (parent: string) => { const rel = relative(parent, cwd); return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)); };
+      if (!statSync(cwd).isDirectory() || cwd === resolve(cwd, "..") || inside(data) || inside(state)) throw invalid();
+      return cwd;
+    } catch { throw invalid(); }
+  };
   const raw = droidWorkingDirectory(request);
-  if (!raw || !isAbsolute(raw) || raw.includes("\0")) throw invalid();
-  try {
-    const cwd = realpathSync(raw), state = realpathSync(resolve(config.dataDir, ".."));
-    const data = realpathSync(config.dataDir);
-    const inside = (parent: string) => { const rel = relative(parent, cwd); return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)); };
-    if (!statSync(cwd).isDirectory() || cwd === resolve(cwd, "..") || inside(data) || inside(state)) throw invalid();
-    return cwd;
-  } catch { throw invalid(); }
+  const supplied = raw === undefined ? undefined : validate(raw);
+  const authenticated = trustedCwd === undefined ? undefined : validate(trustedCwd);
+  if (supplied && authenticated && supplied !== authenticated) {
+    throw new BridgeError(409, "host_workspace_mismatch", "Factory hook and native workspace differ.");
+  }
+  const cwd = authenticated ?? supplied;
+  if (!cwd) throw invalid();
+  return cwd;
 }

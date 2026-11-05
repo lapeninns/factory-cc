@@ -20,6 +20,7 @@ class RuntimeRefused(RuntimeError):
 class RuntimeConfig:
     state_root: Path
     workspace_root: Path
+    # Worker capacity. Fully bound Factory controllers have one additional slot.
     max_running: int = 2
     per_profile: int = 1
     poll_interval: float = 0.1
@@ -29,7 +30,7 @@ class RuntimeConfig:
         self.state_root = Path(self.state_root).expanduser().absolute()
         self.workspace_root = Path(self.workspace_root).expanduser().absolute()
         if not 1 <= self.max_running <= 8 or self.per_profile != 1:
-            raise RuntimeRefused("Concurrency must be 1..8 globally and one job per profile.")
+            raise RuntimeRefused("Worker concurrency must be 1..8 and one job per profile in each lane.")
         if not 0.02 <= self.poll_interval <= 5 or not 0.1 <= self.cancel_grace <= 30:
             raise RuntimeRefused("Invalid supervisor polling or cancellation bounds.")
 

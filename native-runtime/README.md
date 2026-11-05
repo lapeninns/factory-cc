@@ -1,12 +1,17 @@
 # Native Team job runtime
 
 Python 3.9+ standard-library runtime for supervised native jobs and Factory Workstream leases.
-It adds isolated Git worktrees, one-job-per-profile admission, a shared queue,
+It adds isolated Git worktrees, per-profile admission within worker and controller queues,
 supervised execution, privacy-preserving reports, shared policy/workflows and
-versioned releases. Standalone native launchers support the assigned `team1`
-through `team4` profiles. The shared Factory lease helper also accounts for
-`team5` through `team8`; bridge configuration determines fixed-seat versus pool
+versioned releases. Standalone native launchers and the shared Factory lease
+helper support the assigned `team1` through `team8` profiles.
+Bridge configuration determines fixed-seat versus pool
 routing and the permitted workspace policy.
+
+The default scheduler admits two worker jobs plus one reserved Factory
+controller. Each profile can run one worker and one controller concurrently.
+Workspace conflicts apply across both queues, and uncertain cleanup blocks
+reuse of the affected profile until it is resolved.
 
 Read [the operations guide](docs/OPERATIONS.md) for commands, policy and limits.
 
@@ -28,7 +33,7 @@ PYTHONPATH=. PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -m native_runtime.instal
 
 Installation runs the local tests, creates a private backup receipt, installs
 an immutable verified release, and selects it atomically for future jobs.
-Existing runtime jobs keep their loaded code. The four preset launchers and
+Existing runtime jobs keep their loaded code. The eight preset launchers and
 `team-job` use the selected release. No provider, billing, service, account
 login, model request or production deployment is performed by installation.
 

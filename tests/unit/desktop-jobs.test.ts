@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { DesktopJobsRuntime, SUBSCRIPTION_PROFILES, acquireDesktopJobLease, updateDesktopJobRecord, validateDesktopJobBinding, type DesktopJobAcquire, type DesktopJobBinding, type DesktopJobLease, type DesktopJobsOptions } from "../../src/runtime/desktop-jobs.js";
 import type { BridgeRuntime, RuntimeHostCall, RuntimeRequest, RuntimeTurn } from "../../src/runtime/types.js";
 
@@ -189,18 +189,93 @@ describe("explicit host-directory controllers", () => {
     expect(fixture.acquire).not.toHaveBeenCalled(); expect(fixture.inner.handle).not.toHaveBeenCalled();
   });
 
-  it.each(["Execute", "Create", "Edit"])("holds the shared lease across %s until its matching result is consumed", async name => {
+  it.each(["Execute", "Create", "Edit"])("parks %s with a workspace reservation and reacquires compute for its matching result", async name => {
     const fixture = hostFixture(); fixture.inner.handle.mockResolvedValueOnce(hostTurn("host-1", name));
     await fixture.runtime.handle(fixture.input);
-    expect(fixture.releases).not.toHaveBeenCalled();
+    expect(fixture.releases).toHaveBeenCalledWith(expect.objectContaining({ state: "waiting_host", hostActionReservation: true }));
     expect(fixture.runtime.describe()).toMatchObject({ desktopJobs: { heldHostActions: 1 } });
     await expect(fixture.runtime.handle(fixture.input)).rejects.toMatchObject({ status: 409, code: "desktop_host_action_pending" });
     await expect(fixture.runtime.handle(withResult(fixture.input, "other-call"))).rejects.toMatchObject({ code: "desktop_host_action_pending" });
-    expect(fixture.releases).not.toHaveBeenCalled();
-    await fixture.runtime.handle(withResult(fixture.input));
-    expect(fixture.acquire).toHaveBeenCalledOnce();
     expect(fixture.releases).toHaveBeenCalledOnce();
+    await fixture.runtime.handle(withResult(fixture.input));
+    expect(fixture.acquire).toHaveBeenCalledTimes(2);
+    expect(fixture.releases).toHaveBeenCalledTimes(2);
     expect(fixture.releases).toHaveBeenCalledWith(expect.objectContaining({ state: "idle", usage: { input_tokens: 10, output_tokens: 4, cache_creation_input_tokens: 6 } }));
+  });
+
+  it.each(["Task", "SpawnAgent", "mcp__github__create_pull_request", "factory-workers-pool___unknown_mutation"])("reserves the workspace for pending %s", async name => {
+    const fixture = hostFixture();
+    fixture.options.workerMcpPrefix = "factory-workers-pool___";
+    fixture.inner.handle.mockResolvedValueOnce(hostTurn("pending-writer", name));
+    await fixture.runtime.handle(fixture.input);
+    expect(fixture.releases).toHaveBeenCalledWith(expect.objectContaining({ state: "waiting_host", hostActionReservation: true }));
+    await expect(fixture.runtime.handle(fixture.input)).rejects.toMatchObject({ code: "desktop_host_action_pending" });
+    expect(fixture.inner.handle).toHaveBeenCalledOnce();
+  });
+
+  it.each(["SpawnAgent", "mcp__fixture__write_file"])("blocks a second same-folder Workstream until pending %s is acknowledged", async name => {
+    const first = hostFixture(), second = hostFixture();
+    const stateRoot = join(first.root, "native-state");
+    for (const fixture of [first, second]) {
+      fixture.options.runtimePackagePath = resolve("native-runtime");
+      fixture.options.stateRoot = stateRoot;
+      fixture.options.admissionTimeoutMs = 5_000;
+      fixture.options.releaseTimeoutMs = 2_000;
+      fixture.options.acquireLease = undefined;
+      fixture.options.updateRecord = undefined;
+    }
+    second.binding.sessionId = "factory-second";
+    second.binding.cwd = first.cwd;
+    second.binding.subscriptionProfile = "team2";
+    second.input.session.bridgeSessionId = "bridge-second";
+    first.inner.handle.mockResolvedValueOnce(hostTurn("pending-mutation", name));
+    try {
+      await first.runtime.handle(first.input);
+      second.options.admissionTimeoutMs = 100;
+      await expect(second.runtime.handle(second.input)).rejects.toMatchObject({
+        code: "desktop_job_timeout", extra: { retry_safe: true },
+      });
+      expect(second.inner.handle).not.toHaveBeenCalled();
+      await first.runtime.completeHostTool!("bridge-1", {
+        toolUseId: "pending-mutation", toolName: name, input: { command: "df -h" }, content: "done",
+      });
+      second.options.admissionTimeoutMs = 5_000;
+      await second.runtime.handle(second.input);
+      expect(second.inner.handle).toHaveBeenCalledOnce();
+    } finally {
+      await Promise.allSettled([first.runtime.close(), second.runtime.close()]);
+    }
+  });
+
+  it.each(["Read", "ListAgents", "TodoWrite", "factory-workers-pool___factory_worker_start", "factory-workers-pool___factory_worker_wait"])("keeps safe read or supervised control %s outside workspace reservations", async name => {
+    const fixture = hostFixture();
+    fixture.options.workerMcpPrefix = "factory-workers-pool___";
+    fixture.inner.handle.mockResolvedValueOnce(hostTurn("read-or-control", name));
+    await fixture.runtime.handle(fixture.input);
+    expect(fixture.releases).toHaveBeenCalledWith(expect.objectContaining({ state: "waiting_host" }));
+    expect(fixture.runtime.describe()).toMatchObject({ desktopJobs: { heldHostActions: 0 } });
+  });
+
+  it("retains unknown native cleanup separately from a completed inference phase", async () => {
+    const fixture = hostFixture();
+    fixture.inner.handle.mockResolvedValueOnce(hostTurn()).mockRejectedValueOnce(new Error("continuation failed"));
+    fixture.inner.cancel.mockRejectedValue(new Error("native cleanup failed"));
+    await fixture.runtime.handle(fixture.input);
+    await expect(fixture.runtime.handle(withResult(fixture.input))).rejects.toThrow("continuation failed");
+    expect(fixture.releases).toHaveBeenLastCalledWith(expect.objectContaining({
+      state: "unknown", hostActionReservation: true, cleanupVerified: false,
+    }));
+  });
+
+  it.each([true, false])("records native cleanup outcome %s when cancelling a parked host action", async clean => {
+    const fixture = hostFixture();
+    fixture.inner.handle.mockResolvedValueOnce(hostTurn());
+    if (!clean) fixture.inner.cancel.mockRejectedValue(new Error("native cleanup failed"));
+    await fixture.runtime.handle(fixture.input);
+    await expect(fixture.runtime.cancel("bridge-1", "stop")).rejects.toThrow();
+    expect(fixture.update).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({
+      state: "unknown", hostActionReservation: true, cleanupVerified: clean,
+    }));
   });
 
   it("accepts a trusted host completion receipt without replaying a historical result", async () => {
@@ -208,7 +283,8 @@ describe("explicit host-directory controllers", () => {
     await fixture.runtime.handle(fixture.input);
     await fixture.runtime.completeHostTool!("bridge-1", { toolUseId: "host-1", toolName: "Execute", input: { command: "df -h" }, content: "done" });
     await fixture.runtime.handle(fixture.input);
-    expect(fixture.acquire).toHaveBeenCalledOnce(); expect(fixture.releases).toHaveBeenCalledOnce();
+    expect(fixture.acquire).toHaveBeenCalledTimes(2); expect(fixture.releases).toHaveBeenCalledTimes(2);
+    expect(fixture.update).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ state: "waiting_host", hostActionReservation: false }));
   });
 
   it("protects held host records from session retention even when the inner runtime no longer lists them", async () => {
@@ -220,17 +296,17 @@ describe("explicit host-directory controllers", () => {
     expect(fixture.runtime.protectedSessionIds?.()).toEqual(["bridge-1", "bridge-held"]);
   });
 
-  it("holds the same lease across consecutive host actions until the final result", async () => {
+  it("retains workspace ownership while releasing compute between consecutive host actions", async () => {
     const fixture = hostFixture();
     fixture.inner.handle.mockResolvedValueOnce(hostTurn("host-a")).mockResolvedValueOnce(hostTurn("host-b"));
     await fixture.runtime.handle(fixture.input);
-    expect(fixture.releases).not.toHaveBeenCalled();
+    expect(fixture.releases).toHaveBeenCalledOnce();
     await fixture.runtime.handle(withResult(fixture.input, "host-a"));
-    expect(fixture.acquire).toHaveBeenCalledOnce();
-    expect(fixture.releases).not.toHaveBeenCalled();
+    expect(fixture.acquire).toHaveBeenCalledTimes(2);
+    expect(fixture.releases).toHaveBeenCalledTimes(2);
     expect(fixture.runtime.describe()).toMatchObject({ desktopJobs: { heldHostActions: 1 } });
     await fixture.runtime.handle(withResult(fixture.input, "host-b"));
-    expect(fixture.acquire).toHaveBeenCalledOnce(); expect(fixture.releases).toHaveBeenCalledOnce();
+    expect(fixture.acquire).toHaveBeenCalledTimes(3); expect(fixture.releases).toHaveBeenCalledTimes(3);
     expect(fixture.runtime.describe()).toMatchObject({ desktopJobs: { heldHostActions: 0 } });
   });
 
@@ -240,7 +316,8 @@ describe("explicit host-directory controllers", () => {
     const historical = withResult(fixture.input, "old-unrelated-call");
     historical.request.messages.push({ role: "user", content: "new unrelated turn" });
     await expect(fixture.runtime.handle(historical)).rejects.toMatchObject({ code: "desktop_host_action_pending" });
-    expect(fixture.releases).not.toHaveBeenCalled();
+    expect(fixture.releases).toHaveBeenCalledOnce();
+    expect(fixture.update).not.toHaveBeenCalled();
   });
 
   it("accepts a current command result before a newer steering message", async () => {
@@ -249,7 +326,7 @@ describe("explicit host-directory controllers", () => {
     const steered = withResult(fixture.input);
     steered.request.messages.push({ role: "assistant", content: "Tool completed." }, { role: "user", content: "Continue." });
     await fixture.runtime.handle(steered);
-    expect(fixture.acquire).toHaveBeenCalledOnce(); expect(fixture.releases).toHaveBeenCalledOnce();
+    expect(fixture.acquire).toHaveBeenCalledTimes(2); expect(fixture.releases).toHaveBeenCalledTimes(2);
   });
 
   it.each(["cancel", "close", "end"])("keeps unresolved host execution unknown after %s instead of claiming cleanup", async operation => {
@@ -259,8 +336,8 @@ describe("explicit host-directory controllers", () => {
     if (operation === "cancel") await expect(fixture.runtime.cancel("bridge-1", "test")).rejects.toMatchObject({ code: "desktop_host_cleanup_unknown" });
     else if (operation === "close") await expect(fixture.runtime.close()).rejects.toMatchObject({ code: "desktop_jobs_cleanup" });
     else await fixture.runtime.endHostSession!("bridge-1", "end");
-    expect(fixture.releases).toHaveBeenCalledWith(expect.objectContaining({ state: "unknown", cleanupVerified: false }));
-    expect(fixture.update).not.toHaveBeenCalled();
+    expect(fixture.releases).toHaveBeenCalledWith(expect.objectContaining({ state: "waiting_host", hostActionReservation: true }));
+    expect(fixture.update).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ state: "unknown", cleanupVerified: true, hostActionReservation: true }));
     if (operation !== "close") await expect(fixture.runtime.handle(withResult(fixture.input))).rejects.toMatchObject({ code: "desktop_host_cleanup_unknown" });
   });
 
@@ -282,7 +359,7 @@ describe("explicit host-directory controllers", () => {
     await Promise.resolve(); await Promise.resolve();
     output.resolve(hostTurn());
     await running; await rejected;
-    expect(fixture.releases).toHaveBeenCalledWith(expect.objectContaining({ state: "unknown", cleanupVerified: false }));
+    expect(fixture.releases).toHaveBeenCalledWith(expect.objectContaining({ state: "unknown", cleanupVerified: true }));
     expect(fixture.update).not.toHaveBeenCalled();
   });
 });
@@ -298,6 +375,27 @@ function fakeHelper(script: string) {
 }
 
 describe("private shared-lease subprocess protocol", () => {
+  it("marks an admission timeout retry-safe only after durable deferral acknowledgement", async () => {
+    const fixture = fakeHelper(`import json,sys\na=json.loads(sys.stdin.readline())\nprint(json.dumps({'ok':True,'event':'queued','jobId':'job-fixture'}),flush=True)\nr=json.loads(sys.stdin.readline())\nassert r=={'op':'defer'}\nprint(json.dumps({'ok':True,'event':'deferred','jobId':'job-fixture'}),flush=True)\n`);
+    fixture.options.admissionTimeoutMs = 30;
+    await expect(acquireDesktopJobLease(fixture.options, fixture.acquire, new AbortController().signal))
+      .rejects.toMatchObject({ code: "desktop_job_timeout", extra: { retry_safe: true, phase: "admission" } });
+  });
+
+  it("does not call an unconfirmed deferral safe to retry", async () => {
+    const fixture = fakeHelper(`import json,sys\na=json.loads(sys.stdin.readline())\nprint(json.dumps({'ok':True,'event':'queued','jobId':'job-fixture'}),flush=True)\nr=json.loads(sys.stdin.readline())\nassert r=={'op':'defer'}\nsys.exit(2)\n`);
+    fixture.options.admissionTimeoutMs = 30;
+    await expect(acquireDesktopJobLease(fixture.options, fixture.acquire, new AbortController().signal))
+      .rejects.toMatchObject({ code: "desktop_job_channel", extra: {} });
+  });
+
+  it("defers a racing ready response without exposing a model execution lease", async () => {
+    const fixture = fakeHelper(`import json,sys,time\na=json.loads(sys.stdin.readline())\nprint(json.dumps({'ok':True,'event':'queued','jobId':'job-fixture'}),flush=True)\ntime.sleep(.08)\nprint(json.dumps({'ok':True,'event':'ready','jobId':'job-fixture'}),flush=True)\nr=json.loads(sys.stdin.readline())\nassert r=={'op':'defer'}\nprint(json.dumps({'ok':True,'event':'deferred','jobId':'job-fixture'}),flush=True)\n`);
+    fixture.options.admissionTimeoutMs = 30;
+    await expect(acquireDesktopJobLease(fixture.options, fixture.acquire, new AbortController().signal))
+      .rejects.toMatchObject({ code: "desktop_job_timeout", extra: { retry_safe: true } });
+  });
+
   it.each(["invalid_workspace", "invalid_binding"])("returns permanent helper %s errors without retryable status or raw details", async code => {
     const fixture = fakeHelper(`import json\nprint(json.dumps({'ok':False,'error':'factory_lease_refused','code':${JSON.stringify(code)}}),flush=True)\n`);
     await expect(acquireDesktopJobLease(fixture.options, fixture.acquire, new AbortController().signal))

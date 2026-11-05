@@ -1,5 +1,6 @@
 import type { ModelProvider } from "../models.js";
 import type { RoleTag, SessionState } from "../types.js";
+import type { RuntimeHostCompletion } from "../runtime/types.js";
 
 export interface SessionRecord {
   bridgeSessionId: string;
@@ -9,6 +10,10 @@ export interface SessionRecord {
   sdkSessionId?: string;
   /** Exact accepted request that failed upstream after all host work settled. */
   retryableRequestHash?: string;
+  /** Admission retries retain the native checkpoint instead of cold-importing it. */
+  retryableRequestKind?: "upstream" | "admission";
+  /** Authenticated host receipts retained until an admitted turn consumes them. */
+  hostCompletionReceipts?: RuntimeHostCompletion[];
   /** Runtime that owns sdkSessionId. Absent on Claude sessions created before Cursor coexisted. */
   provider?: ModelProvider;
   /** Claude account running this session (`personal` or a profile id). Set by the pool or after a limit moved it; absent means the model entry's own account. */
