@@ -205,6 +205,25 @@ describe("private owned-Git repository policy", () => {
     expect(git(target, ["show", "HEAD:config"])).toBe("replacement");
   });
 
+  it("admits an unstaged file-to-directory change but still rejects real submodules", async () => {
+    const source = repository("file-to-directory");
+    writeFileSync(join(source, "config"), "committed file\n");
+    git(source, ["add", "config"]);
+    git(source, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "file"]);
+    rmSync(join(source, "config"));
+    mkdirSync(join(source, "config"));
+    writeFileSync(join(source, "config", "new.txt"), "directory content\n");
+    const inspected = await inspectWorkerWorkspace(source, true);
+    const target = join(root, "file-to-directory-worker");
+    await prepareWorkerWorkspace(inspected, target, "worker-fixture");
+    expect(readFileSync(join(target, "config", "new.txt"), "utf8")).toBe("directory content\n");
+
+    const withSubmodule = repository("gitlink");
+    mkdirSync(join(withSubmodule, "vendor"));
+    git(withSubmodule, ["update-index", "--add", "--cacheinfo", "160000," + git(withSubmodule, ["rev-parse", "HEAD"]) + ",vendor"]);
+    await expect(inspectWorkerWorkspace(withSubmodule, true)).rejects.toThrow(/Submodule directories/);
+  });
+
   it("records force-staged ignored files in the snapshot commit", async () => {
     const source = repository("ignored-input");
     writeFileSync(join(source, ".gitignore"), "important.txt\n");

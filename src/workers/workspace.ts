@@ -170,11 +170,17 @@ export async function inspectWorkerWorkspace(path: string, allowFolders: boolean
   if (kind !== "git" && !allowFolders) throw new Error("This worker policy requires a committed Git repository. Use owned-workspace for ordinary folders and new repositories.");
   if (!inside(repository, directory)) throw new Error("Workspace directory escaped its repository.");
   const tracked = new Set<string>();
+  const gitlinks = new Set<string>();
   let candidates: string[];
   let originalFiles: string[] = [];
   const exclusions: Array<{ path: string; reason: string }> = [];
   if (kind !== "folder") {
-    for (const name of (await git(repository, ["ls-files", "--cached", "-z"])).split("\0").filter(Boolean)) tracked.add(pathName(name));
+    // `-s` keeps each index entry's mode, so only real gitlinks (160000) count as submodules.
+    for (const entry of (await git(repository, ["ls-files", "--cached", "-s", "-z"])).split("\0").filter(Boolean)) {
+      const tab = entry.indexOf("\t"), name = pathName(entry.slice(tab + 1));
+      tracked.add(name);
+      if (entry.startsWith("160000 ")) gitlinks.add(name);
+    }
     candidates = [...new Set([...tracked, ...(await git(repository, ["ls-files", "--others", "--exclude-standard", "-z"])).split("\0").filter(Boolean).map(pathName)])];
     if (sourceCommit) originalFiles = (await git(repository, ["ls-tree", "-r", "--name-only", "-z", sourceCommit])).split("\0").filter(Boolean).map(pathName);
   } else {
@@ -233,7 +239,8 @@ export async function inspectWorkerWorkspace(path: string, allowFolders: boolean
       if (bytes > maxBytes) throw new Error(snapshotLimitError);
       if (untrackedBytes > MAX_BYTES) throw new Error("Workspace exceeds the 64 MiB untracked input limit.");
       files.push({ path, mode: stat.mode & 0o777, digest: createHash("sha256").update(content).digest("hex") });
-    } else if (stat.isDirectory() && tracked.has(path)) throw new Error("Submodule directories need their own explicit worker workspace.");
+    } else if (stat.isDirectory() && gitlinks.has(path)) throw new Error("Submodule directories need their own explicit worker workspace.");
+    else if (stat.isDirectory() && tracked.has(path)) continue; // A tracked file replaced by a directory; its files are separate inputs.
     else if (!stat.isDirectory()) throw new Error("Unsupported workspace input file type.");
   }
   const sourceDirty = kind !== "git" || Boolean((await git(repository, ["status", "--porcelain", "--untracked-files=normal"])).trim());
