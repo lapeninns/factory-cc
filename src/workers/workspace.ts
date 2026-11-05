@@ -64,7 +64,7 @@ function containsCredentialConfig(path: string, bytes: Buffer): boolean {
   if (!/\.(?:json|jsonc|toml|ya?ml)$/i.test(path)) return false;
   const text = bytes.toString("utf8");
   const credentialFields = credentialScanText(path, text);
-  return /(?:["']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|password|client[_-]?secret|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)["']?\s*[:=]\s*["']?[^\s"'\]}]+)/i.test(credentialFields)
+  return /(?:["']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|password|client[_-]?secret|(?:anthropic[_-]?)?auth[_-]?token|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)["']?\s*[:=]\s*["']?[^\s"'\]}]+)/i.test(credentialFields)
     || /(?:sk-ant-(?:api|oat)[A-Za-z0-9_-]{20,}|sk-or-v1-[A-Za-z0-9]{20,})/.test(text);
 }
 

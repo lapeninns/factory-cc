@@ -224,6 +224,21 @@ describe("private owned-Git repository policy", () => {
     await expect(inspectWorkerWorkspace(withSubmodule, true)).rejects.toThrow(/Submodule directories/);
   });
 
+  it("treats ANTHROPIC_AUTH_TOKEN in application settings as a credential", async () => {
+    const untracked = repository("auth-token-untracked");
+    mkdirSync(join(untracked, ".claude"));
+    writeFileSync(join(untracked, ".claude", "settings.json"), JSON.stringify({ env: { ANTHROPIC_AUTH_TOKEN: "synthetic-byok-value" } }) + "\n");
+    const inspected = await inspectWorkerWorkspace(untracked, true);
+    expect(inspected.files.map(file => file.path)).not.toContain(".claude/settings.json");
+    expect(inspected.snapshot.excluded).toContainEqual(expect.objectContaining({ path: ".claude/settings.json" }));
+
+    const tracked = repository("auth-token-tracked");
+    mkdirSync(join(tracked, ".claude"));
+    writeFileSync(join(tracked, ".claude", "settings.json"), JSON.stringify({ env: { ANTHROPIC_AUTH_TOKEN: "synthetic-byok-value" } }) + "\n");
+    git(tracked, ["add", ".claude/settings.json"]);
+    await expect(inspectWorkerWorkspace(tracked, true)).rejects.toThrow(/tracked credential configuration/);
+  });
+
   it("records force-staged ignored files in the snapshot commit", async () => {
     const source = repository("ignored-input");
     writeFileSync(join(source, ".gitignore"), "important.txt\n");
