@@ -188,6 +188,23 @@ describe("private owned-Git repository policy", () => {
     expect(readFileSync(join(source, "notes.txt"), "utf8")).toBe("changed\n");
   });
 
+  it("snapshots a staged file that replaces a committed directory", async () => {
+    const source = repository("directory-to-file");
+    mkdirSync(join(source, "config"));
+    writeFileSync(join(source, "config", "old.txt"), "committed\n");
+    git(source, ["add", "config/old.txt"]);
+    git(source, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "directory"]);
+    git(source, ["rm", "-rq", "config"]);
+    writeFileSync(join(source, "config"), "replacement\n");
+    git(source, ["add", "config"]);
+    const inspected = await inspectWorkerWorkspace(source, true);
+    const target = join(root, "directory-to-file-worker");
+    await prepareWorkerWorkspace(inspected, target, "worker-fixture");
+    expect(lstatSync(join(target, "config")).isFile()).toBe(true);
+    expect(readFileSync(join(target, "config"), "utf8")).toBe("replacement\n");
+    expect(git(target, ["show", "HEAD:config"])).toBe("replacement");
+  });
+
   it("refuses pre-existing snapshot paths without changing their files", async () => {
     const source = join(root, "existing-folder"); mkdirSync(source);
     writeFileSync(join(source, "notes.txt"), "source\n");

@@ -233,7 +233,10 @@ export async function prepareWorkerWorkspace(source: WorkerWorkspaceSource, work
         symlinkSync(file.link, destination);
       } else {
         if (!lstatSync(input).isFile() || createHash("sha256").update(readFileSync(input)).digest("hex") !== file.digest) throw new Error("A workspace input changed during snapshot preparation.");
-        if (existsSync(destination) && lstatSync(destination).isSymbolicLink()) rmSync(destination);
+        // A source change can replace a committed directory or link with a
+        // regular file; remove whatever non-file entry the checkout left there.
+        const existing = lstatSync(destination, { throwIfNoEntry: false });
+        if (existing && !existing.isFile()) rmSync(destination, { force: true, recursive: true });
         copyFileSync(input, destination);
         chmodSync(destination, file.mode);
         if (createHash("sha256").update(readFileSync(destination)).digest("hex") !== file.digest) throw new Error("A workspace input changed while copying.");
