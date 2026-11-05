@@ -112,12 +112,26 @@ function linkedCredentialConfig(repository: string, path: string, target: string
   }
   if (!info.isDirectory() || !CONFIG_DIRECTORY.test(path + "/")) return false;
   let seen = 0;
+  const visited = new Set<string>();
+  // Follow nested links under their logical configuration path. Every resolved
+  // entry must stay inside the repository, and each directory is walked once.
   const walk = (directory: string, logical: string): boolean => {
+    if (visited.has(directory)) return false;
+    visited.add(directory);
     for (const name of readdirSync(directory)) {
       if (++seen > MAX_FILES) throw new Error("Workspace exceeds the 10000-file snapshot limit.");
-      const full = join(directory, name), view = join(logical, name), entry = lstatSync(full);
+      const view = join(logical, name);
+      let full = join(directory, name), entry = lstatSync(full);
+      if (entry.isSymbolicLink()) {
+        full = realpathSync(full);
+        if (!inside(repository, full)) throw new Error("A workspace symlink points outside the assigned source.");
+        entry = lstatSync(full);
+      }
       if (entry.isDirectory()) { if (walk(full, view)) return true; }
-      else if (entry.isFile() && CONFIG_EXTENSION.test(view) && containsCredentialConfig(view, readFileSync(full))) return true;
+      else if (entry.isFile() && (CONFIG_EXTENSION.test(view) || CONFIG_EXTENSION.test(full))) {
+        const content = readFileSync(full);
+        if (containsCredentialConfig(view, content) || containsCredentialConfig(relative(repository, full), content)) return true;
+      }
     }
     return false;
   };

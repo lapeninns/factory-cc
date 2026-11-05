@@ -232,6 +232,19 @@ describe("private owned-Git repository policy", () => {
     symlinkSync("dotclaude", join(directoryLink, ".claude"));
     await expect(inspectWorkerWorkspace(directoryLink, true)).rejects.toThrow(/credential-bearing configuration/);
 
+    const nested = repository("linked-config-nested");
+    writeFileSync(join(nested, "local-settings.json"), JSON.stringify({ apiKey: "synthetic-fixture-value" }) + "\n");
+    mkdirSync(join(nested, "config"));
+    symlinkSync("../local-settings.json", join(nested, "config", "settings.json"));
+    symlinkSync("config", join(nested, ".claude"));
+    await expect(inspectWorkerWorkspace(nested, true)).rejects.toThrow(/credential-bearing configuration/);
+
+    const cycle = repository("linked-config-cycle");
+    mkdirSync(join(cycle, "config"));
+    symlinkSync("..", join(cycle, "config", "loop"));
+    symlinkSync("config", join(cycle, ".claude"));
+    await expect(inspectWorkerWorkspace(cycle, true)).resolves.toMatchObject({ kind: "git" });
+
     const harmless = repository("linked-config-harmless");
     writeFileSync(join(harmless, "local-settings.json"), JSON.stringify({ permissions: { allow: ["Read"] } }) + "\n");
     mkdirSync(join(harmless, ".claude"));
