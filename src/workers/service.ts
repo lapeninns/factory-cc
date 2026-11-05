@@ -176,7 +176,20 @@ export class APIWorkerService {
         record.updatedAt = now();
         writeWorker(this.root, record);
       }
-      const task = options.executionHost ? readWorkerTask(this.root, record.id) : undefined;
+      let task = options.executionHost ? readWorkerTask(this.root, record.id) : undefined;
+      if (options.executionHost && !options.managedWorkerId && record.state === "starting" && !record.executorLaunchRequested) {
+        // The previous frontend stopped during workspace preparation, before
+        // any executor launch. Record it like a failed preparation instead of
+        // leaving a starting record that the scheduler will never launch.
+        record.state = "unknown";
+        record.reason = "workspace_preparation_unconfirmed";
+        record.failure = { stage: "workspace", code: record.reason, message: "Workspace preparation did not confirm completion. Inspect the recorded workspace before replacing this operation." };
+        record.cleanupVerified = null;
+        record.pendingApprovalCount = 0;
+        record.updatedAt = now();
+        writeWorker(this.root, record);
+        task = undefined;
+      }
       const live = this.live(record, task);
       this.workers.set(record.id, live);
       if (record.state === "unknown" || options.executionHost && !TERMINAL.has(record.state) && (record.executorLaunchRequested || task === undefined)) this.active.add(record.id);

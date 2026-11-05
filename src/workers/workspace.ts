@@ -94,6 +94,36 @@ function credentialScanText(path: string, text: string): string {
   } catch { return text; }
 }
 
+const CONFIG_DIRECTORY = /(?:^|[\\/])\.(?:factory|claude|codex)(?:[\\/]|$)/;
+const CONFIG_EXTENSION = /\.(?:json|jsonc|toml|ya?ml)$/i;
+
+/**
+ * A symlink is scanned under both its own path and its target's path, so an
+ * application configuration cannot reach the snapshot through a link whose
+ * target has an ordinary name. Directory links are walked only when they
+ * place files inside a configuration directory.
+ */
+function linkedCredentialConfig(repository: string, path: string, target: string): boolean {
+  const info = lstatSync(target);
+  if (info.isFile()) {
+    if (!CONFIG_EXTENSION.test(path) && !CONFIG_EXTENSION.test(target)) return false;
+    const content = readFileSync(target);
+    return containsCredentialConfig(path, content) || containsCredentialConfig(relative(repository, target), content);
+  }
+  if (!info.isDirectory() || !CONFIG_DIRECTORY.test(path + "/")) return false;
+  let seen = 0;
+  const walk = (directory: string, logical: string): boolean => {
+    for (const name of readdirSync(directory)) {
+      if (++seen > MAX_FILES) throw new Error("Workspace exceeds the 10000-file snapshot limit.");
+      const full = join(directory, name), view = join(logical, name), entry = lstatSync(full);
+      if (entry.isDirectory()) { if (walk(full, view)) return true; }
+      else if (entry.isFile() && CONFIG_EXTENSION.test(view) && containsCredentialConfig(view, readFileSync(full))) return true;
+    }
+    return false;
+  };
+  return walk(target, path);
+}
+
 async function git(repository: string, args: string[]): Promise<string> {
   const result = await exec("git", ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-C", repository, ...args], {
     timeout: 30_000, maxBuffer: 8 * 1024 * 1024,
@@ -172,6 +202,7 @@ export async function inspectWorkerWorkspace(path: string, allowFolders: boolean
       const target = realpathSync(source);
       if (!inside(repository, target)) throw new Error("A workspace symlink points outside the assigned source.");
       if (excluded(relative(repository, target), false)) throw new Error("A workspace symlink resolves into an excluded input.");
+      if (linkedCredentialConfig(repository, path, target)) throw new Error("A workspace symlink resolves to a credential-bearing configuration.");
       files.push({ path, mode: stat.mode & 0o777, link: relative(dirname(source), target) });
     } else if (stat.isFile()) {
       if (bytes + stat.size > maxBytes) throw new Error(snapshotLimitError);
@@ -243,6 +274,13 @@ export async function prepareWorkerWorkspace(source: WorkerWorkspaceSource, work
       }
     }
     await git(worktree, ["add", "-A"]);
+    // `add -A` skips paths matched by .gitignore, but inspection admitted
+    // every copied file (including force-staged ignored ones). Stage them
+    // explicitly so the recorded input commit contains the whole snapshot.
+    const admitted = source.files.map(file => file.path);
+    for (let index = 0; index < admitted.length; index += 500) {
+      await git(worktree, ["--literal-pathspecs", "add", "-f", "--", ...admitted.slice(index, index + 500)]);
+    }
     if (!source.sourceCommit || (await git(worktree, ["status", "--porcelain"])).trim()) {
       await git(worktree, ["-c", "user.name=Factory Worker", "-c", "user.email=worker@localhost", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "Capture worker input snapshot"]);
     }

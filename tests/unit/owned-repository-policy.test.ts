@@ -205,6 +205,40 @@ describe("private owned-Git repository policy", () => {
     expect(git(target, ["show", "HEAD:config"])).toBe("replacement");
   });
 
+  it("records force-staged ignored files in the snapshot commit", async () => {
+    const source = repository("ignored-input");
+    writeFileSync(join(source, ".gitignore"), "important.txt\n");
+    git(source, ["add", ".gitignore"]);
+    git(source, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "ignore"]);
+    writeFileSync(join(source, "important.txt"), "admitted\n");
+    git(source, ["add", "-f", "important.txt"]);
+    const inspected = await inspectWorkerWorkspace(source, true);
+    expect(inspected.files.map(file => file.path)).toContain("important.txt");
+    const target = join(root, "ignored-input-worker");
+    const prepared = await prepareWorkerWorkspace(inspected, target, "worker-fixture");
+    expect(git(target, ["show", prepared.inputCommit + ":important.txt"])).toBe("admitted");
+  });
+
+  it("rejects symlinked application configurations that carry credentials", async () => {
+    const fileLink = repository("linked-config-file");
+    writeFileSync(join(fileLink, "local-settings.json"), JSON.stringify({ apiKey: "synthetic-fixture-value" }) + "\n");
+    mkdirSync(join(fileLink, ".claude"));
+    symlinkSync("../local-settings.json", join(fileLink, ".claude", "settings.json"));
+    await expect(inspectWorkerWorkspace(fileLink, true)).rejects.toThrow(/credential-bearing configuration/);
+
+    const directoryLink = repository("linked-config-directory");
+    mkdirSync(join(directoryLink, "dotclaude"));
+    writeFileSync(join(directoryLink, "dotclaude", "settings.json"), JSON.stringify({ apiKey: "synthetic-fixture-value" }) + "\n");
+    symlinkSync("dotclaude", join(directoryLink, ".claude"));
+    await expect(inspectWorkerWorkspace(directoryLink, true)).rejects.toThrow(/credential-bearing configuration/);
+
+    const harmless = repository("linked-config-harmless");
+    writeFileSync(join(harmless, "local-settings.json"), JSON.stringify({ permissions: { allow: ["Read"] } }) + "\n");
+    mkdirSync(join(harmless, ".claude"));
+    symlinkSync("../local-settings.json", join(harmless, ".claude", "settings.json"));
+    await expect(inspectWorkerWorkspace(harmless, true)).resolves.toMatchObject({ kind: "git" });
+  });
+
   it("refuses pre-existing snapshot paths without changing their files", async () => {
     const source = join(root, "existing-folder"); mkdirSync(source);
     writeFileSync(join(source, "notes.txt"), "source\n");

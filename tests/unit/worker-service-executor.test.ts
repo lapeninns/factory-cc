@@ -87,6 +87,47 @@ it("reconstructs the API frontend while its worker and pending approval survive"
   expect(readFileSync(join(root, "executions"), "utf8")).toBe(worker.id + "\n");
 });
 
+it("reconciles a worker interrupted during workspace preparation after frontend restart", async () => {
+  const folder = realpathSync(mkdtempSync(join(tmpdir(), "worker-executor-preparation-")));
+  roots.push(folder);
+  const repo = join(folder, "source"), root = join(folder, "state");
+  mkdirSync(repo); mkdirSync(root, { mode: 0o700 });
+  execFileSync("git", ["init", "-q", repo]);
+  writeFileSync(join(repo, "input.txt"), "fixture\n");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture"]);
+  const launches: string[] = [];
+  const host: WorkerExecutionHost = {
+    start: async worker => { launches.push(worker.id); return { ...worker, state: "running", approvals: [] }; },
+    status: worker => ({ ...worker, state: "running", approvals: [] }),
+    cancel: async worker => ({ ...worker, state: "cancelled", cleanupVerified: true, leaseReleased: true, approvals: [] }),
+    approve: async worker => ({ ...worker, state: "running", approvals: [] }),
+    detach: async () => {},
+  };
+  const makeService = () => {
+    const service = new APIWorkerService({ stateRoot: root, workspaceRoot: join(folder, "workspaces"), allowedRepositories: [repo], maxConcurrent: 1,
+      provider: { kind: "anthropic" }, maxBudgetUsd: 0.1, maxMs: 10_000, sourceEnv: { PATH: process.env.PATH, ANTHROPIC_API_KEY: "nonfunctional-fixture" },
+      verifyRuntime: () => ({ executable: "/nonfunctional-fixture", sdkVersion: "0.3.300", cliVersion: "2.1.300", sha256: "fixture" }), executionHost: host });
+    services.push(service); return service;
+  };
+  const first = makeService();
+  await first.start({ repository: repo, task: "A", workflow: "investigate" });
+  const b = await first.start({ repository: repo, task: "B", workflow: "investigate" });
+  expect(first.status(b.id).state).toBe("queued");
+  await first.close();
+  // Simulate a frontend that stopped after persisting B but before preparation finished.
+  const path = join(root, b.id + ".json");
+  const record = JSON.parse(readFileSync(path, "utf8"));
+  record.state = "starting"; delete record.executorLaunchRequested;
+  writeFileSync(path, JSON.stringify(record) + "\n");
+  const restored = makeService();
+  const view = restored.status(b.id);
+  expect(view.state).toBe("unknown");
+  expect(view.reason).toBe("workspace_preparation_unconfirmed");
+  expect(JSON.parse(readFileSync(path, "utf8")).state).toBe("unknown");
+  expect(launches).not.toContain(b.id);
+});
+
 it("bounds executor launches and resumes its durable queue after frontend restart", async () => {
   const folder = realpathSync(mkdtempSync(join(tmpdir(), "worker-executor-queue-")));
   roots.push(folder);
