@@ -46,6 +46,8 @@ export interface BridgeConfig {
   readonly controllerPool?: boolean;
   /** Explicit operator opt-in to exactly approved Factory filesystem actions. */
   readonly controllerHostTools?: boolean;
+  /** Operator opt-in to visible Factory Workstream agents through SpawnAgent. */
+  readonly controllerSpawnAgents?: boolean;
   /** Operator-only policy for the bridge's extra host-action confirmation. */
   readonly controllerApprovalPolicy?: "ask" | "bypass";
   /** Private native account descriptors, deeply frozen and non-enumerable. */
@@ -330,6 +332,13 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
   if (controllerHostTools && (!controllerPool || !workerPool || !subscriptionDesktopJobs || !controllerReadOnly)) {
     throw new Error("Controller host tools require the supervised subscription controller and worker pools.");
   }
+  if (overrides.controllerSpawnAgents !== undefined && typeof overrides.controllerSpawnAgents !== "boolean") {
+    throw new Error("Controller SpawnAgent policy must be a boolean supplied by operator configuration.");
+  }
+  const controllerSpawnAgents = overrides.controllerSpawnAgents === true;
+  if (controllerSpawnAgents && !controllerHostTools) {
+    throw new Error("Controller SpawnAgent delegation requires pooled subscription host tools.");
+  }
   const controllerApprovalPolicy = overrides.controllerApprovalPolicy ?? "ask";
   if (controllerApprovalPolicy !== "ask" && controllerApprovalPolicy !== "bypass") {
     throw new Error("Controller approval policy must be ask or bypass supplied by operator configuration.");
@@ -450,6 +459,7 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
   Object.defineProperty(config, "workerPool", { value: workerPool, enumerable: true });
   Object.defineProperty(config, "controllerPool", { value: controllerPool, enumerable: true });
   Object.defineProperty(config, "controllerHostTools", { value: controllerHostTools, enumerable: true });
+  Object.defineProperty(config, "controllerSpawnAgents", { value: controllerSpawnAgents, enumerable: true });
   Object.defineProperty(config, "controllerApprovalPolicy", { value: controllerApprovalPolicy, enumerable: true });
   if (subscriptionAccounts) Object.defineProperty(config, "subscriptionAccounts", { value: subscriptionAccounts });
   return config;

@@ -92,6 +92,10 @@ describe("subscription Desktop launcher", () => {
     expect(() => parseSubscriptionDesktop([...pooledArgs(), "--host-tools"])).toThrow(/requires? --controller-pool/);
     expect(parseSubscriptionDesktop([...pooledArgs(), "--controller-pool", "--host-tools"]).hostTools).toBe(true);
     expect(() => parseSubscriptionDesktop([...pooledArgs(), "--controller-pool", "--host-tools", "--host-tools"])).toThrow(/Duplicate host-tools/);
+    expect(parseSubscriptionDesktop([...pooledArgs(), "--controller-pool", "--host-tools"]).spawnAgents).toBe(false);
+    expect(parseSubscriptionDesktop([...pooledArgs(), "--controller-pool", "--host-tools", "--spawn-agents"]).spawnAgents).toBe(true);
+    expect(() => parseSubscriptionDesktop([...pooledArgs(), "--controller-pool", "--spawn-agents"])).toThrow(/requires --host-tools/);
+    expect(() => parseSubscriptionDesktop([...pooledArgs(), "--controller-pool", "--host-tools", "--spawn-agents", "--spawn-agents"])).toThrow(/Duplicate spawn-agents/);
   });
 
   it("refuses changing an existing pooled marker into host-tools mode", async () => {

@@ -44,6 +44,8 @@ export interface WorkerRecord {
   startedAt?: string;
   endedAt?: string;
   sdkSessionId?: string;
+  /** Native Claude Code transcript for sdkSessionId, kept after cleanup. */
+  transcriptPath?: string;
   observedModels: string[];
   children?: Array<{ id: string; state: "running" | "completed" | "failed" | "cancelled" }>;
   result?: string;

@@ -61,7 +61,7 @@ class Fake implements SdkHandle {
   }
 }
 
-function setup(options: { original?: keyof typeof actions; hostTools?: boolean; askTool?: boolean; invoke?: boolean; approvalPolicy?: "ask" | "bypass" } = {}) {
+function setup(options: { original?: keyof typeof actions; hostTools?: boolean; spawnAgents?: boolean; askTool?: boolean; invoke?: boolean; approvalPolicy?: "ask" | "bypass" } = {}) {
   const root = mkdtempSync(join(tmpdir(), "controller-host-tools-")); roots.push(root);
   mkdirSync(join(root, "policies")); mkdirSync(join(root, "workflows"));
   writeFileSync(join(root, "policies/team-policy.md"), "Fixture policy.\n");
@@ -70,7 +70,7 @@ function setup(options: { original?: keyof typeof actions; hostTools?: boolean; 
   vi.stubEnv("BRIDGE_SDK_CWD", root);
   const config = loadConfig({ mode: "sdk", authMode: "subscription", desktopProfile: true, desktopJobs: true, desktopLifecycle: true,
     desktopRuntimePath: root, desktopStateRoot: join(root, "state"), controllerReadOnly: true, workerPool: true, controllerPool: true,
-    controllerHostTools: options.hostTools !== false, controllerApprovalPolicy: options.approvalPolicy,
+    controllerHostTools: options.hostTools !== false, controllerSpawnAgents: options.spawnAgents, controllerApprovalPolicy: options.approvalPolicy,
     workerControlFile: join(root, "control.json"), workerMcpPrefix: "factory-workers-pool___",
     subscriptionProfile: "team1", subscriptionExpectedEmail: "team1@example.invalid",
     subscriptionAccounts: SUBSCRIPTION_PROFILES.map(profile => ({ profile, expectedEmail: `${profile}@example.invalid`, weight: 1,
@@ -140,6 +140,33 @@ describe("exactly approved Factory host operations", () => {
     expect(await options.canUseTool(name, actions[original])).toMatchObject({ behavior: "deny" });
     expect(options.systemPrompt.append).toContain("delegate useful independent work through factory_worker_start");
     expect(options.systemPrompt.append).not.toContain("Use synchronous Factory Task");
+  });
+
+  it("publishes SpawnAgent for visible Workstream agents when the operator opts in", async () => {
+    const { runtime, fake, base, control } = setup({ original: "SpawnAgent", spawnAgents: true, approvalPolicy: "bypass", askTool: false });
+    const first = await runtime.handle(base), action = callFrom(first);
+    expect(action).toMatchObject({ name: "SpawnAgent", id: "host-action", input: actions.SpawnAgent });
+    const append = fake.calls[0]!.options.systemPrompt.append as string;
+    expect(append).toContain("Delegate work the user should see and steer with SpawnAgent");
+    expect(append).toContain("InterruptAgent stops its current turn");
+    expect(append).toContain("Use factory_worker_start only when");
+    expect(append).toContain("Factory Task is unavailable in this controller");
+    expect(append).not.toContain("SpawnAgent are unavailable");
+    expect((await runtime.handle(toolResult(base, action.id, "agent started"))).response.stop_reason).toBe("end_turn");
+    expect(fake.observedResult).toMatchObject({ isError: false });
+    expect(control.requestApproval).not.toHaveBeenCalled();
+  });
+
+  it("keeps Factory Task on the managed worker path when SpawnAgent is enabled", async () => {
+    const { runtime, fake, base } = setup({ original: "Task", spawnAgents: true, invoke: false, approvalPolicy: "bypass" });
+    await runtime.handle(base);
+    const name = `mcp__droid__${new StableDroidToolNames().toMcp("Task")}`;
+    expect(fake.handlers.has(name.slice("mcp__droid__".length))).toBe(false);
+    expect(await fake.calls[0]!.options.canUseTool(name, actions.Task)).toMatchObject({ behavior: "deny" });
+  });
+
+  it("refuses SpawnAgent opt-in without pooled host tools", () => {
+    expect(() => setup({ hostTools: false, spawnAgents: true })).toThrow(/SpawnAgent delegation requires pooled subscription host tools/);
   });
 
   it("keeps newly discovered Factory Task and SpawnAgent tools outside the active catalog", async () => {
