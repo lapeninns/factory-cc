@@ -10,7 +10,7 @@ import { installShutdownHandlers } from "../src/index.js";
 import { SUBSCRIPTION_PROFILES, validateDesktopJobBinding, type SubscriptionProfile } from "../src/runtime/desktop-jobs.js";
 
 export function parseSubscriptionDesktop(argv: string[]) {
-  const values = new Map<string, string>(); let check = false, workerPool = false, controllerPool = false, hostTools = false;
+  const values = new Map<string, string>(); let check = false, workerPool = false, controllerPool = false, hostTools = false, spawnAgents = false;
   for (let i = 0; i < argv.length; i++) {
     const name = argv[i]!;
     if (name === "--check") { check = true; continue; }
@@ -26,11 +26,16 @@ export function parseSubscriptionDesktop(argv: string[]) {
       if (hostTools) throw new Error("Duplicate host-tools option.");
       hostTools = true; continue;
     }
+    if (name === "--spawn-agents") {
+      if (spawnAgents) throw new Error("Duplicate spawn-agents option.");
+      spawnAgents = true; continue;
+    }
     if (!["--profile", "--project", "--data-dir", "--port", "--runtime-path", "--state-root", "--worker-control", "--worker-mcp-prefix", "--approval-policy"].includes(name) || values.has(name) || !argv[i + 1] || argv[i + 1]!.startsWith("--")) throw new Error("Invalid subscription Desktop arguments.");
     values.set(name, argv[++i]!);
   }
   if (controllerPool && !workerPool) throw new Error("The controller pool requires --worker-pool.");
   if (hostTools && (!controllerPool || !workerPool)) throw new Error("Host tools require --controller-pool and --worker-pool.");
+  if (spawnAgents && !hostTools) throw new Error("SpawnAgent delegation requires --host-tools.");
   const approvalPolicy = values.get("--approval-policy") ?? (hostTools ? "bypass" : "ask");
   if (approvalPolicy !== "ask" && approvalPolicy !== "bypass") throw new Error("Approval policy must be ask or bypass.");
   if (approvalPolicy === "bypass" && !hostTools) throw new Error("Approval bypass requires explicit --host-tools.");
@@ -52,7 +57,7 @@ export function parseSubscriptionDesktop(argv: string[]) {
     throw new Error(workerPool ? "The pooled controller requires the exact supervised pool worker namespace."
       : "The read-only controller must use its own fixed seat's worker namespace.");
   }
-  return { check, workerPool, controllerPool, hostTools, approvalPolicy: approvalPolicy as "ask" | "bypass", profile: profile as SubscriptionProfile, project: worktree, dataDir: resolve(dataDir), runtimePath: resolve(runtimePath), stateRoot: resolve(stateRoot), port, workerControlFile: resolve(workerControlFile), workerMcpPrefix };
+  return { check, workerPool, controllerPool, hostTools, spawnAgents, approvalPolicy: approvalPolicy as "ask" | "bypass", profile: profile as SubscriptionProfile, project: worktree, dataDir: resolve(dataDir), runtimePath: resolve(runtimePath), stateRoot: resolve(stateRoot), port, workerControlFile: resolve(workerControlFile), workerMcpPrefix };
 }
 
 function privateFile(path: string): string {
@@ -101,7 +106,7 @@ export async function runSubscriptionDesktop(argv = process.argv.slice(2)): Prom
     { profile: args.profile, expectedEmail: prepared.expectedIdentity.email, configDir: prepared.env.CLAUDE_CONFIG_DIR })
     : undefined;
   if (args.check) {
-    console.log(JSON.stringify({ profile: args.profile, workerPool: args.workerPool, controllerPool: args.controllerPool, hostTools: args.hostTools, approvalPolicy: args.approvalPolicy,
+    console.log(JSON.stringify({ profile: args.profile, workerPool: args.workerPool, controllerPool: args.controllerPool, hostTools: args.hostTools, spawnAgents: args.spawnAgents, approvalPolicy: args.approvalPolicy,
       ...(subscriptionAccounts ? { controllerProfiles: subscriptionAccounts.map(account => account.profile) } : {}),
       authentication: "subscription", apiCredentialsUsed: false, preflightVerified: true, desktopJobs: true, port: args.port, modelRequestsMade: false }));
     return;
@@ -111,7 +116,7 @@ export async function runSubscriptionDesktop(argv = process.argv.slice(2)): Prom
   for (const name of Object.keys(process.env)) if (/^ANTHROPIC_|^CLAUDE_|^BRIDGE_|^AWS_|^GOOGLE_|^OPENROUTER_/.test(name)) delete process.env[name];
   Object.assign(process.env, prepared.env);
   const config = loadConfig({ mode: "sdk", authMode: "subscription", desktopProfile: true, desktopLifecycle: true, desktopJobs: true,
-    controllerReadOnly: true, workerPool: args.workerPool, controllerPool: args.controllerPool, controllerHostTools: args.hostTools, controllerApprovalPolicy: args.approvalPolicy, subscriptionAccounts,
+    controllerReadOnly: true, workerPool: args.workerPool, controllerPool: args.controllerPool, controllerHostTools: args.hostTools, controllerSpawnAgents: args.spawnAgents, controllerApprovalPolicy: args.approvalPolicy, subscriptionAccounts,
     desktopRuntimePath: args.runtimePath, desktopStateRoot: args.stateRoot,
     host: "127.0.0.1", port: args.port, dataDir: args.dataDir, sdkCwd: args.project, permissionMode: "ask", maxSessions: 16,
     clientToken: credentials.client ?? randomBytes(32).toString("hex"), adminToken: credentials.admin ?? randomBytes(32).toString("hex"), hookToken: credentials.hook ?? randomBytes(32).toString("hex"),
@@ -125,7 +130,7 @@ export async function runSubscriptionDesktop(argv = process.argv.slice(2)): Prom
   }
   const logger = createLogger(config.logDir), app = createBridgeApp(config, logger, join(config.sandboxDir, "CANARY.txt"));
   installShutdownHandlers(app, logger); await listen(app, config);
-  console.log(JSON.stringify({ ready: true, profile: args.profile, workerPool: args.workerPool, controllerPool: args.controllerPool, hostTools: args.hostTools, approvalPolicy: args.approvalPolicy,
+  console.log(JSON.stringify({ ready: true, profile: args.profile, workerPool: args.workerPool, controllerPool: args.controllerPool, hostTools: args.hostTools, spawnAgents: args.spawnAgents, approvalPolicy: args.approvalPolicy,
     url: app.url, authentication: "subscription", apiCredentialsUsed: false }));
 }
 

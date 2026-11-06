@@ -116,6 +116,7 @@ interface LiveWorker {
   lease?: WorkerLease;
   approvalBatch?: SubscriptionApprovalBatch;
   launchPending?: boolean;
+  configDir?: string;
 }
 const silentLogger = { info() {}, warn() {}, error() {} } as unknown as Logger;
 
@@ -469,6 +470,7 @@ export class APIWorkerService {
       const { support, env, identity } = await this.prepareRuntime();
       stage = "execution";
       if (this.options.provider.kind !== "subscription") env.CLAUDE_CONFIG_DIR = privateDirectory(join(this.root, "native-config", record.id));
+      live.configDir = env.CLAUDE_CONFIG_DIR;
       const permission: CanUseTool = (tool, input, options) => this.requestPermission(live, tool, input, options.signal, options.toolUseID);
       const options: Options = {
         cwd: record.workingDirectory ?? record.worktree, env, abortController: live.controller, model: "claude-opus-5-5", effort: "medium",
@@ -559,9 +561,14 @@ export class APIWorkerService {
       record.resultState = live.cancelRequested ? "cancelled" : "failed";
       record.state = "cleaning";
       record.backoff ??= workerBackoff(error);
-      record.reason = live.cancelRequested ? "cancelled" : deadline ? "deadline_exceeded" : admissionRejected ? (error as BridgeError).code : record.backoff ? "native_" + record.backoff.kind : "native_execution_failed";
+      // The SDK can throw after delivering an error result (for example
+      // error_max_turns); that recorded subtype is the actual cause.
+      const resultReason = live.sawResult && !live.resultSucceeded ? record.reason : undefined;
+      record.reason = live.cancelRequested ? "cancelled" : deadline ? "deadline_exceeded" : admissionRejected ? (error as BridgeError).code : record.backoff ? "native_" + record.backoff.kind : resultReason ?? "native_execution_failed";
       record.error = "Worker execution did not complete successfully. Review its recorded state and approvals.";
-      record.failure = safeFailure(error, stage, record.reason);
+      record.failure = record.reason === resultReason && resultReason
+        ? { stage: "execution", code: resultReason, message: "The native worker ended with an error result. Read transcriptPath for its final turns." }
+        : safeFailure(error, stage, record.reason);
       this.save(live);
     } finally {
       live.generation++;
@@ -764,7 +771,11 @@ export class APIWorkerService {
       }
     }
     if (!isChild && typeof value.session_id === "string" && value.session_id.length < 160) {
-      if (!record.sdkSessionId) record.sdkSessionId = value.session_id;
+      if (!record.sdkSessionId) {
+        record.sdkSessionId = value.session_id;
+        const transcript = transcriptPath(live.configDir, record.workingDirectory ?? record.worktree, value.session_id);
+        if (transcript) record.transcriptPath = transcript;
+      }
       else if (record.sdkSessionId !== value.session_id) {
         live.resultSucceeded = false; record.reason = "root_session_identity_changed";
         throw new Error("Native root session identity changed.");
@@ -841,6 +852,13 @@ function safeFailure(error: unknown, stage: "admission" | "execution", fallback:
   const nativeCode = error instanceof BridgeError ? error.code : value?.code;
   const code = typeof nativeCode === "string" && /^[A-Za-z0-9_.-]{1,80}$/.test(nativeCode) ? nativeCode : fallback;
   return { stage, code, message: stage === "admission" ? "Worker admission or runtime preflight failed." : "Native worker execution failed. The result and completed child records are retained." };
+}
+
+/** Mirrors Claude Code's project folder naming; long paths use a hashed name we do not guess. */
+function transcriptPath(configDir: string | undefined, cwd: string, sessionId: string): string | undefined {
+  if (!configDir || !isAbsolute(configDir) || !/^[A-Za-z0-9-]{1,128}$/.test(sessionId)) return undefined;
+  const project = cwd.replace(/[^A-Za-z0-9]/g, "-");
+  return project.length > 200 ? undefined : join(configDir, "projects", project, sessionId + ".jsonl");
 }
 
 function now(): string { return new Date().toISOString(); }

@@ -309,6 +309,19 @@ describe("Factory supervised API workers", () => {
     expect(failed.status(b.id).reason).toBe("error_max_budget_usd");
     expect(failed.status(b.id).usage).toBeUndefined();
   });
+  it("keeps the native error result as the failure reason when the SDK throws afterwards", async () => {
+    const runtime = service({ run: async (context) => {
+      context.message({ type: "system", subtype: "init", session_id: "turn-limit-session" });
+      context.message({ type: "result", subtype: "error_max_turns", is_error: true, session_id: "turn-limit-session" });
+      throw new Error("Reached maximum number of turns");
+    } });
+    const worker = await runtime.start({ repository: repo, task: "x", workflow: "implement" });
+    await until(() => runtime.status(worker.id).state === "failed");
+    const status = runtime.status(worker.id);
+    expect(status).toMatchObject({ reason: "error_max_turns", failure: { stage: "execution", code: "error_max_turns" }, sdkSessionId: "turn-limit-session" });
+    const cwd = status.workingDirectory ?? status.worktree;
+    expect(status.transcriptPath).toBe(join(folder, "state", "native-config", worker.id, "projects", cwd.replace(/[^A-Za-z0-9]/g, "-"), "turn-limit-session.jsonl"));
+  });
   it("keeps the root identity and fails a root success if a child failed", async () => {
     const runtime = service({ run: async (context) => {
       context.message({ type: "system", subtype: "init", session_id: "root-session" });
