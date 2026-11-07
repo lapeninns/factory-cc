@@ -233,7 +233,7 @@ export class SubscriptionWorkerPool {
   private view(route: PoolRoute, value: unknown): Record<string, unknown> {
     if (!object(value) || value.id !== route.backendId || (value.subscriptionProfile !== undefined && value.subscriptionProfile !== route.profile)) throw new Error("Fixed worker identity did not match its pinned route.");
     const observedState = typeof value.state === "string" ? value.state : "unknown";
-    const active = !terminalStates.has(observedState) || value.cleanupVerified !== true;
+    const active = !terminalStates.has(observedState) || value.cleanupVerified !== true || value.leaseReleased === false;
     if (route.observedState !== observedState || route.active !== active) {
       route.observedState = observedState; route.active = active; this.save();
     }
@@ -284,7 +284,8 @@ export class SubscriptionWorkerPool {
   }
   private recoveryRequired(profile: SubscriptionProfile): boolean {
     return this.state.routes.some(route => route.profile === profile && !route.rejectionCode
-      && (route.phase === "unknown" || route.observedState === "unknown"));
+      && (route.phase === "unknown" || route.observedState === "unknown"
+        || terminalStates.has(route.observedState ?? "") && route.active === true));
   }
   async accounts(signal?: AbortSignal): Promise<Record<string, unknown>> {
     await this.refreshActive(signal);
@@ -301,9 +302,13 @@ export class SubscriptionWorkerPool {
         completedWorkers: routes.filter(route => route.observedState === "completed" && route.active === false).length,
         failedWorkers: routes.filter(route => route.rejectionCode || route.observedState === "failed").length,
         unknownWorkers: routes.filter(route => !route.rejectionCode && (route.phase === "unknown" || route.observedState === "unknown")).length,
+        recoveryWorkers: routes.filter(route => !route.rejectionCode && (route.phase === "unknown" || route.observedState === "unknown"
+          || terminalStates.has(route.observedState ?? "") && route.active === true))
+          .map(route => ({ id: route.id, ...(route.backendId ? { backendId: route.backendId } : {}) })),
         ...(coolingUntil > now ? { coolingUntil: new Date(coolingUntil).toISOString() } : {}) };
     }));
-    return { checkedAt: new Date(now).toISOString(), seatCount: accounts.length, weightMeaning: "assignment_priority", accounts };
+    return { checkedAt: new Date(now).toISOString(), seatCount: accounts.length, weightMeaning: "assignment_priority",
+      eligibilityMeaning: "routing_admission_not_provider_allowance", remainingProviderAllowance: "unknown", accounts };
   }
   private async select(signal?: AbortSignal): Promise<PoolBackend> {
     await this.refreshActive(signal);
@@ -365,7 +370,7 @@ export class SubscriptionWorkerPool {
       if (isWorkerStartRejection(result)) {
         route.phase = "unknown"; route.rejectionCode = result.code; route.active = false; route.observedState = "failed";
         route.updatedAt = new Date(this.now()).toISOString();
-        if (["subscription_preflight_failed", "runtime_unverified", "service_unavailable"].includes(result.code)) {
+        if (result.code.startsWith("subscription_") || ["runtime_unverified", "service_unavailable"].includes(result.code)) {
           this.state.coolUntil[route.profile] = Math.max(this.state.coolUntil[route.profile] ?? 0, this.now() + 30_000);
         }
         this.save();

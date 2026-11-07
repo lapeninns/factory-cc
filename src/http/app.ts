@@ -29,7 +29,7 @@ import { ControlBroker } from "../control/broker.js";
 import { controlPageHtml, controlPageHeaders } from "./control-page.js";
 import { configuredModels, providerFromModelId, resolveRequestModel, type BridgeModel, type ModelProvider } from "../models.js";
 import { ClaudePool, PERSONAL_ACCOUNT, POOL_PROFILE } from "../upstream/claude-pool.js";
-import { DesktopJobsRuntime, type DesktopJobBinding } from "../runtime/desktop-jobs.js";
+import { DesktopJobsRuntime, SUBSCRIPTION_WORKER_SLOTS, type DesktopJobBinding } from "../runtime/desktop-jobs.js";
 import type { RuntimeRequest } from "../runtime/types.js";
 
 export interface BridgeApp {
@@ -101,7 +101,7 @@ export async function prepareControllerWorkspaceMigration(config: BridgeConfig, 
 export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath: string, runtime: BridgeRuntime = createRuntime(config, logger, canaryPath)): BridgeApp {
   if (config.desktopJobs) runtime = new DesktopJobsRuntime(runtime, {
     pythonExecutable: "/usr/bin/python3", runtimePackagePath: config.desktopRuntimePath!,
-    stateRoot: config.desktopStateRoot!, maxRunning: 2, workerMcpPrefix: config.workerMcpPrefix,
+    stateRoot: config.desktopStateRoot!, maxRunning: config.workerPool ? SUBSCRIPTION_WORKER_SLOTS : 2, workerMcpPrefix: config.workerMcpPrefix,
     getBinding: (input) => controllerJobBinding(config, input),
   });
   const store = new SessionStore(join(config.dataDir, "sessions"), config.persistSessions, config.maxSessions, logger, {

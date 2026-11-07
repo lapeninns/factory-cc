@@ -9,7 +9,7 @@ import { pathToFileURL } from "node:url";
 import { APIWorkerService, type APIWorkerServiceOptions, type WorkerApprovalPolicy, type WorkerRepositoryPolicy, type WorkerView } from "../src/workers/service.js";
 import { callWorkerExecutor, launchWorkerExecutor, workerExecutorStatus, type WorkerExecutorController } from "../src/workers/executor.js";
 import { startWorkerControl } from "../src/workers/control.js";
-import { acquireDesktopJobLease, updateDesktopJobRecord, SUBSCRIPTION_PROFILES, type SubscriptionProfile } from "../src/runtime/desktop-jobs.js";
+import { acquireDesktopJobLease, updateDesktopJobRecord, SUBSCRIPTION_PROFILES, SUBSCRIPTION_WORKER_SLOTS, type SubscriptionProfile } from "../src/runtime/desktop-jobs.js";
 import { startWorkerMcp } from "../src/workers/http.js";
 import { prepareSubscription } from "../src/workers/subscription-auth.js";
 import { WorkerStartRejected } from "../src/workers/start-rejection.js";
@@ -74,7 +74,8 @@ export function createWorkerServiceOptions(config: WorkerServerConfig): APIWorke
   const runtime = realpathSync(config.nativeRuntimePath);
   const policy = readFileSync(join(runtime, "policies/team-policy.md"), "utf8");
   const workflows = Object.fromEntries(["implement", "investigate", "release-prepare"].map(name => [name, readFileSync(join(runtime, "workflows", name + ".md"), "utf8")]));
-  const leases = { pythonExecutable: "/usr/bin/python3", runtimePackagePath: runtime, stateRoot: config.sharedStateRoot, maxRunning: 2 };
+  const leases = { pythonExecutable: "/usr/bin/python3", runtimePackagePath: runtime, stateRoot: config.sharedStateRoot,
+    maxRunning: config.provider === "subscription" ? SUBSCRIPTION_WORKER_SLOTS : 2 };
   return { stateRoot: config.stateRoot, workspaceRoot: config.workspaceRoot,
     allowedRepositories: config.allowedRepositories, repositoryPolicy: config.repositoryPolicy, approvalPolicy: config.approvalPolicy ?? (config.provider === "subscription" ? "bypass" : "ask"),
     provider: config.provider === "subscription" ? { kind: "subscription", profile: config.subscriptionProfile!, mappingPath: config.profileMappingPath } : { kind: config.provider }, maxConcurrent: config.provider === "subscription" ? 1 : 2,
@@ -114,7 +115,7 @@ export async function runFactoryWorkers(argv = process.argv.slice(2), options: {
   let subscriptionLoginVerified = false;
   if (config.provider === "subscription" && (check || serve)) {
     try { await prepareSubscription(config.subscriptionProfile!, { mappingPath: config.profileMappingPath }); subscriptionLoginVerified = true; }
-    catch { if (config.enabled) throw new Error("The fixed Team subscription login is not ready."); }
+    catch (error) { if (config.enabled) throw error; }
   } else if (check || serve) {
     try { key = privateFile(config.apiKeyFile!, 16384).trim() || undefined; } catch { if (config.enabled) throw new Error("Configured API credential is unavailable or unsafe."); }
   }
@@ -137,7 +138,7 @@ export async function runFactoryWorkers(argv = process.argv.slice(2), options: {
   }
   const executionOptions = createWorkerServiceOptions(config);
   const snapshot = (worker: Parameters<NonNullable<APIWorkerServiceOptions["executionHost"]>["status"]>[0]): WorkerView => {
-    const current = workerExecutorStatus(config.stateRoot, worker.id);
+    const current = workerExecutorStatus(config.stateRoot, worker.id, { sharedStateRoot: config.sharedStateRoot });
     if (current) return current;
     if (["completed", "failed", "cancelled", "unknown"].includes(worker.state)) return { ...structuredClone(worker), approvals: [] };
     return { ...structuredClone(worker), state: "unknown", reason: "executor_ownership_unconfirmed", cleanupVerified: null, pendingApprovalCount: 0, approvals: [] };

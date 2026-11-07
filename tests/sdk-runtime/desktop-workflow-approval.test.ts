@@ -8,7 +8,10 @@ import { SdkRuntime, type SdkHandle, type SdkUserInput } from "../../src/runtime
 import type { RuntimeRequest } from "../../src/runtime/types.js";
 import type { MessagesRequest } from "../../src/types.js";
 
-vi.mock("../../src/runtime/native-workflow-support.js", () => ({ assertNativeWorkflowSupport: () => ({ executable: "/offline-fixture/claude" }) }));
+vi.mock("../../src/runtime/native-workflow-support.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../src/runtime/native-workflow-support.js")>(),
+  assertNativeWorkflowSupport: () => ({ executable: "/offline-fixture/claude" }),
+}));
 const runtimes: SdkRuntime[] = [];
 const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
 const ask = { name: "AskUser", input_schema: { type: "object", properties: { questionnaire: { type: "string" }, blocking: { type: "boolean" } }, required: ["questionnaire"], additionalProperties: false } };

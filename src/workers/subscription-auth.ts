@@ -5,13 +5,14 @@ import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { userInfo } from "node:os";
 import { promisify } from "node:util";
-import type { NativeWorkflowSupport } from "../runtime/native-workflow-support.js";
+import { assertNativeWorkflowSupport, NATIVE_WORKFLOW_BUILD, type NativeWorkflowSupport } from "../runtime/native-workflow-support.js";
 import { SUBSCRIPTION_PROFILES, type SubscriptionProfile } from "../runtime/desktop-jobs.js";
+import { BridgeError } from "../types.js";
 
 const execute = promisify(execFile);
 const PROFILES = new Set<string>(SUBSCRIPTION_PROFILES);
-const EXPECTED_CLI_VERSION = "2.1.316";
-const EXPECTED_SDK_VERSION = "0.3.300";
+const EXPECTED_CLI_VERSION = NATIVE_WORKFLOW_BUILD.cliVersion;
+const EXPECTED_SDK_VERSION = NATIVE_WORKFLOW_BUILD.sdkVersion;
 const BASE_ENVIRONMENT = new Set(["PATH", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "TERM", "COLORTERM", "TZ", "LANG"]);
 const NO_API_SOURCES = new Set(["", "none", "oauth"]);
 
@@ -38,9 +39,29 @@ export interface PreparedSubscription {
   runtime: NativeWorkflowSupport;
 }
 
-function failure(): Error {
-  return new Error(`Subscription authentication failed. Verify the pinned Claude CLI ${EXPECTED_CLI_VERSION} installation and this connection's assigned Team seat through native Claude login; no other account or API route will be selected.`);
+export type SubscriptionFailureCode = "subscription_profile_invalid" | "subscription_runtime_missing" | "subscription_runtime_unverified" | "subscription_login_unavailable" | "subscription_identity_mismatch";
+const FAILURE_MESSAGES: Record<SubscriptionFailureCode, string> = {
+  subscription_profile_invalid: "The fixed Team profile mapping or its private directory is invalid.",
+  subscription_runtime_missing: "The packaged subscription CLI is missing. Restore the complete pinned SDK release.",
+  subscription_runtime_unverified: "The packaged subscription CLI or SDK failed version, ownership or digest verification.",
+  subscription_login_unavailable: "The assigned Team login could not be verified through native Claude login status.",
+  subscription_identity_mismatch: "Native login does not match the configured first-party Team subscription identity.",
+};
+/** Fixed messages only: never attach raw CLI output, paths, identities or causes. */
+export class SubscriptionFailure extends Error {
+  constructor(readonly code: SubscriptionFailureCode) {
+    super("Subscription authentication failed. " + FAILURE_MESSAGES[code] + " Verify the assigned Team seat; no other account or API route will be selected.");
+    this.name = "SubscriptionFailure";
+  }
 }
+function failure(code: SubscriptionFailureCode = "subscription_identity_mismatch"): SubscriptionFailure {
+  return new SubscriptionFailure(code);
+}
+export function subscriptionFailureReport(error: unknown): { code: string; message: string } {
+  return error instanceof SubscriptionFailure ? { code: error.code, message: error.message }
+    : { code: "worker_startup_failed", message: "Worker startup failed. Inspect private configuration, service ownership and runtime installation." };
+}
+
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -62,7 +83,7 @@ function readMapping(path: string, profile: string): SubscriptionIdentity {
     const folder = lstatSync(configDir);
     if (!folder.isDirectory() || !owned(folder) || (folder.mode & 0o077) !== 0) throw failure();
     return { profile: profile as SubscriptionIdentity["profile"], email: selected.email.trim(), configDir };
-  } catch { throw failure(); }
+  } catch { throw failure("subscription_profile_invalid"); }
 }
 
 /** Allowlist keeps API, router, cloud, OAuth-token and process-injection variables out. */
@@ -101,31 +122,41 @@ export function verifyNativeSubscription(info: unknown, identity: Pick<Subscript
 
 /** Select one operator-configured profile. This function never pools or rotates accounts. */
 export async function prepareSubscription(profile: string, options: SubscriptionOptions = {}): Promise<PreparedSubscription> {
+  let stage: SubscriptionFailureCode = "subscription_profile_invalid";
   try {
     const home = userInfo().homedir;
     const identity = readMapping(options.mappingPath ?? join(home, ".factory/config/native-ultracode-profiles.json"), profile);
     const env = sanitizedSubscriptionEnvironment(options.sourceEnv ?? process.env, identity.configDir);
-    // The login CLI has its own verified version. The mutable launcher can
-    // advance independently of the separately pinned native workflow runtime.
-    const selectedExecutable = options.executable ?? join(home, ".local/share/claude/versions", EXPECTED_CLI_VERSION);
-    if (!isAbsolute(selectedExecutable)) throw failure();
-    // Resolve once so an explicitly supplied symlink cannot switch executables
-    // between the version and identity checks.
+    // Authentication and inference belong to the same immutable, verified release.
+    // Native auto-updaters may prune ~/.local/share/claude/versions at any time.
+    stage = "subscription_runtime_unverified";
+    const bundled = options.executable === undefined ? assertNativeWorkflowSupport() : undefined;
+    const selectedExecutable = options.executable ?? bundled!.executable;
+    if (!isAbsolute(selectedExecutable)) throw failure(stage);
+    stage = "subscription_runtime_missing";
     const executable = realpathSync(selectedExecutable), info = lstatSync(executable);
-    if (!info.isFile() || !owned(info) || (info.mode & 0o022) !== 0 || (info.mode & 0o111) === 0) throw failure();
+    stage = "subscription_runtime_unverified";
+    if (!info.isFile() || !owned(info) || (info.mode & 0o022) !== 0 || (info.mode & 0o111) === 0) throw failure(stage);
     const sdkPath = dirname(createRequire(import.meta.url).resolve("@anthropic-ai/claude-agent-sdk"));
     const sdk = JSON.parse(readFileSync(join(sdkPath, "package.json"), "utf8"));
-    if (sdk.version !== EXPECTED_SDK_VERSION) throw failure();
+    if (sdk.version !== EXPECTED_SDK_VERSION) throw failure(stage);
     const before = await hashFile(executable);
-    if (options.expectedSha256 !== undefined && (!/^[a-f0-9]{64}$/.test(options.expectedSha256) || before !== options.expectedSha256)) throw failure();
+    const expectedSha256 = options.expectedSha256 ?? bundled?.sha256;
+    if (expectedSha256 !== undefined && (!/^[a-f0-9]{64}$/.test(expectedSha256) || before !== expectedSha256)) throw failure(stage);
     const run = options.runCli ?? nativeCli;
     const version = (await run(executable, ["--version"], env)).stdout.trim();
-    if (!new RegExp(`^${EXPECTED_CLI_VERSION.replaceAll(".", "\\.")}(?: \\([^\\r\\n]*\\))?$`).test(version)) throw failure();
+    if (version !== EXPECTED_CLI_VERSION && version !== EXPECTED_CLI_VERSION + " (Claude Code)") throw failure(stage);
+    stage = "subscription_login_unavailable";
     const status: unknown = JSON.parse((await run(executable, ["auth", "status", "--json"], env)).stdout);
-    if (!object(status) || status.loggedIn !== true || status.authMethod !== "claude.ai") throw failure();
+    if (!object(status) || status.loggedIn !== true || status.authMethod !== "claude.ai") throw failure(stage);
     verifyNativeSubscription(status, identity);
-    if (before !== await hashFile(executable)) throw failure();
+    stage = "subscription_runtime_unverified";
+    if (before !== await hashFile(executable)) throw failure(stage);
     return { env, expectedIdentity: identity,
       runtime: { executable, sdkVersion: sdk.version, cliVersion: EXPECTED_CLI_VERSION, sha256: before } };
-  } catch { throw failure(); }
+  } catch (error) {
+    if (error instanceof SubscriptionFailure) throw error;
+    if (error instanceof BridgeError && error.code === "workflow_runtime_unverified" && error.extra.runtime_missing === true) throw failure("subscription_runtime_missing");
+    throw failure(stage);
+  }
 }

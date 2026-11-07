@@ -167,12 +167,11 @@ Provision the official CLI login for each intended seat separately. The default
 mapping is `~/.factory/config/native-ultracode-profiles.json`, a private regular
 file owned by the operator. Its `profiles` object maps `team1`–`team8` to `email`
 and absolute `configDir` fields. Do not commit the mapping, OAuth state or private
-runtime configuration. Authentication uses the version-specific official CLI
-at `~/.local/share/claude/versions/2.1.316`. Updating the ordinary
-`~/.local/bin/claude` launcher does not change that selection. The pinned
-installation must remain available. The native workflow executable is verified
-separately against the Agent SDK 0.3.300 bundled CLI 2.1.300 and its recorded
-digest. Other versions require separate validation.
+runtime configuration. Authentication uses the same verified, unmodified CLI
+packaged with Agent SDK 0.3.300: CLI 2.1.300 and its recorded digest. The native
+login CLI's auto-updated version directory is not a release dependency. Updating
+or pruning `~/.local/share/claude/versions` cannot remove the packaged runtime.
+Other SDK or bundled CLI versions require separate validation.
 
 Each fixed worker service has a private config with `provider: "subscription"`,
 its exact `subscriptionProfile`, `stateRoot`, `workspaceRoot`, `nativeRuntimePath`,
@@ -186,6 +185,33 @@ permission handling have been validated.
 node workers-dist/scripts/subscription-workers.js --check --config /absolute/private/team1.json
 node workers-dist/scripts/subscription-workers.js --serve --config /absolute/private/team1.json
 ```
+
+Run read-only candidate diagnostics for all eight profiles with:
+
+```sh
+node workers-dist/scripts/subscription-doctor.js --config /absolute/private/pool-config.json
+```
+
+This checks login and existing executor/lease evidence without constructing a
+worker service, changing saved state, or making a model request. A verified login
+does not measure remaining provider allowance. Startup errors retain fixed,
+sanitized codes for profile, runtime, login and identity failures; raw native
+output and private identities are never included.
+
+The subscription worker services and pooled controller share an eight-worker
+admission ceiling, with one executing worker per seat and a separate controller
+lane. Assignment weights do not increase these ceilings. Pending admissions,
+turn limits and deadlines are local resource policies, not provider entitlements.
+
+A departed executor snapshot with `shared_lease_release_unproven` can be projected
+as settled only when its saved cleanup is verified and the shared ledger records
+the same terminal outcome for the exact worker, worktree, account and original
+executor birth identity. The executor group and lease helper must be absent from
+a successful process observation. Missing, unsafe, live, mismatched or incomplete
+evidence retains recovery. The projection is read-only: it neither clears a
+lease nor rewrites the original failure evidence. The pool refreshes its own
+observations from the resulting backend status; it never replays an uncertain
+start on another account.
 
 Factory's stdio MCP entry uses the same command without `--serve`. It connects to
 the existing loopback service rather than creating another worker owner. A

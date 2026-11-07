@@ -8,6 +8,8 @@ import type { BridgeRuntime, RetiredSession, RuntimeControl, RuntimeHostEnd, Run
 /** Values supplied by the authenticated host controller, never request metadata. */
 export const SUBSCRIPTION_PROFILES = ["team1", "team2", "team3", "team4", "team5", "team6", "team7", "team8"] as const;
 export type SubscriptionProfile = typeof SUBSCRIPTION_PROFILES[number];
+/** One execution per configured seat. Routing weights never multiply capacity. */
+export const SUBSCRIPTION_WORKER_SLOTS = SUBSCRIPTION_PROFILES.length;
 export type DesktopWorkspacePolicy = "controller-readonly" | "controller-host";
 export interface DesktopJobBinding { sessionId: string; cwd: string; launchId?: string; subscriptionProfile?: SubscriptionProfile; workspacePolicy?: DesktopWorkspacePolicy; nativeGeneration?: number }
 export type DesktopJobState = "waiting_host" | "idle" | "completed" | "failed" | "cancelled" | "unknown";

@@ -3,11 +3,18 @@ import { chmodSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, 
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { prepareSubscription, sanitizedSubscriptionEnvironment, verifyNativeSubscription, type SubscriptionIdentity } from "../../src/workers/subscription-auth.js";
+import { BridgeError } from "../../src/types.js";
+import { assertNativeWorkflowSupport } from "../../src/runtime/native-workflow-support.js";
+import { prepareSubscription, subscriptionFailureReport, sanitizedSubscriptionEnvironment, verifyNativeSubscription, type SubscriptionIdentity } from "../../src/workers/subscription-auth.js";
 
 vi.mock("node:os", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:os")>();
   return { ...actual, userInfo: vi.fn(actual.userInfo) };
+});
+
+vi.mock("../../src/runtime/native-workflow-support.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/runtime/native-workflow-support.js")>();
+  return { ...actual, assertNativeWorkflowSupport: vi.fn(actual.assertNativeWorkflowSupport) };
 });
 
 const actualUser = userInfo();
@@ -28,39 +35,50 @@ function fixture() {
   writeFileSync(mappingPath, JSON.stringify({ version: 1, profiles }), { mode: 0o600 });
   const executable = join(root, "claude");
   writeFileSync(executable, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  vi.mocked(assertNativeWorkflowSupport).mockReturnValue({ executable, cliVersion: "2.1.300", sdkVersion: "0.3.300", sha256: createHash("sha256").update(readFileSync(executable)).digest("hex") });
   const status = { loggedIn: true, authMethod: "claude.ai", apiProvider: "firstParty", subscriptionType: "team", email: profiles.team1!.email };
-  const runCli = vi.fn(async (_exe: string, args: string[]) => ({ stdout: args[0] === "--version" ? "2.1.316 (Claude Code)\n" : JSON.stringify(status) }));
+  const runCli = vi.fn(async (_exe: string, args: string[]) => ({ stdout: args[0] === "--version" ? "2.1.300 (Claude Code)\n" : JSON.stringify(status) }));
   return { root, mappingPath, executable, profiles, status, runCli };
 }
 
 describe("fixed-seat subscription worker authentication", () => {
-  it("keeps the default login CLI pinned when the mutable launcher is updated", async () => {
+  it("uses the packaged runtime after the native updater prunes all managed CLI versions", async () => {
     const f = fixture();
     vi.mocked(userInfo).mockReturnValue({ ...actualUser, homedir: f.root });
-    const versions = join(f.root, ".local/share/claude/versions");
     const bin = join(f.root, ".local/bin");
-    mkdirSync(versions, { recursive: true });
     mkdirSync(bin, { recursive: true });
-    const pinned = join(versions, "2.1.316"), updated = join(versions, "2.1.317");
-    writeFileSync(pinned, "pinned-login-cli", { mode: 0o700 });
-    writeFileSync(updated, "updated-login-cli", { mode: 0o700 });
-    symlinkSync(updated, join(bin, "claude"));
-
+    symlinkSync("/missing-new-cli", join(bin, "claude"));
     const prepared = await prepareSubscription("team1", { mappingPath: f.mappingPath, runCli: f.runCli });
-    expect(prepared.runtime.executable).toBe(pinned);
-    expect(f.runCli.mock.calls.every(([executable]) => executable === pinned)).toBe(true);
+    expect(prepared.runtime.executable).toBe(f.executable);
+    expect(f.runCli.mock.calls.every(([executable]) => executable === f.executable)).toBe(true);
+    expect(assertNativeWorkflowSupport).toHaveBeenCalled();
   });
 
-  it("reports a missing pinned login CLI without falling back to the mutable launcher", async () => {
+  it("preserves a missing bundled runtime diagnosis without exposing dependency paths", async () => {
     const f = fixture();
-    vi.mocked(userInfo).mockReturnValue({ ...actualUser, homedir: f.root });
-    const bin = join(f.root, ".local/bin");
-    mkdirSync(bin, { recursive: true });
-    symlinkSync(f.executable, join(bin, "claude"));
-
-    await expect(prepareSubscription("team1", { mappingPath: f.mappingPath, runCli: f.runCli }))
-      .rejects.toThrow("Verify the pinned Claude CLI 2.1.316 installation");
+    vi.mocked(assertNativeWorkflowSupport).mockImplementationOnce(() => { throw new BridgeError(503, "workflow_runtime_unverified", "/private/dependency/path", { runtime_missing: true }); });
+    try { await prepareSubscription("team1", { mappingPath: f.mappingPath }); throw new Error("expected rejection"); }
+    catch (error) { expect(subscriptionFailureReport(error)).toMatchObject({ code: "subscription_runtime_missing" }); expect(String(error)).not.toContain("/private/"); }
     expect(f.runCli).not.toHaveBeenCalled();
+  });
+
+  it("reports a missing explicit CLI without falling back to the mutable launcher", async () => {
+    const f = fixture();
+    await expect(prepareSubscription("team1", { ...f, executable: join(f.root, "missing") }))
+      .rejects.toMatchObject({ code: "subscription_runtime_missing" });
+    expect(f.runCli).not.toHaveBeenCalled();
+  });
+
+  it("retains sanitized failure categories and never logs an unknown exception", async () => {
+    const f = fixture();
+    f.status.loggedIn = false;
+    await expect(prepareSubscription("team1", f)).rejects.toMatchObject({ code: "subscription_login_unavailable" });
+    f.status.loggedIn = true; f.status.email = "private-other@example.invalid";
+    try { await prepareSubscription("team1", f); } catch (error) {
+      expect(subscriptionFailureReport(error)).toMatchObject({ code: "subscription_identity_mismatch" });
+      expect(JSON.stringify(subscriptionFailureReport(error))).not.toContain("private-other");
+    }
+    expect(JSON.stringify(subscriptionFailureReport(new Error("secret-token")))).not.toContain("secret-token");
   });
 
   it("selects exactly the configured profile and exposes only sanitized environment", async () => {
@@ -74,7 +92,7 @@ describe("fixed-seat subscription worker authentication", () => {
     } });
     expect(prepared.env).toEqual({ PATH: "/usr/bin:/bin", HOME: userInfo().homedir, LANG: "en_GB.UTF-8", LC_ALL: "C", TERM: "xterm", CLAUDE_CONFIG_DIR: f.profiles.team1!.configDir, CLAUDE_CODE_EFFORT_LEVEL: "medium" });
     expect(prepared.expectedIdentity.profile).toBe("team1");
-    expect(prepared.runtime).toMatchObject({ executable: f.executable, cliVersion: "2.1.316", sdkVersion: "0.3.300" });
+    expect(prepared.runtime).toMatchObject({ executable: f.executable, cliVersion: "2.1.300", sdkVersion: "0.3.300" });
     expect(prepared.runtime.sha256).toBe(createHash("sha256").update(readFileSync(f.executable)).digest("hex"));
     expect(f.runCli.mock.calls.map(([, args]) => args)).toEqual([["--version"], ["auth", "status", "--json"]]);
   });
@@ -137,13 +155,13 @@ describe("fixed-seat subscription worker authentication", () => {
     await expect(prepareSubscription("team1", f)).rejects.toThrow();
     expect(f.runCli).toHaveBeenCalledTimes(1);
     await expect(prepareSubscription("team1", { ...f, expectedSha256: "0".repeat(64) })).rejects.toThrow();
-    const bad = vi.fn(async (_exe: string, args: string[]) => ({ stdout: args[0] === "--version" ? "2.1.316" : "malformed-private-response" }));
+    const bad = vi.fn(async (_exe: string, args: string[]) => ({ stdout: args[0] === "--version" ? "2.1.300" : "malformed-private-response" }));
     await expect(prepareSubscription("team1", { ...f, runCli: bad })).rejects.not.toThrow("malformed-private-response");
   });
 
   it("uses the real process boundary for a fake executable without shell interpolation", async () => {
     const f = fixture();
-    writeFileSync(f.executable, `#!/bin/sh\nif [ "$1" = "--version" ]; then printf '%s\\n' '2.1.316 (Claude Code)'; else printf '%s\\n' '${JSON.stringify(f.status)}'; fi\n`, { mode: 0o700 });
+    writeFileSync(f.executable, `#!/bin/sh\nif [ "$1" = "--version" ]; then printf '%s\\n' '2.1.300 (Claude Code)'; else printf '%s\\n' '${JSON.stringify(f.status)}'; fi\n`, { mode: 0o700 });
     const prepared = await prepareSubscription("team1", { mappingPath: f.mappingPath, executable: f.executable });
     expect(prepared.expectedIdentity.profile).toBe("team1");
   });

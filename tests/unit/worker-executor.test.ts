@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
-import { lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -130,5 +130,49 @@ describe("durable worker executor", () => {
     }), { gateTimeoutMs: 20, snapshotMs: 20 });
     expect(starts).toBe(0);
     expect(workerExecutorStatus(options.root, options.id)?.state).toBe("cancelled");
+  });
+});
+
+
+describe("shared lease completion reconciliation", () => {
+  it("accepts an exact terminal receipt after executor departure without replaying or modifying evidence", async () => {
+    const options = fixture();
+    await launchWorkerExecutor(options); active.push({ root: options.root, id: options.id });
+    await expect.poll(() => workerExecutorStatus(options.root, options.id)?.state).toBe("waiting_approval");
+    await callWorkerExecutor(options.root, options.id, "approve", { id: options.id, approvalId: "approval-one", decision: "allow" });
+    await expect.poll(() => workerExecutorStatus(options.root, options.id)?.state).toBe("completed");
+    const executorRoot = join(options.root, "executors", options.id);
+    const receipt = JSON.parse(readFileSync(join(executorRoot, "receipt.json"), "utf8"));
+    await expect.poll(() => { try { process.kill(receipt.pid, 0); return false; } catch { return true; } }).toBe(true);
+    const viewPath = join(executorRoot, "view.json"), original = readFileSync(viewPath, "utf8");
+    const view = { ...JSON.parse(original), state: "unknown", reason: "shared_lease_release_unproven", resultState: "completed", leaseReleased: false,
+      authentication: "subscription", subscriptionProfile: "team1", worktree: "/fixture/worktree", endedAt: "2026-11-07T01:02:05.121Z" };
+    const sharedStateRoot = join(options.root, "native-state");
+    mkdirSync(sharedStateRoot, { mode: 0o700 }); mkdirSync(join(sharedStateRoot, "jobs"), { mode: 0o700 });
+    const jobId = "factory-" + createHash("sha256").update(options.id + "\0" + options.id).digest("hex").slice(0, 32);
+    const jobPath = join(sharedStateRoot, "jobs", jobId + ".json");
+    const job = { version: 1, id: jobId, kind: "factory-session", role: "worker", factorySessionId: options.id, bridgeSessionId: options.id,
+      state: "completed", worktree: view.worktree, profile: "team1", subscriptionProfile: "team1", authMode: "subscription", cleanupVerified: null,
+      externalCleanupRequired: false, ownedProcesses: [], endedAt: "2026-11-07T11:48:50.421703+00:00",
+      leaseOwnerIdentity: { pid: receipt.pid, pgid: receipt.group, start: receipt.started, uid: process.getuid!() },
+      supervisorIdentity: { pid: receipt.pid, pgid: receipt.group, uid: process.getuid!(), start: receipt.started } };
+    writeFileSync(viewPath, JSON.stringify(view)); writeFileSync(jobPath, JSON.stringify(job), { mode: 0o600 });
+    try {
+      expect(workerExecutorStatus(options.root, options.id, { sharedStateRoot })).toMatchObject({ state: "completed", leaseReleased: true, cleanupVerified: true, reason: "shared_lease_settlement_reconciled" });
+      expect(readFileSync(viewPath, "utf8")).toBe(JSON.stringify(view));
+      expect(readFileSync(jobPath, "utf8")).toBe(JSON.stringify(job));
+      expect(readFileSync(join(options.root, "starts"), "utf8")).toBe("started\n");
+      for (const change of [
+        { state: "unknown" }, { subscriptionProfile: "team2" }, { worktree: "/other" }, { externalCleanupRequired: true },
+        { leaseOwnerIdentity: { ...job.leaseOwnerIdentity, start: "different birth" } }, { supervisorIdentity: { pid: process.pid } },
+        { ownedProcesses: [{ pid: process.pid }] }, { endedAt: "2026-11-06T01:00:00Z" }, { cleanupVerified: false },
+      ]) {
+        writeFileSync(jobPath, JSON.stringify({ ...job, ...change }));
+        expect(workerExecutorStatus(options.root, options.id, { sharedStateRoot })?.state).toBe("unknown");
+      }
+      writeFileSync(jobPath, JSON.stringify(job));
+      writeFileSync(viewPath, JSON.stringify({ ...view, cleanupVerified: false }));
+      expect(workerExecutorStatus(options.root, options.id, { sharedStateRoot })?.state).toBe("unknown");
+    } finally { writeFileSync(viewPath, original); }
   });
 });

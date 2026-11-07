@@ -16,7 +16,7 @@ import type { Logger } from "../logging.js";
 import { BridgeError, type Usage } from "../types.js";
 import { WorkerStartRejected, type WorkerStartRejectionCode } from "./start-rejection.js";
 import { privateDirectory, readWorkers, readWorkerTask, removeWorkerTask, validOperationId, workerId, writeWorker, writeWorkerTask, type WorkerOperation, type WorkerRecord, type WorkerStartInput, type WorkerWorkflow } from "./worker-state.js";
-import { prepareSubscription, verifyNativeSubscription, type SubscriptionIdentity } from "./subscription-auth.js";
+import { prepareSubscription, verifyNativeSubscription, SubscriptionFailure, type SubscriptionIdentity } from "./subscription-auth.js";
 import type { SubscriptionProfile } from "../runtime/desktop-jobs.js";
 import { upstreamError } from "../runtime/upstream-error.js";
 import { approvalSummary, MAX_WORKER_APPROVAL_SUMMARY_CHARS } from "./approval.js";
@@ -286,6 +286,7 @@ export class APIWorkerService {
       if (this.closed) throw new WorkerStartRejected("service_unavailable", "Worker service is closed.");
     } catch (error) {
       if (error instanceof WorkerStartRejected) throw error;
+      if (error instanceof SubscriptionFailure) throw new WorkerStartRejected(error.code, error.message);
       if (error instanceof BridgeError && error.code === "workflow_runtime_unverified") rejectionCode = "runtime_unverified";
       throw new WorkerStartRejected(rejectionCode, error instanceof Error ? error.message : undefined);
     }
