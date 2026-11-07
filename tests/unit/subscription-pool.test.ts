@@ -174,6 +174,7 @@ describe("subscription worker pool routing", () => {
     const f = fixture(), path = root(), pool = new SubscriptionWorkerPool(path, f.backends, () => now);
     const item = await pool.start(scopeA, input), backend = [...f.workers.values()][0]!;
     backend.state = "completed"; backend.result = "The rate limit implementation needs a test.";
+    backend.cleanupVerified = true; backend.leaseReleased = true;
     await pool.status(scopeA, String(item.id));
     expect(JSON.parse(readFileSync(join(path, "pool-state.json"), "utf8")).coolUntil).toEqual({});
     backend.state = "failed"; backend.error = "rate_limit_error";
@@ -215,6 +216,7 @@ describe("subscription worker pool routing", () => {
     const f = fixture(), path = root(), pool = new SubscriptionWorkerPool(path, f.backends, () => now);
     const item = await pool.start(scopeA, input), backend = [...f.workers.values()][0]!;
     backend.state = "failed";
+    backend.cleanupVerified = true; backend.leaseReleased = true;
     backend.backoff = { kind: "rate_limit", retryAfterSeconds: 60 };
     backend.endedAt = new Date(now - 120_000).toISOString();
     await pool.status(scopeA, String(item.id));
