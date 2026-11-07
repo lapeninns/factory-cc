@@ -26,6 +26,9 @@ const exec = promisify(execFile);
 const TERMINAL = new Set(["completed", "failed", "cancelled", "unknown"]);
 const EXECUTING = new Set(["starting", "running", "waiting_approval"]);
 const DEFAULT_POLICY = "You are a supervised worker delegated by a Factory Workstream. Read this repository's AGENTS.md and CLAUDE.md instructions. Work only in your assigned worktree. Preserve source checkout changes. Follow the user's QA/e2e and Local CI rules. Produce evidence and a reviewable result. Never infer permission to publish, deploy, merge, change production, buy credits or borrow another account. Use the authority explicitly delegated by the controller and request its decision when new permissions are needed. Report checks actually executed and unresolved limitations. The small workflow guideline is advice, not a hard agent or spend cap.";
+// About two minutes in total: long enough to outlast lock contention from a
+// burst of queued helpers, short enough that the executor still exits promptly.
+const LEASE_RECOVERY_DELAYS_MS = [1_000, 3_000, 10_000, 30_000, 60_000] as const;
 const BLOCKED_TOOLS = ["EnterWorktree", "ExitWorktree", "RemoteTrigger", "CronCreate", "CronDelete", "CronList", "ScheduleTask"];
 
 export interface WorkerApproval {
@@ -85,6 +88,12 @@ export interface APIWorkerServiceOptions {
   acquireLease?: (worker: Readonly<WorkerRecord>, signal: AbortSignal) => Promise<WorkerLease>;
   /** Finish a parked shared record after native cleanup, without reacquiring inference capacity. */
   finalizeLease?: (worker: Readonly<WorkerRecord>, result: WorkerLeaseResult) => Promise<void>;
+  /**
+   * Waits before each confirmation retry after a shared lease release is not
+   * acknowledged. Only this live executor can still prove ownership, so an
+   * unconfirmed release must be settled here or the account stays reserved.
+   */
+  leaseRecoveryDelaysMs?: readonly number[];
   /** Independent job executors retain native continuations when the API service restarts. */
   executionHost?: WorkerExecutionHost;
   /** An executor adopts exactly one already prepared worker without replaying start. */
@@ -593,22 +602,41 @@ export class APIWorkerService {
       const lease = live.lease;
       live.lease = undefined;
       const leaseResult: WorkerLeaseResult = { state: record.state === "unknown" ? "unknown" : record.resultState ?? "failed", cleanupVerified: record.cleanupVerified === true, usage: live.providerEvidence ? { ...live.usage.providerTotals(), estimated: false } : undefined, sdkSessionId: record.sdkSessionId };
+      let released = false;
       try {
         if (lease) await lease.release(leaseResult);
         else if (!admissionRejected) await this.options.finalizeLease?.(record, leaseResult);
+        released = true;
+      }
+      catch {
+        // A release can miss its acknowledgement window while other helpers
+        // hold the shared state lock. The helper is then stopped, and only
+        // this executor can still confirm the verified cleanup it observed.
+        if (lease && leaseResult.cleanupVerified) released = await this.confirmLeaseRelease(record, leaseResult);
+      }
+      if (released) {
         record.leaseReleased = true;
         if (record.cleanupVerified === true) {
           record.state = record.resultState ?? "failed";
           record.settledAt = now();
         }
-      }
-      catch {
+      } else {
         record.state = "unknown"; record.reason = "shared_lease_release_unproven";
         record.failure = { stage: "lease_release", code: record.reason, message: "Shared lease release did not confirm completion." };
       }
       record.endedAt = now();
       this.save(live);
     }
+  }
+  private async confirmLeaseRelease(record: WorkerRecord, result: WorkerLeaseResult): Promise<boolean> {
+    const finalize = this.options.finalizeLease;
+    if (!finalize) return false;
+    for (const delay of this.options.leaseRecoveryDelaysMs ?? LEASE_RECOVERY_DELAYS_MS) {
+      await new Promise<void>((done) => setTimeout(done, delay));
+      try { await finalize(record, result); return true; }
+      catch { /* The stopped helper may still hold the record, or the lock is still contended. */ }
+    }
+    return false;
   }
   private policy(record: WorkerRecord): string {
     return (this.options.policyText ?? DEFAULT_POLICY) + "\n\nSelected workflow: " + record.workflow + ".\n" + (this.options.workflowText?.[record.workflow] ?? "")

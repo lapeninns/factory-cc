@@ -790,6 +790,31 @@ class FactoryLeaseTests(unittest.TestCase):
         self.assertEqual(job['ownedProcesses'], [])
         self.assertEqual(job['leaseOwnerIdentity'], process_identity(os.getpid()))
 
+    def test_owner_update_frees_account_after_release_acknowledgement_is_missed(self):
+        # The bridge stops a helper whose release is not acknowledged in time.
+        first, job_id = self.admitted('missed-release', subscriptionProfile='team4')
+        self.git(self.repo, 'worktree', 'add', '-qb', 'factory-other', str(self.root / 'other'))
+        waiter = self.start()
+        self.send(waiter, self.request('next-worker', self.root / 'other', subscriptionProfile='team4'))
+        first.terminate()
+        first.wait(timeout=3)
+        self.assertEqual(self.receive(waiter)['event'], 'queued')
+        # Polling has backed off to its ceiling by now, so the release below
+        # also shows that a queued waiter is admitted promptly afterwards.
+        self.assertIsNone(self.receive(waiter, 1.5))
+        self.assertEqual(read_job(self.config, job_id)['state'], 'unknown')
+
+        confirm = self.start()
+        self.send(confirm, self.request('missed-release', op='update', subscriptionProfile='team4',
+                                        state='completed', cleanupVerified=True))
+        self.assertEqual(self.receive(confirm)['event'], 'updated')
+        self.assertEqual(confirm.wait(timeout=3), 0)
+        job = read_job(self.config, job_id)
+        self.assertEqual(job['state'], 'completed')
+        self.assertFalse(job['externalCleanupRequired'])
+        self.assertEqual(self.receive(waiter, 2.5)['event'], 'ready')
+        self.release(waiter, 'completed', cleanupVerified=True)
+
     def test_invalid_or_sensitive_fields_are_not_persisted_or_echoed(self):
         child, job_id = self.admitted()
         self.send(child, {'op': 'release', 'state': 'idle', 'usage': {'secret-token': 'never-copy-this'}})
