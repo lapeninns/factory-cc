@@ -336,7 +336,13 @@ export class APIWorkerService {
   status(id: string): WorkerView {
     const live = this.find(id);
     if (live.launchPending) return { ...this.view(live), state: "starting" };
-    if (this.options.executionHost && (live.record.executorLaunchRequested || live.task === undefined) && !TERMINAL.has(live.record.state)) return this.options.executionHost.status(live.record);
+    // An unknown release observation can become settled in the shared ledger
+    // after this frontend saved it. Keep consulting the independently verified
+    // executor view; "unknown" is terminal for execution, not for observation.
+    const settlementPending = live.record.state === "unknown" && live.record.reason === "shared_lease_release_unproven"
+      && live.record.cleanupVerified === true;
+    if (this.options.executionHost && (live.record.executorLaunchRequested || live.task === undefined)
+        && (!TERMINAL.has(live.record.state) || settlementPending)) return this.options.executionHost.status(live.record);
     return this.view(live);
   }
   list(): WorkerView[] { return [...this.workers.values()].map(worker => this.status(worker.record.id)); }

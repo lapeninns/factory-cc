@@ -85,6 +85,18 @@ it("reconstructs the API frontend while its worker and pending approval survive"
   await expect.poll(() => restored.status(worker.id).state).toBe("completed");
   expect(restored.status(worker.id)).toMatchObject({ result: "One completed execution", cleanupVerified: true, leaseReleased: true });
   expect(readFileSync(join(root, "executions"), "utf8")).toBe(worker.id + "\n");
+  await restored.close();
+  // The independently owned executor has confirmed completion, while the
+  // frontend still holds its earlier unknown/release-unproven observation.
+  const savedPath = join(root, worker.id + ".json");
+  const saved = JSON.parse(readFileSync(savedPath, "utf8"));
+  saved.state = "unknown"; saved.reason = "shared_lease_release_unproven"; saved.leaseReleased = false;
+  writeFileSync(savedPath, JSON.stringify(saved));
+  const reconciled = makeService();
+  expect(reconciled.status(worker.id)).toMatchObject({ state: "completed", cleanupVerified: true, leaseReleased: true });
+  expect(reconciled.list().find(value => value.id === worker.id)?.state).toBe("completed");
+  expect(JSON.parse(readFileSync(savedPath, "utf8")).state).toBe("unknown");
+  expect(readFileSync(join(root, "executions"), "utf8")).toBe(worker.id + "\n");
 });
 
 it("reconciles a worker interrupted during workspace preparation after frontend restart", async () => {
