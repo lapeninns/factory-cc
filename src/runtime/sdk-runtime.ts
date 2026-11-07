@@ -1380,7 +1380,7 @@ export class SdkRuntime implements BridgeRuntime {
     const current = (): boolean => !approval.signal.aborted && !live.terminal && !live.hostEnding && !live.turnHandoff
       && live.queryEpoch === epoch && this.control === control && !!live.current
       && resolveCwd(live.current, this.config) === cwd
-      && (control.factoryPermissionMode?.(live.current.session.bridgeSessionId) ?? live.current.factoryPermissionMode) !== "spec"
+      && (this.config.factoryNative || (control.factoryPermissionMode?.(live.current.session.bridgeSessionId) ?? live.current.factoryPermissionMode) !== "spec")
       && !this.toolAccessDenial(live, `mcp__droid__${mcpName}`, control.factoryPermissionMode?.(live.current.session.bridgeSessionId));
     if (this.config.controllerApprovalPolicy === "bypass") {
       // Bypass only this bridge-owned question. Factory still receives the

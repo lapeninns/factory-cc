@@ -168,6 +168,17 @@ describe("exactly approved Factory host operations", () => {
     expect(fake.observedResult).toMatchObject({ isError: false });
   });
 
+  it.each(["Task", "Execute"] as const)("Factory-native mode delegates spec-mode %s permission to Factory", async original => {
+    const { runtime, fake, base, setMode } = setup({ original, factoryNative: true, spawnAgents: true, askTool: false });
+    setMode("spec");
+    const action = callFrom(await runtime.handle(base));
+    expect(action).toMatchObject({ name: original, input: actions[original] });
+    const denied = toolResult(base, action.id, "Factory denied this action in spec mode");
+    (denied.request.messages[0]!.content as any[])[0].is_error = true;
+    await runtime.handle(denied);
+    expect(fake.observedResult).toMatchObject({ isError: true });
+  });
+
   it("Factory-native mode denies internal reads and nested Claude execution in hooks and permissions", async () => {
     const { runtime, fake, base } = setup({ original: "Read", factoryNative: true, spawnAgents: true, invoke: false });
     await runtime.handle(base);
