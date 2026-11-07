@@ -1,61 +1,67 @@
 # Factory owns the harness; the bridge supplies the model connection
 
-## Accepted direction
+## Architecture
 
-The requested architecture uses native Factory Workstreams, SpawnAgent, agent messaging, custom Droid Task subagents, skills, tools, permissions and the right-hand Agents panel. The bridge provides the model connection, authentication and inference admission. It does not create a second product worker hierarchy or run workspace tools.
+Native Factory owns Workstreams, SpawnAgent, agent conversations and messaging, interruption, custom Droid Task delegation, tools, skills, permissions and the right-hand Agents panel. The bridge provides the model connection, subscription authentication and inference admission. It does not create a parallel product worker hierarchy or execute workspace tools.
 
-Interpretation recorded: the user's "module" means "model" (decided by default, owner to confirm). This replaces the proposed native-supervisor wrapper architecture. Existing running SDK workers must finish or receive an explicit handoff; changing the model connection cannot convert them into native Factory agents.
+`subscription-desktop --worker-pool --controller-pool --host-tools --spawn-agents --factory-native` enables this mode with the launcher's existing required paths/profile arguments. The worker-pool options remain a configuration dependency of the older launcher. All `factory_worker_*` tools, including dynamically discovered tools, are excluded in native mode; no task is sent to those executors. `--approval-policy bypass` removes only the bridge-owned extra question. Factory still applies its own permissions and spec mode.
 
-## Operator mode
+Every advertised Factory tool, including Read/LS/Grep/Glob, returns through the host MCP catalog. Claude Code built-ins are denied through the SDK tool list, PreToolUse hook and permission callback. SpawnAgent, SendMessage, ListAgents, InterruptAgent and Task are real host tool calls with real results. The official SDK system preset is retained with an appended transport policy; binaries and authentication are unmodified. The inference backend remains the official Claude Agent SDK/CLI, not a raw completion API.
 
-`subscription-desktop --worker-pool --controller-pool --host-tools --spawn-agents --factory-native` enables the new mode with the existing required paths and profile arguments. `--approval-policy bypass` here removes only the bridge's extra confirmation: Factory retains its own mode, autonomy and approval enforcement. Existing modes retain their behavior.
+## Trusted identity and native inference lanes
 
-The current launcher still requires the worker-pool configuration as part of its existing account/admission configuration contract. In Factory-native mode all `factory_worker_*` tools are excluded, including dynamically discovered tools. No work is sent to that executor pool. Removing that legacy configuration dependency is separate from the native lifecycle acceptance check.
+A scoped lifecycle hook reads the same bounded, owned `.settings.json` file that establishes the selected custom model. Only its top-level Factory `mission-v2` tag supplies the Workstream ID and `orchestrator`/`agent` kind. No transcript, tool output, prompt role claim or model header supplies this authority. Conflicting reserved tags are unclassified. The hook overwrites incoming role hints before sending enriched metadata through its private authenticated host-event endpoint.
 
-Every advertised Factory tool, including Read/LS/Grep/Glob, is exposed through the host MCP catalog. Claude Code built-ins are denied through the SDK tool list, PreToolUse hook and permission boundary. SpawnAgent and Task return to Droid as real host tool calls and consume its real results. Agent messaging and lifecycle tools use the same host boundary. The native SDK system preset remains intact, with an appended transport policy; binaries and authentication are unmodified.
+The broker pins this metadata to the exact live host generation and rejects a changed Workstream role. Native inference receives the `factory-native` directory policy: an owned canonical folder, without invented Git provenance or bridge-owned workspace tools. The bridge does not hold a workspace reservation while Factory tools or child tasks run.
 
-The inference backend remains the official Claude Agent SDK/CLI. This is an adapter using a native agent backend, not a claim that the SDK is a raw completion API. All task tool execution must occur in Factory. Account eligibility does not prove remaining allowance, and no provider or billing fallback is enabled.
+Verified orchestrators use the reserved controller lane; native agents use the worker lane. An ordinary authenticated native Droid session without Workstream metadata uses the unreserved worker lane, regardless of its model header. This avoids granting controller capacity from a display name or a copied `X-Bridge-Role` header.
 
-The bridge does not keep a workspace reservation while a Factory tool or child task runs. Otherwise a synchronous Task can deadlock waiting for a child in the same folder. Real Python lease integration verifies that the child can acquire inference before the parent receives its Task result. Current reserved controller compute capacity remains one model phase at a time; account eligibility is not a promise of eight simultaneous native-agent generations. Fair parallel native inference admission is a remaining capacity design question, separate from native lifecycle visibility.
+The scheduler retains one controller slot and eight worker slots, derived from the eight configured subscription profiles. Each profile retains at most one active job per lane. Uncertain cleanup continues to reserve the account. This is compute admission, not a provider allowance measurement or a guarantee of eight concurrent native agents.
 
-## Model routing
+This separation fixes a demonstrated control failure: when parent and child both used the single controller lane, the parent's InterruptAgent call waited until the child finished and returned "already idle". The real lease regression now keeps a child generating while its parent reacquires inference, and native desktop execution confirms an active interruption.
 
-The pooled controller custom model uses `extraHeaders: {"X-Bridge-Role": "orchestrator"}` as in the existing approved model entry. Omitting this header in the isolated CLI probe caused a pre-inference workspace-policy rejection; correcting the test configuration produced the successful round trip. The header is a configured connection role, not authority to infer Workstream identity from transcript content.
+## Account continuity and first assignments
 
-Set the Workstream orchestrator AND agent model to the bridge-backed custom model (or verified inheritance). Check custom Droid pinned models and Light/Medium/Heavy routing too; these can override inheritance. A loopback model endpoint is local to the machine running the agent, so this acceptance lane uses Local agents. Remote machines require their own approved reachable model connection.
+A native session retains its verified account across stopped model turns and cold-retry cleanup. A queued replacement with no SDK execution does not change that assignment. A cooling assigned account waits for its own recovery; native mode does not automatically borrow another seat after a provider limit.
 
-The NabaLens Flow Improvement native UI was inspected on 2026-11-07: its orchestrator is the existing bridge-backed custom model; its agent setting displays Inherit of that same custom model. The Workstream has zero native agents because it currently uses SDK pool workers. That observation is configuration evidence, not native SpawnAgent execution proof.
+First assignments project the least occupied eligible lane from the owned shared job ledger, using configured weights only among equally occupied seats. Queued jobs count as load, uncertain accounts remain excluded, unreadable/symlinked ledgers fail closed, and the projection writes no state. The Python scheduler remains the admission authority and verifies ownership and cleanup before inference. Legacy pool behavior remains unchanged outside native mode.
 
-## Acceptance before migration
+## Model configuration
 
-1. Isolated native Workstream uses the candidate bridge for both orchestrator and agent.
-2. One bounded read-only SpawnAgent creates a real right-hand Agents row.
-3. Open that row and verify its native session and tool activity; confirm corresponding bridge inference evidence using trusted host identity.
-4. SendMessage, completion, follow-up and InterruptAgent operate on the same native agent. Do not count an MCP notification or assistant prose as lifecycle proof.
-5. A native custom Droid Task uses the configured bridge model; nested Claude Agent/Task execution remains denied.
-6. Reads and mutations return through Factory tools, including tool discovery updates; no bridge worker starts and no internal native workspace tools execute.
-7. Factory permissions and spec mode still govern actions. No automatic hosted-model fallback is assumed: verify the model actually selected in every test session.
-8. Existing work is preserved; controller activation waits for zero active turns, pending host calls and held host actions.
+Use one bridge-backed custom model for the Workstream orchestrator and let agents inherit it. Factory's current agent picker exposes hosted choices and Inherit, while its orchestrator picker also exposes local custom models. Separate local agent-model selection was not available in the tested desktop build. The authenticated settings tag solves role scheduling without requiring a second model entry.
 
-## Validation boundary
+The custom model can retain the existing `X-Bridge-Role: orchestrator` connection header for compatibility. It does not determine native admission roles. Inspect custom Droid pinned models and Light/Medium/Heavy routing too; these may override inheritance. A loopback endpoint is local to the executing machine; the acceptance lane uses Local agents. Remote agents require their own approved reachable model connection.
 
-Focused SDK fixtures verify host action/result transport and internal-tool rejection. Native desktop UI execution is a separate required lane. The e2e browser/mobile runner has no applicable native macOS target here; it is not reported as executed. Formal CI and installed release must be recorded separately from local checks.
+Use model-scoped hooks. `BRIDGE_FACTORY_BINDING_NATIVE` isolates an experimental native connection from existing pooled/fixed-seat hooks. Missing/foreign/stale lifecycle generations remain rejected. Never remove historical markers or parse nested transcript content to force a reused Workstream onto another connection.
+
+## Availability diagnosis and recovery
+
+The initial test displayed "Workstreams are not available for this organization" before any model request reached the bridge. The native log identified `missions_v2_disabled`. Read-only inspection found an active Pro plan, Local-only delegation and a later feature cache with `missions_v2: true`. A fresh native Workstream then started successfully without changing flags, credentials, billing or binaries. The exact cause of the earlier false availability evaluation remains unproven; no entitlement bypass or permanent vendor fix is claimed.
+
+Reusing an old test Workstream after changing its endpoint produced `stale_host_binding`, a separate lifecycle protection. A fresh Workstream with the intended model selected in its saved settings established the correct host generation. The desktop composer initially displayed a built-in label even while the saved Workstream model was custom; actual bridge ingress and saved settings were used to verify routing rather than relying on that label.
+
+## Executed native acceptance, 2026-11-07
+
+- Workstream `4ecf9980-a17b-454f-a9a4-ee62a3fe798f`: native agent `d3c02091-bfaf-46b2-a99d-d765bd978dba` appeared in the Agents tab, read the exact probe marker, accepted a direct acknowledgement message, was stopped during an active bridge request, and accepted a follow-up read in the same native conversation. Its row returned Idle.
+- Native SendMessage and ListAgents were observed as real Factory host calls. The initial controller-lane InterruptAgent test returned already-idle and was not counted as an active-interruption pass.
+- Workstream `96ed1b55-75a9-4644-b530-796d53cc45e0`: native agent `1dbe2647-6859-4594-af8e-472046c106ca` exercised the repaired worker lane and real active InterruptAgent. Its continuation exposed an account reassignment/queue issue, which was then repaired. The queued test request was cancelled before inference; no productive worker was cancelled.
+- Final native agent `19802ea5-202f-4810-8ac0-bf6d549c6a37` exercised creation, file read, SendMessage, running-state observation, active InterruptAgent, follow-up read and Idle completion. It returned `NATIVE_STABLE_RESUMED FACTORY_BRIDGE_SMOKE_59B826B_20261107` and retained team1 across the stopped and resumed model turns. Both parent and agent reported `claude-opus-5-5` through the bridge.
+- An observer captured two simultaneous running inference leases: controller and worker. This demonstrates parent/child steering concurrency, not an eight-agent load test.
+
+Detailed private evidence lives in `evidence/local/reliability-20261107/native-factory-availability/` (ignored). No private capabilities or raw transcripts are included here. The macOS native panel has no applicable browser/mobile e2e target; no e2e runner pass is claimed. Custom Task tool transport is covered by protocol fixtures; a separate live custom-Droid Task journey is not included in this Workstream-panel certification.
+
+## Before migrating NabaLens
+
+Existing SDK workers cannot become native Factory agents by changing a model entry. Preserve their assignments, worktrees, results and callbacks; finish them or make an explicit bounded handoff.
+
+Package one clean verified release containing the matching JS and Python scheduler code. Repoint every shared-runtime participant through a coordinated plan; do not permanently mix old scheduler classification with the new native policy. Update the scoped lifecycle hook to the same release so role metadata is present. Preserve tokens, ports and histories.
+
+Controller activation waits for zero active requests/native turns, pending host calls, pending approvals and held host actions. Read back loaded entrypoints, config markers, runtime health and native role routing independently. Formal CI, immutable packaging, native desktop acceptance, activation and productive NabaLens continuation are separate claims. No NabaLens migration is claimed by the isolated acceptance above.
 
 ## Primary references
 
+- https://docs.factory.com/workstreams/overview
 - https://docs.factory.com/workstreams/steer
 - https://docs.factory.com/workstreams/settings
 - https://docs.factory.com/harness/subagents
 - https://docs.factory.com/model-independence/byok
-
-## Candidate evidence, 2026-11-07
-
-- Local typecheck, build and workers build passed.
-- Full TypeScript suite: 1,583 passed; three platform-specific tests skipped.
-- Focused host policy, launcher and real Python lease integration suite: 139 passed.
-- Native Droid CLI via the isolated candidate endpoint: exit 0, exact probe marker returned, selected account team2, model claude-opus-5-5. Droid's host transcript records its Read tool; the backend transcript records only host-MCP Script calls for that read. This proves the bounded read path, not Workstream agent lifecycle.
-- Native Factory desktop: candidate model selected for the isolated orchestrator and agent inheritance. The attempt displayed "Workstreams are not available for this organization" before any request reached the candidate endpoint. Stopped the test attempt. Right-hand native agent creation, steering and completion remain BLOCKED, not passed. The cause of the Factory availability message has not been established.
-- Test model settings restored; the temporary custom model removed; existing model entries preserved; hook configuration restored exactly; the isolated endpoint stopped after authenticated idle readback.
-- Existing NabaLens Workstream, running workers and production controller were preserved. No live migration or merge is claimed.
-
-Detailed private local evidence is under `evidence/local/reliability-20261107/native-factory/` (ignored). No tokens or raw private transcripts are included in this document.

@@ -10,7 +10,7 @@ const MAX_SESSION_SETTINGS_BYTES = 128 * 1024;
 const CONFIG_FLAG = "--factory-cc-hook-config";
 const DESKTOP_FLAG = "--factory-cc-desktop-lifecycle";
 const DEFAULT_BINDING_ENV = "BRIDGE_FACTORY_BINDING";
-const BINDING_ENV_NAMES = new Set([DEFAULT_BINDING_ENV, "BRIDGE_FACTORY_BINDING_POOL", ...Array.from({ length: 8 }, (_, index) => `BRIDGE_FACTORY_BINDING_TEAM${index + 1}`)]);
+const BINDING_ENV_NAMES = new Set([DEFAULT_BINDING_ENV, "BRIDGE_FACTORY_BINDING_POOL", "BRIDGE_FACTORY_BINDING_NATIVE", ...Array.from({ length: 8 }, (_, index) => `BRIDGE_FACTORY_BINDING_TEAM${index + 1}`)]);
 
 type JsonObject = Record<string, unknown>;
 export interface FactoryHookModelScope { modelIds: string[]; sessionsDir: string }
@@ -52,28 +52,39 @@ function modelScope(value: unknown): FactoryHookModelScope {
 }
 
 /** Droid saves this small settings file before SessionStart. Never inspect transcript content. */
-function sessionModelMatches(scope: FactoryHookModelScope, event: unknown): boolean {
+function sessionSettings(scope: FactoryHookModelScope, event: unknown): JsonObject | undefined {
   if (!object(event) || typeof event.session_id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(event.session_id)
       || typeof event.transcript_path !== "string" || !isAbsolute(event.transcript_path)
       || event.transcript_path !== resolve(event.transcript_path)
-      || basename(event.transcript_path) !== event.session_id + ".jsonl") return false;
+      || basename(event.transcript_path) !== event.session_id + ".jsonl") return undefined;
   let fd: number | undefined;
   try {
     const root = realpathSync(scope.sessionsDir);
     const parent = realpathSync(dirname(event.transcript_path));
     const within = relative(root, parent);
-    if (within === ".." || within.startsWith(".." + sep) || isAbsolute(within)) return false;
+    if (within === ".." || within.startsWith(".." + sep) || isAbsolute(within)) return undefined;
     fd = openSync(join(parent, event.session_id + ".settings.json"), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     const info = fstatSync(fd);
     if (!info.isFile() || (process.getuid && info.uid !== process.getuid()) || info.mode & 0o022
-        || info.size > MAX_SESSION_SETTINGS_BYTES) return false;
+        || info.size > MAX_SESSION_SETTINGS_BYTES) return undefined;
     const bytes = Buffer.alloc(MAX_SESSION_SETTINGS_BYTES + 1);
     const length = readSync(fd, bytes, 0, bytes.length, 0);
-    if (length > MAX_SESSION_SETTINGS_BYTES) return false;
+    if (length > MAX_SESSION_SETTINGS_BYTES) return undefined;
     const settings: unknown = JSON.parse(bytes.subarray(0, length).toString("utf8"));
-    return object(settings) && typeof settings.model === "string" && scope.modelIds.includes(settings.model);
-  } catch { return false; }
+    return object(settings) && typeof settings.model === "string" && scope.modelIds.includes(settings.model) ? settings : undefined;
+  } catch { return undefined; }
   finally { if (fd !== undefined) closeSync(fd); }
+}
+
+/** Only Factory's small, owned settings metadata supplies Workstream roles. */
+function nativeWorkstreamSettings(settings: JsonObject | undefined): { workstreamId: string; role: "orchestrator" | "agent" } | undefined {
+  if (!settings || !Array.isArray(settings.tags)) return;
+  const tags = settings.tags.filter(tag => object(tag) && tag.name === "mission-v2");
+  if (tags.length !== 1) return;
+  const metadata = (tags[0] as JsonObject).metadata;
+  if (!object(metadata) || (metadata.kind !== "orchestrator" && metadata.kind !== "agent")
+      || typeof metadata.missionId !== "string" || !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(metadata.missionId)) return;
+  return { workstreamId: metadata.missionId, role: metadata.kind };
 }
 
 export function factoryHookEndpoint(base: string): string {
@@ -286,7 +297,8 @@ export async function factoryHookMain(argv = process.argv.slice(2), env: NodeJS.
   // event may still settle its generation after the selected model changes.
   const ownedSessionEnd = object(event) && event.hook_event_name === "SessionEnd"
     && typeof bindingToken === "string" && /^[a-f0-9]{64}$/.test(bindingToken);
-  if (config.modelScope && !sessionModelMatches(config.modelScope, event) && !ownedSessionEnd) return;
+  const scopedSettings = config.modelScope ? sessionSettings(config.modelScope, event) : undefined;
+  if (config.modelScope && !scopedSettings && !ownedSessionEnd) return;
   if (desktopLifecycle && object(event) && event.hook_event_name === "SessionStart"
       && (typeof event.CLAUDE_ENV_FILE !== "string" || !isAbsolute(event.CLAUDE_ENV_FILE))) {
     throw new Error("Direct Desktop SessionStart requires its official environment file");
@@ -294,6 +306,13 @@ export async function factoryHookMain(argv = process.argv.slice(2), env: NodeJS.
   const clientSessionEnd = !desktopLifecycle && object(event) && event.hook_event_name === "SessionEnd" && bindingToken === undefined;
   if (object(event) && event.hook_event_name !== "SessionStart" && !clientSessionEnd && (!bindingToken || !/^[a-f0-9]{64}$/.test(bindingToken))) {
     throw new Error("Factory lifecycle event has no SessionStart generation binding");
+  }
+  // Never accept role hints in hook/tool content. Enrich the authenticated
+  // envelope only from the same bounded settings file used for model scope.
+  if (object(event)) {
+    delete event.bridgeNativeWorkstream;
+    const native = nativeWorkstreamSettings(scopedSettings);
+    if (native) event.bridgeNativeWorkstream = native;
   }
   const result = await forwardFactoryHook({ url: config.url, hookToken }, event, { bindingToken,
     ...(launchId?.trim() ? { launchId } : {}), desktopLifecycle });

@@ -57,6 +57,15 @@ describe("Factory model-phase supervision", () => {
     expect(fixture.inner.handle).not.toHaveBeenCalled(); expect(fixture.acquire).not.toHaveBeenCalled();
   });
 
+  it("refuses native workspace admission without the model-only runtime policy", async () => {
+    const fixture = setup();
+    fixture.binding.workspacePolicy = "factory-native";
+    fixture.binding.subscriptionProfile = "team1";
+    await expect(fixture.runtime.handle(request())).rejects.toMatchObject({ code: "desktop_workspace_policy" });
+    expect(fixture.acquire).not.toHaveBeenCalled();
+    expect(fixture.inner.handle).not.toHaveBeenCalled();
+  });
+
   it("preserves Factory request/tools and releases active inference capacity while waiting for host tools", async () => {
     const fixture = setup(); fixture.inner.handle.mockResolvedValueOnce(turn(["tool-1"]));
     const input = request(), sink = { textDelta: vi.fn(), toolTrace: vi.fn() };
@@ -273,6 +282,43 @@ describe("explicit host-directory controllers", () => {
       expect(first.inner.handle).toHaveBeenCalledTimes(2);
     } finally {
       await Promise.allSettled([first.runtime.close(), second.runtime.close()]);
+    }
+  });
+
+  it("keeps the native orchestrator responsive while its same-folder agent is generating", async () => {
+    const parent = hostFixture(), agent = hostFixture(), finishAgent = deferred<RuntimeTurn>();
+    for (const fixture of [parent, agent]) {
+      fixture.options.factoryNative = true;
+      fixture.binding.workspacePolicy = "factory-native";
+      fixture.options.runtimePackagePath = resolve("native-runtime");
+      fixture.options.stateRoot = join(parent.root, "native-state");
+      fixture.options.admissionTimeoutMs = 5_000;
+      fixture.options.releaseTimeoutMs = 2_000;
+      fixture.options.acquireLease = undefined;
+      fixture.options.updateRecord = undefined;
+    }
+    agent.binding.sessionId = "native-agent";
+    agent.binding.cwd = parent.cwd;
+    agent.binding.subscriptionProfile = "team2";
+    agent.input.role = "worker";
+    agent.input.session.bridgeSessionId = "native-agent-bridge";
+    const began = deferred<void>();
+    agent.inner.handle.mockImplementationOnce(async () => { began.resolve(); return finishAgent.promise; });
+    parent.inner.handle.mockResolvedValueOnce(hostTurn("native-send", "SendMessage"));
+    let running: Promise<RuntimeTurn> | undefined;
+    try {
+      await parent.runtime.handle(parent.input);
+      running = agent.runtime.handle(agent.input);
+      await began.promise;
+      // The child retains inference. The parent must still be able to think
+      // and publish InterruptAgent rather than waiting for child completion.
+      await parent.runtime.handle(withResult(parent.input, "native-send"));
+      expect(parent.inner.handle).toHaveBeenCalledTimes(2);
+      expect(agent.inner.handle).toHaveBeenCalledOnce();
+    } finally {
+      finishAgent.resolve(turn());
+      if (running) await running;
+      await Promise.allSettled([parent.runtime.close(), agent.runtime.close()]);
     }
   });
 

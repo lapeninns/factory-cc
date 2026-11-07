@@ -10,8 +10,8 @@ export const SUBSCRIPTION_PROFILES = ["team1", "team2", "team3", "team4", "team5
 export type SubscriptionProfile = typeof SUBSCRIPTION_PROFILES[number];
 /** One execution per configured seat. Routing weights never multiply capacity. */
 export const SUBSCRIPTION_WORKER_SLOTS = SUBSCRIPTION_PROFILES.length;
-export type DesktopWorkspacePolicy = "controller-readonly" | "controller-host";
-export interface DesktopJobBinding { sessionId: string; cwd: string; launchId?: string; subscriptionProfile?: SubscriptionProfile; workspacePolicy?: DesktopWorkspacePolicy; nativeGeneration?: number }
+export type DesktopWorkspacePolicy = "controller-readonly" | "controller-host" | "factory-native";
+export interface DesktopJobBinding { sessionId: string; cwd: string; launchId?: string; subscriptionProfile?: SubscriptionProfile; workspacePolicy?: DesktopWorkspacePolicy; nativeGeneration?: number; inferenceRole?: "orchestrator" | "worker" }
 export type DesktopJobState = "waiting_host" | "idle" | "completed" | "failed" | "cancelled" | "unknown";
 export interface DesktopJobRelease {
   state: DesktopJobState;
@@ -101,14 +101,14 @@ export function validateDesktopJobBinding(binding: DesktopJobBinding | undefined
   validateSubscriptionProfile(binding.subscriptionProfile);
   validateWorkspacePolicy(binding.workspacePolicy, binding.subscriptionProfile);
   if (binding.nativeGeneration !== undefined && (!Number.isSafeInteger(binding.nativeGeneration) || binding.nativeGeneration < 0
-      || binding.nativeGeneration > 1_000_000 || !["controller-readonly", "controller-host"].includes(binding.workspacePolicy ?? ""))) {
+      || binding.nativeGeneration > 1_000_000 || !["controller-readonly", "controller-host", "factory-native"].includes(binding.workspacePolicy ?? ""))) {
     throw new BridgeError(400, "desktop_job_generation", "Invalid native controller generation.");
   }
   try {
     const cwd = realpathSync(binding.cwd);
     const directory = lstatSync(cwd);
     if (!directory.isDirectory() || directory.uid !== process.getuid?.()) throw new Error();
-    if (binding.workspacePolicy === "controller-host") {
+    if (binding.workspacePolicy === "controller-host" || binding.workspacePolicy === "factory-native") {
       if (cwd !== resolve(binding.cwd)) throw new Error();
       return { ...binding, cwd };
     }
@@ -118,7 +118,7 @@ export function validateDesktopJobBinding(binding: DesktopJobBinding | undefined
         || git.uid !== process.getuid?.()) throw new Error();
     return { ...binding, cwd };
   } catch {
-    throw new BridgeError(422, "desktop_job_workspace", binding.workspacePolicy === "controller-host"
+    throw new BridgeError(422, "desktop_job_workspace", (binding.workspacePolicy === "controller-host" || binding.workspacePolicy === "factory-native")
       ? "Choose an existing, canonical workspace directory owned by this user."
       : "Choose a Git project root for a read-only controller, or a dedicated Git worktree for a supervised worker.");
   }
@@ -212,10 +212,13 @@ export class DesktopJobsRuntime implements BridgeRuntime {
     let binding: DesktopJobBinding;
     try { binding = validateDesktopJobBinding(this.options.getBinding(input)); }
     catch (error) { return Promise.reject(error); }
+    if (binding.workspacePolicy === "factory-native" && !this.options.factoryNative) {
+      return Promise.reject(failure("desktop_workspace_policy", "Factory-native admission requires the operator-configured model-only runtime."));
+    }
     const id = input.session.bridgeSessionId;
     if (this.active.has(id)) return Promise.reject(new BridgeError(409, "desktop_job_busy", "This Factory model phase is already running."));
     const request: DesktopJobAcquire = { factorySessionId: binding.sessionId,
-      bridgeSessionId: binding.nativeGeneration === undefined ? id : `${id}:g${binding.nativeGeneration}`, cwd: binding.cwd, role: input.role,
+      bridgeSessionId: binding.nativeGeneration === undefined ? id : `${id}:g${binding.nativeGeneration}`, cwd: binding.cwd, role: binding.inferenceRole ?? input.role,
       ...(binding.subscriptionProfile === undefined ? {} : { subscriptionProfile: binding.subscriptionProfile }),
       ...(binding.workspacePolicy === undefined ? {} : { workspacePolicy: binding.workspacePolicy }) };
     try { validateWorkspacePolicy(request.workspacePolicy, request.subscriptionProfile, request.role); }
@@ -585,10 +588,12 @@ function validateSubscriptionProfile(profile: unknown): void {
 }
 
 function validateWorkspacePolicy(policy: unknown, profile: unknown, role?: unknown): void {
-  if (policy !== undefined && (!["controller-readonly", "controller-host"].includes(String(policy))
+  if (policy !== undefined && (!["controller-readonly", "controller-host", "factory-native"].includes(String(policy))
       || !(SUBSCRIPTION_PROFILES as readonly string[]).includes(String(profile))
-      || role === "worker" || role === "validator"
-      || (policy === "controller-host" && role !== undefined && role !== "chat" && role !== "orchestrator"))) {
+      || (policy === "factory-native"
+        ? role !== undefined && !["chat", "orchestrator", "worker", "validator"].includes(String(role))
+        : role === "worker" || role === "validator"
+          || (policy === "controller-host" && role !== undefined && role !== "chat" && role !== "orchestrator")))) {
     throw new BridgeError(400, "desktop_workspace_policy", "Directory policies require an explicitly configured subscription controller.");
   }
 }

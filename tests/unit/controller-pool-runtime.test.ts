@@ -126,6 +126,21 @@ describe("native controller pool identity", () => {
     await expect(runtime.handle(request())).rejects.toMatchObject({ code: "rate_limit_error" });
     await expect(runtime.prepareColdRetry("bridge-one")).rejects.toMatchObject({ code: "native_retry_unsafe" });
   });
+  it("does not grant reserved native controller capacity from model role headers", () => {
+    const input = request("team8");
+    input.factorySession = { sessionId: "native-factory", cwd: "/fixture", desktopLifecycle: true };
+    input.headers["x-bridge-role"] = "orchestrator";
+    expect(controllerJobBinding({ ...config(), factoryNative: true, controllerHostTools: true }, input))
+      .toMatchObject({ workspacePolicy: "factory-native", inferenceRole: "worker" });
+  });
+
+  it.each(["orchestrator", "agent"] as const)("uses authenticated role metadata for the native %s connection", role => {
+    const input = request("team8");
+    input.factorySession = { sessionId: "native-factory", cwd: "/fixture", desktopLifecycle: true, nativeWorkstream: { role, workstreamId: "00000000-0000-0000-0000-000000000001" } };
+    expect(controllerJobBinding({ ...config(), factoryNative: true, controllerHostTools: true }, input))
+      .toMatchObject({ subscriptionProfile: "team8", nativeGeneration: 0, workspacePolicy: "factory-native", inferenceRole: role === "agent" ? "worker" : "orchestrator" });
+  });
+
   it("binds the lease to the same privately selected account and generation", () => {
     const input = request("team8"); input.factorySession = { sessionId: "factory-one", cwd: "/fixture", desktopLifecycle: true };
     expect(controllerJobBinding(config(), input)).toMatchObject({ subscriptionProfile: "team8", nativeGeneration: 0, workspacePolicy: "controller-readonly" });

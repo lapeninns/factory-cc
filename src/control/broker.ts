@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
-import type { BridgeRuntime, RuntimeApprovalRequest, RuntimeControl, RuntimePermissionDecision } from "../runtime/types.js";
+import type { BridgeRuntime, RuntimeApprovalRequest, RuntimeControl, RuntimePermissionDecision, NativeWorkstreamIdentity } from "../runtime/types.js";
 import type { SessionStore } from "../sessions/store.js";
 import { BridgeError, type ContentBlock, type MessagesRequest } from "../types.js";
 import { canonicalWorkspacePath, COMPACTION_SUMMARY } from "../workspace.js";
@@ -22,8 +22,9 @@ interface HostBinding {
   /** Remains locked until the host confirms successful ExitSpecMode. */
   specRestricted?: boolean;
   desktopLifecycle?: boolean;
+  nativeWorkstream?: NativeWorkstreamIdentity;
 }
-export interface FactoryHostIdentity { sessionId: string; cwd: string; launchId?: string; desktopLifecycle: boolean }
+export interface FactoryHostIdentity { sessionId: string; cwd: string; launchId?: string; desktopLifecycle: boolean; nativeWorkstream?: NativeWorkstreamIdentity }
 interface PendingApproval {
   view: ObjectValue & { id: string; bridgeSessionId: string };
   finish(decision: RuntimePermissionDecision): void;
@@ -41,7 +42,9 @@ export class ControlBroker implements RuntimeControl {
   private closed = false;
 
   constructor(private readonly runtime: BridgeRuntime, private readonly store: SessionStore, private readonly approvalTimeoutMs: number,
-    private readonly options: { desktopLifecycle?: boolean; ignoreUnknownSessionMarkers?: boolean; restoreIdleDesktopBindings?: boolean } = {}) {
+    private readonly options: { desktopLifecycle?: boolean; ignoreUnknownSessionMarkers?: boolean; restoreIdleDesktopBindings?: boolean; factoryNative?: boolean } = {}) {
+    if (options.factoryNative !== undefined && typeof options.factoryNative !== "boolean") throw new Error("Factory-native binding policy must be an explicit boolean.");
+    if (options.factoryNative && !options.desktopLifecycle) throw new Error("Factory-native bindings require authenticated Desktop lifecycle events.");
     if (options.desktopLifecycle && options.ignoreUnknownSessionMarkers) throw new Error("Desktop lifecycle cannot ignore unknown session markers.");
     if (options.restoreIdleDesktopBindings !== undefined && typeof options.restoreIdleDesktopBindings !== "boolean") throw new Error("Desktop binding recovery must be an explicit boolean.");
     if (options.restoreIdleDesktopBindings && !options.desktopLifecycle) throw new Error("Desktop binding recovery requires authenticated Desktop lifecycle events.");
@@ -196,7 +199,7 @@ export class ControlBroker implements RuntimeControl {
   hostIdentity(token: string | undefined): FactoryHostIdentity | undefined {
     const host = token ? this.tokens.get(token) : undefined;
     return host && !host.ended ? { sessionId: host.sessionId, cwd: host.cwd, launchId: host.launchId,
-      desktopLifecycle: host.desktopLifecycle === true } : undefined;
+      desktopLifecycle: host.desktopLifecycle === true, ...(host.nativeWorkstream ? { nativeWorkstream: { ...host.nativeWorkstream } } : {}) } : undefined;
   }
 
   /** The live Factory host this native session is bound to, if any. */
@@ -315,6 +318,7 @@ export class ControlBroker implements RuntimeControl {
         launch?.hosts.add(host);
       }
       host.cwdAliases.add(resolve(event.cwd));
+      this.observeNativeWorkstream(host, event);
       this.observePermissionMode(host, event);
       return { ok: true, bindingToken: host.token, additionalContext: `[factory-cc-session:${host.token}]` };
     }
@@ -325,6 +329,7 @@ export class ControlBroker implements RuntimeControl {
       if (!host.drained) await this.endHost(host, false, "Factory SessionEnd retry");
       return { ok: true, alreadyEnded: true };
     }
+    this.observeNativeWorkstream(host, event);
     this.observePermissionMode(host, event);
 
     if (event.hook_event_name === "UserPromptSubmit") {
@@ -377,6 +382,19 @@ export class ControlBroker implements RuntimeControl {
       return { ok: true, ended: true, sessions: host.bridgeSessions.size };
     }
     return { ok: true, observed: true };
+  }
+
+  private observeNativeWorkstream(host: HostBinding, event: ObjectValue): void {
+    if (!this.options.factoryNative || event.bridgeNativeWorkstream === undefined) return;
+    const value = object(event.bridgeNativeWorkstream);
+    if ((value.role !== "orchestrator" && value.role !== "agent") || typeof value.workstreamId !== "string"
+        || !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(value.workstreamId)) {
+      throw invalid("Invalid authenticated native Workstream metadata");
+    }
+    if (host.nativeWorkstream && (host.nativeWorkstream.role !== value.role || host.nativeWorkstream.workstreamId !== value.workstreamId)) {
+      throw new BridgeError(409, "native_workstream_conflict", "Factory cannot change the Workstream role of a live session generation.");
+    }
+    host.nativeWorkstream = { workstreamId: value.workstreamId, role: value.role };
   }
 
   private observePermissionMode(host: HostBinding, event: ObjectValue): void {

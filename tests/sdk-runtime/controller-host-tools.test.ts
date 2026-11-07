@@ -19,7 +19,10 @@ const actions = {
   Create: { file_path: "/fixture/report.txt", content: "report" },
   Edit: { file_path: "/fixture/report.txt", old_str: "old", new_str: "new" },
   Task: { subagent_type: "general", prompt: "Inspect the owned fixture" },
-  SpawnAgent: { task: "Inspect the owned fixture" },
+  SpawnAgent: { title: "Native fixture reader", prompt: "Inspect the owned fixture" },
+  SendMessage: { sessionId: "native-agent-fixture", message: "Reply with the bounded acknowledgement" },
+  InterruptAgent: { sessionId: "native-agent-fixture" },
+  ListAgents: {},
   "factory-workers-pool___factory_worker_accounts": {},
   "factory-workers-pool___factory_worker_start": { repository: "/fixture/repository", task: "Inspect the owned fixture", workflow: "investigate", operationId: "fixture-inspection" },
 };
@@ -158,7 +161,7 @@ describe("exactly approved Factory host operations", () => {
     expect(control.requestApproval).not.toHaveBeenCalled();
   });
 
-  it.each(["Read", "Task", "SpawnAgent"] as const)("Factory-native mode returns %s to Droid and consumes its result", async original => {
+  it.each(["Read", "Task", "SpawnAgent", "SendMessage", "InterruptAgent", "ListAgents"] as const)("Factory-native mode returns %s to Droid and consumes its result", async original => {
     const { runtime, fake, base } = setup({ original, factoryNative: true, spawnAgents: true, askTool: false });
     const action = callFrom(await runtime.handle(base));
     expect(action).toMatchObject({ name: original, input: actions[original] });

@@ -212,7 +212,7 @@ describe("Factory hook forwarding", () => {
 const scopedModel = "custom:Factory-Workstreams-Opus-5.5-eight-account-pool-0";
 const scopedSession = "4d199e9c-1e17-4c19-8498-b94ca53e29bb";
 
-async function scopedHookFixture() {
+async function scopedHookFixture(bindingEnv = "BRIDGE_FACTORY_BINDING_POOL") {
   const location = paths();
   const sessionsDir = join(location.configPath, "../sessions");
   const sessionDir = join(sessionsDir, "owned-project");
@@ -235,11 +235,11 @@ async function scopedHookFixture() {
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("Missing test listener");
   installFactoryHooks({ ...location, url: `http://127.0.0.1:${address.port}`, hookToken: "fixture-only-token",
-    desktopLifecycle: true, bindingEnv: "BRIDGE_FACTORY_BINDING_POOL", modelScope: { modelIds: [scopedModel], sessionsDir } });
+    desktopLifecycle: true, bindingEnv, modelScope: { modelIds: [scopedModel], sessionsDir } });
   const invoke = async (name: string, options: { bindingToken?: string; event?: Record<string, unknown> } = {}) => {
     const env = { ...process.env };
-    for (const key of ["BRIDGE_FACTORY_LAUNCH_ID", "BRIDGE_FACTORY_BINDING_POOL", "FORCE_COLOR", "NO_COLOR"]) delete env[key];
-    if (options.bindingToken !== undefined) env.BRIDGE_FACTORY_BINDING_POOL = options.bindingToken;
+    for (const key of ["BRIDGE_FACTORY_LAUNCH_ID", "BRIDGE_FACTORY_BINDING_POOL", "BRIDGE_FACTORY_BINDING_NATIVE", "FORCE_COLOR", "NO_COLOR"]) delete env[key];
+    if (options.bindingToken !== undefined) env[bindingEnv] = options.bindingToken;
     const child = spawn(process.execPath, ["--import", "tsx", resolve("scripts/factory-hook.ts"),
       "--factory-cc-hook-config", location.configPath, "--factory-cc-desktop-lifecycle"],
     { env, stdio: ["pipe", "pipe", "pipe"] });
@@ -279,19 +279,42 @@ describe("model-scoped Factory lifecycle hooks", () => {
     }
   });
 
-  it("uses only the selected model settings to bind and emit context through the actual entrypoint", async () => {
-    const fixture = await scopedHookFixture();
+  it.each(["BRIDGE_FACTORY_BINDING_POOL", "BRIDGE_FACTORY_BINDING_NATIVE"])("uses selected model settings and %s through the actual entrypoint", async bindingEnv => {
+    const fixture = await scopedHookFixture(bindingEnv);
     try {
       // The transcript is intentionally absent. Only the small settings file is needed.
       expect(existsSync(fixture.transcriptPath)).toBe(false);
       const startResult = await fixture.invoke("SessionStart");
       expect(startResult).toMatchObject({ code: 0, stderr: "" });
       expect(JSON.parse(startResult.stdout)).toMatchObject({ hookSpecificOutput: { additionalContext: "scoped-context" } });
-      expect(readFileSync(fixture.envFile, "utf8")).toContain("export BRIDGE_FACTORY_BINDING_POOL='" + "a".repeat(64) + "'");
+      expect(readFileSync(fixture.envFile, "utf8")).toContain("export " + bindingEnv + "='" + "a".repeat(64) + "'");
       const prompt = await fixture.invoke("UserPromptSubmit", { bindingToken: "a".repeat(64) });
       expect(prompt).toMatchObject({ code: 0, stderr: "" });
       expect(JSON.parse(prompt.stdout)).toMatchObject({ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: "scoped-context" } });
       expect(fixture.received.map(item => item.event.hook_event_name)).toEqual(["SessionStart", "UserPromptSubmit"]);
+    } finally { await fixture.close(); }
+  });
+
+  it("derives native roles only from Factory settings tags, never hook or transcript hints", async () => {
+    const fixture = await scopedHookFixture("BRIDGE_FACTORY_BINDING_NATIVE");
+    const workstreamId = "00000000-0000-0000-0000-000000000001";
+    try {
+      writeFileSync(fixture.settingsPath, JSON.stringify({ model: scopedModel,
+        tags: [{ name: "mission-v2", metadata: { kind: "agent", missionId: workstreamId } }] }));
+      expect((await fixture.invoke("SessionStart", { event: { bridgeNativeWorkstream: { role: "orchestrator", workstreamId } } })).code).toBe(0);
+      expect(fixture.received.at(-1)!.event.bridgeNativeWorkstream).toEqual({ role: "agent", workstreamId });
+      // An unrelated user tag cannot impersonate the reserved Factory tag.
+      writeFileSync(fixture.settingsPath, JSON.stringify({ model: scopedModel,
+        tags: [{ name: "user", metadata: { kind: "orchestrator", missionId: workstreamId } }] }));
+      expect((await fixture.invoke("UserPromptSubmit", { bindingToken: "a".repeat(64),
+        event: { bridgeNativeWorkstream: { role: "orchestrator", workstreamId } } })).code).toBe(0);
+      expect(fixture.received.at(-1)!.event).not.toHaveProperty("bridgeNativeWorkstream");
+      // Conflicting reserved tags remain unclassified instead of guessing.
+      writeFileSync(fixture.settingsPath, JSON.stringify({ model: scopedModel,
+        tags: ["agent", "orchestrator"].map(kind => ({ name: "mission-v2", metadata: { kind, missionId: workstreamId } })) }));
+      await fixture.invoke("UserPromptSubmit", { bindingToken: "a".repeat(64) });
+      expect(fixture.received.at(-1)!.event).not.toHaveProperty("bridgeNativeWorkstream");
+      expect(existsSync(fixture.transcriptPath)).toBe(false);
     } finally { await fixture.close(); }
   });
 

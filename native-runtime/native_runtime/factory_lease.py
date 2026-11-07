@@ -44,7 +44,7 @@ def _identifier(value):
 
 def validate_worktree(value, workspace_policy=None):
     """Workers require linked worktrees; explicit host controllers may use folders."""
-    if workspace_policy not in (None, "controller-readonly", "controller-host"):
+    if workspace_policy not in (None, "controller-readonly", "controller-host", "factory-native"):
         raise ProtocolError("invalid_workspace_policy")
     if not isinstance(value, str) or not Path(value).is_absolute():
         raise ProtocolError("absolute_worktree_required")
@@ -55,7 +55,7 @@ def validate_worktree(value, workspace_policy=None):
         info = path.stat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
             raise ProtocolError("owned_worktree_required")
-        if workspace_policy == "controller-host":
+        if workspace_policy in ("controller-host", "factory-native"):
             # A folder is not a repository. Do not invent Git provenance or run
             # Git against an ancestor repository for a general host operation.
             return {"worktree": str(path), "workspaceKind": "directory",
@@ -97,10 +97,13 @@ def _base_request(request, operation):
                                                or subscription_profile not in SUBSCRIPTION_PROFILES):
         raise ProtocolError("invalid_subscription_profile")
     policy = request.get("workspacePolicy")
-    if "workspacePolicy" in request and (policy not in ("controller-readonly", "controller-host") or subscription_profile is None
-                                           or role in ("worker", "validator")
-                                           or (policy == "controller-host" and role not in ("chat", "orchestrator"))):
-        raise ProtocolError("invalid_controller_policy")
+    if "workspacePolicy" in request:
+        allowed_role = (role in ("chat", "orchestrator", "worker", "validator") if policy == "factory-native"
+                        else role not in ("worker", "validator")
+                        and (policy != "controller-host" or role in ("chat", "orchestrator")))
+        if (policy not in ("controller-readonly", "controller-host", "factory-native")
+                or subscription_profile is None or not allowed_role):
+            raise ProtocolError("invalid_controller_policy")
     workspace = validate_worktree(request.get("cwd"), policy)
     if policy is not None:
         workspace["workspacePolicy"] = policy
@@ -179,6 +182,8 @@ def create_or_resume(config, request):
 
 
 def _workspace_conflict(left, right):
+    if left.get("workspacePolicy") == right.get("workspacePolicy") == "factory-native":
+        return False  # Pure model phases; Factory owns all workspace tools.
     if "controller-host" in (left.get("workspacePolicy"), right.get("workspacePolicy")):
         return _host_workspace_conflict(left, right)
     if left.get("worktree") != right.get("worktree"):

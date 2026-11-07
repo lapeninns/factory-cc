@@ -35,7 +35,7 @@ def execution_lane(job):
     profile = job.get("profile")
     if (job.get("kind") == "factory-session"
             and job.get("authMode") == "subscription"
-            and job.get("workspacePolicy") in ("controller-readonly", "controller-host")
+            and job.get("workspacePolicy") in ("controller-readonly", "controller-host", "factory-native")
             and job.get("role") in ("chat", "orchestrator")
             and isinstance(profile, str) and profile in SUBSCRIPTION_PROFILES
             and job.get("subscriptionProfile") == profile):
@@ -45,7 +45,8 @@ def execution_lane(job):
 
 def holds_workspace(job):
     """A published host action keeps its write reservation while compute is free."""
-    return job.get("state") in OCCUPIED or job.get("hostActionReservation") is True
+    return (job.get("workspacePolicy") != "factory-native"
+            and (job.get("state") in OCCUPIED or job.get("hostActionReservation") is True))
 
 
 def occupies_compute(job):
@@ -81,6 +82,8 @@ def profile_conflicts(job, occupied):
 
 
 def _host_workspace_conflict(left, right):
+    if left.get("workspacePolicy") == right.get("workspacePolicy") == "factory-native":
+        return False
     """Host operations reserve their folder tree, including native descendants."""
     if "controller-host" not in (left.get("workspacePolicy"), right.get("workspacePolicy")):
         return False

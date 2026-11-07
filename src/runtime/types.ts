@@ -1,6 +1,8 @@
 import type { ContentBlock, MessagesRequest, MessagesResponse, RoleTag } from "../types.js";
 import type { SessionRecord } from "../sessions/state.js";
 
+export interface NativeWorkstreamIdentity { workstreamId: string; role: "orchestrator" | "agent" }
+
 export interface RuntimeRequest {
   request: MessagesRequest;
   role: RoleTag;
@@ -9,7 +11,7 @@ export interface RuntimeRequest {
   /** Trusted host policy supplied by the controller, never raw Messages metadata. */
   factoryPermissionMode?: string;
   /** Bound by ControlBroker from its live opaque marker, never raw request metadata. */
-  factorySession?: { sessionId: string; cwd: string; launchId?: string; desktopLifecycle: boolean };
+  factorySession?: { sessionId: string; cwd: string; launchId?: string; desktopLifecycle: boolean; nativeWorkstream?: NativeWorkstreamIdentity };
   /** Trusted HTTP retry receipt. Prior results become reference history, never callbacks. */
   recovery?: "cold-import";
 }

@@ -1,3 +1,4 @@
+import { nativeAccountCandidates, nativeAssignedAccount } from "../runtime/native-account-admission.js";
 import { resolveRequestCwd } from "../workspace.js";
 import { createHash, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -56,6 +57,7 @@ function listenUrl(host: string, port: number): string {
 /** Only persisted, privately selected controller identities reach the lease. */
 export function controllerJobBinding(config: BridgeConfig, input: RuntimeRequest): DesktopJobBinding | undefined {
   if (!input.factorySession?.desktopLifecycle) return undefined;
+  const native = config.factoryNative ? input.factorySession.nativeWorkstream : undefined;
   let profile = config.subscriptionProfile;
   if (config.controllerPool) {
     const selected = config.subscriptionAccounts?.find(account => account.profile === input.session.claudeAccount);
@@ -66,9 +68,10 @@ export function controllerJobBinding(config: BridgeConfig, input: RuntimeRequest
     profile = selected.profile;
   }
   return {
+    ...(config.factoryNative ? { inferenceRole: native?.role === "orchestrator" ? "orchestrator" as const : "worker" as const } : {}),
     sessionId: input.factorySession.sessionId, cwd: input.factorySession.cwd, launchId: input.factorySession.launchId,
     ...(profile === undefined ? {} : { subscriptionProfile: profile }),
-    ...(config.controllerReadOnly ? { workspacePolicy: config.controllerHostTools ? "controller-host" as const : "controller-readonly" as const } : {}),
+    ...(config.controllerReadOnly ? { workspacePolicy: config.factoryNative ? "factory-native" as const : config.controllerHostTools ? "controller-host" as const : "controller-readonly" as const } : {}),
     ...(config.controllerPool ? { nativeGeneration: input.session.nativeGeneration } : {}),
   };
 }
@@ -109,7 +112,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
   });
   // Approvals wait on a person, so they get their own limit rather than the turn's idle limit.
   const control = new ControlBroker(runtime, store, config.approvalTimeoutMs, { desktopLifecycle: config.desktopLifecycle,
-    ignoreUnknownSessionMarkers: config.ignoreUnknownSessionMarkers, restoreIdleDesktopBindings: config.controllerHostTools });
+    ignoreUnknownSessionMarkers: config.ignoreUnknownSessionMarkers, restoreIdleDesktopBindings: config.controllerHostTools, factoryNative: config.factoryNative });
   runtime.setControl?.(control);
   const records: RedactedRequestRecord[] = [];
   let authFailureCount = 0;
@@ -117,7 +120,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     ? new ClaudePool((config.subscriptionAccounts ?? []).map(account => ({ id: account.profile, weight: account.weight })))
     : config.claudePool ? new ClaudePool(config.claudePool) : undefined;
   /** Pool entries always take a pool account. Other Claude entries keep their own account unless it is sitting out a limit. */
-  const claudeAccountFor = (listed: BridgeModel | undefined): string | undefined => {
+  const claudeAccountFor = (listed: BridgeModel | undefined, host?: import("../control/broker.js").FactoryHostIdentity): string | undefined => {
     if (!claudePool || listed?.provider === "cursor") return undefined;
     if (config.controllerPool) {
       const states = claudePool.status();
@@ -125,6 +128,21 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         const earliest = Math.min(...states.map(account => Date.parse(account.coolingUntil ?? "")));
         throw new BridgeError(429, "rate_limit_error", "All configured controller accounts are cooling; retry after the earliest recovery.",
           { retry_after: Math.max(1, Math.ceil((earliest - Date.now()) / 1000)), usage_limit: true });
+      }
+      if (config.factoryNative) {
+        if (!host?.desktopLifecycle) throw new BridgeError(409, "desktop_binding_required", "Factory-native account selection requires authenticated host lifecycle metadata.");
+        const members = states.map(account => account.id);
+        const assigned = nativeAssignedAccount(store.list(), host.sessionId, members);
+        if (assigned) {
+          if (claudePool.isCooling(assigned)) {
+            const until = states.find(account => account.id === assigned)?.coolingUntil;
+            throw new BridgeError(429, "rate_limit_error", "This native agent's assigned account is cooling; continue after its recovery.",
+              { retry_after: Math.max(1, Math.ceil((Date.parse(until ?? "") - Date.now()) / 1000)), usage_limit: true });
+          }
+          return assigned;
+        }
+        const ready = states.filter(account => !claudePool.isCooling(account.id)).map(account => account.id);
+        return claudePool.pick(nativeAccountCandidates(config.desktopStateRoot!, host.nativeWorkstream?.role === "orchestrator" ? "orchestrator" : "worker", ready));
       }
       return claudePool.pick();
     }
@@ -498,7 +516,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     });
     const retryNeedsAccount = config.controllerPool && resolved.reason === "upstream-retry"
       && resolved.match?.claudeAccount && claudePool?.isCooling(resolved.match.claudeAccount);
-    const claudeAccount = !resolved.match || retryNeedsAccount ? claudeAccountFor(listed) : undefined;
+    const claudeAccount = !resolved.match || retryNeedsAccount ? claudeAccountFor(listed, factorySession) : undefined;
     if (resolved.match && claudeAccount) store.update(resolved.match.bridgeSessionId, { claudeAccount });
     if (claudeAccount) logger.info("claude_account_assigned", { model: request.model, account: claudeAccount });
     const session = resolved.match
@@ -736,7 +754,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
             && (current.state === "GENERATING" || current.state === "RESUMING")) {
           // The retry imports this conversation's history, so it can start on a different account.
           let next: string | undefined;
-          try { next = limitedAccount ? claudeAccountFor(listed) : undefined; }
+          try { next = limitedAccount ? claudeAccountFor(listed, factorySession) : undefined; }
           catch (coolingError) { error = coolingError; }
           const nextAccount = next && !claudePool!.isCooling(next) ? next : undefined;
           const nextGeneration = (current.nativeGeneration ?? 0) + 1;

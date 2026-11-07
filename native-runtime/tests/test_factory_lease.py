@@ -581,6 +581,24 @@ class FactoryLeaseTests(unittest.TestCase):
         self.release(other_worker, 'completed', cleanupVerified=True)
         self.release(next_controller, 'completed', cleanupVerified=True)
 
+    def test_factory_native_uses_owned_folders_and_explicit_role_lanes(self):
+        with mock.patch('native_runtime.factory_lease.git', side_effect=AssertionError('native model phases do not require Git')):
+            workspace = validate_worktree(str(self.root), 'factory-native')
+        self.assertEqual(workspace['workspaceKind'], 'directory')
+        self.assertIsNone(workspace['repository'])
+        base = {'kind': 'factory-session', 'authMode': 'subscription', 'profile': 'team1',
+                'subscriptionProfile': 'team1', 'workspacePolicy': 'factory-native'}
+        self.assertEqual(execution_lane({**base, 'role': 'orchestrator'}), 'controller')
+        self.assertEqual(execution_lane({**base, 'role': 'worker'}), 'worker')
+        self.assertEqual(execution_lane({**base, 'role': 'validator'}), 'worker')
+        for role in ('unknown', 'session'):
+            with self.subTest(role=role):
+                child = self.start()
+                self.send(child, self.request(cwd=self.root, role=role, subscriptionProfile='team1',
+                                             workspacePolicy='factory-native'))
+                self.assertFalse(self.receive(child)['ok'])
+                self.assertEqual(child.wait(timeout=3), 2)
+
     def test_reserved_lane_requires_complete_matching_controller_metadata(self):
         controller = {'kind': 'factory-session', 'authMode': 'subscription', 'profile': 'team1',
                       'subscriptionProfile': 'team1', 'workspacePolicy': 'controller-readonly', 'role': 'chat'}
