@@ -31,6 +31,12 @@ export interface DesktopJobAcquire {
   workspacePolicy?: DesktopWorkspacePolicy;
 }
 export interface DesktopJobLease { jobId: string; release(result: DesktopJobRelease): Promise<void> }
+/**
+ * Release, update and deferral confirmations wait for the shared state lock.
+ * A burst of queued helpers can hold that lock for several seconds, and a
+ * missed confirmation stops the helper and leaves the account reserved.
+ */
+export const DEFAULT_RELEASE_TIMEOUT_MS = 30_000;
 export interface DesktopLeaseOptions {
   pythonExecutable: string;
   runtimePackagePath: string;
@@ -451,7 +457,7 @@ class LeaseChannel {
       "--max-running", String(options.maxRunning ?? 2)], { stdio: ["pipe", "pipe", "pipe"],
       env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "", LC_ALL: "C",
         PYTHONPATH: packagePath, PYTHONDONTWRITEBYTECODE: "1" } });
-    this.timer = setTimeout(() => this.deferAdmission(options.releaseTimeoutMs ?? 5_000), options.admissionTimeoutMs ?? 300_000);
+    this.timer = setTimeout(() => this.deferAdmission(options.releaseTimeoutMs ?? DEFAULT_RELEASE_TIMEOUT_MS), options.admissionTimeoutMs ?? 300_000);
     this.timer.unref();
     this.child.stdout.on("data", (data: Buffer) => this.consume(data));
     // Error diagnostics from the helper may contain paths; never relay raw text.
@@ -560,11 +566,11 @@ function safeRelease(result: DesktopJobRelease): WireMessage {
 export async function acquireDesktopJobLease(options: DesktopLeaseOptions, request: DesktopJobAcquire, signal: AbortSignal): Promise<DesktopJobLease> {
   const channel = new LeaseChannel(options, { op: "acquire", ...safeAcquire(request) }, signal);
   const jobId = await channel.ready;
-  return { jobId, release: (result) => channel.release(result, options.releaseTimeoutMs ?? 5_000) };
+  return { jobId, release: (result) => channel.release(result, options.releaseTimeoutMs ?? DEFAULT_RELEASE_TIMEOUT_MS) };
 }
 
 export async function updateDesktopJobRecord(options: DesktopLeaseOptions, request: DesktopJobAcquire, result: DesktopJobRelease): Promise<void> {
-  const channel = new LeaseChannel({ ...options, admissionTimeoutMs: options.releaseTimeoutMs ?? 5_000 }, { op: "update", ...safeAcquire(request), ...safeRelease(result) });
+  const channel = new LeaseChannel({ ...options, admissionTimeoutMs: options.releaseTimeoutMs ?? DEFAULT_RELEASE_TIMEOUT_MS }, { op: "update", ...safeAcquire(request), ...safeRelease(result) });
   await channel.exited;
 }
 

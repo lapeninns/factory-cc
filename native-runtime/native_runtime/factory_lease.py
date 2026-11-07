@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import random
 import re
 import select
 import stat
@@ -339,6 +340,10 @@ class Lines:
         return None
 
 
+# Upper bound for a queued helper's scheduling interval, in seconds.
+QUEUED_POLL_MAX = 1.0
+
+
 def emit(event, job=None, **fields):
     value = {"ok": True, "event": event, **fields}
     if job:
@@ -363,6 +368,10 @@ def serve(config, input_fd=0):
             return 0
         job = create_or_resume(config, request)
         emit("queued", job)
+        # Each scheduling attempt holds the shared lock while it snapshots
+        # processes and reads every job. Queued helpers back off so that a
+        # burst of them cannot starve admitted helpers that must release.
+        wait = config.poll_interval
         while not admitted:
             message = lines.poll(0)
             if message is not None:
@@ -384,7 +393,8 @@ def serve(config, input_fd=0):
                 admitted = True
                 emit("ready", job)
                 break
-            time.sleep(config.poll_interval)
+            time.sleep(wait * random.uniform(0.75, 1.25))
+            wait = min(max(config.poll_interval, QUEUED_POLL_MAX), wait * 2)
         while True:
             message = lines.poll(config.poll_interval)
             if message is None:

@@ -498,6 +498,36 @@ describe("Factory supervised API workers", () => {
     expect(run).not.toHaveBeenCalled();
   });
 
+  it("confirms verified cleanup through the owner's update when a lease release is not acknowledged", async () => {
+    const finalizeLease = vi.fn(async (_worker: unknown, _result: unknown) => { if (finalizeLease.mock.calls.length < 2) throw new Error("Stopped helper still owns the record"); });
+    const runtime = service({ cleanup: async () => {}, leaseRecoveryDelaysMs: [0, 0, 0], finalizeLease,
+      acquireLease: async () => ({ release: async () => { throw new Error("Release acknowledgement timed out"); } }) });
+    const item = await runtime.start({ repository: repo, task: "fixture", workflow: "investigate" });
+    await until(() => runtime.status(item.id).state === "completed");
+    expect(finalizeLease).toHaveBeenCalledTimes(2);
+    expect(finalizeLease.mock.calls[1][1]).toMatchObject({ state: "completed", cleanupVerified: true });
+    expect(runtime.status(item.id)).toMatchObject({ resultState: "completed", cleanupVerified: true, leaseReleased: true });
+    expect(runtime.status(item.id).settledAt).toBeDefined();
+  });
+
+  it("keeps the lease uncertain when no confirmation retry succeeds or cleanup is unverified", async () => {
+    const finalizeLease = vi.fn(async () => { throw new Error("Release remains unconfirmed"); });
+    const release = async () => { throw new Error("Release acknowledgement timed out"); };
+    const exhausted = service({ cleanup: async () => {}, leaseRecoveryDelaysMs: [0, 0], finalizeLease, acquireLease: async () => ({ release }) });
+    const a = await exhausted.start({ repository: repo, task: "fixture", workflow: "investigate" });
+    await until(() => exhausted.status(a.id).state === "unknown");
+    expect(finalizeLease).toHaveBeenCalledTimes(2);
+    expect(exhausted.status(a.id)).toMatchObject({ cleanupVerified: true, leaseReleased: false, reason: "shared_lease_release_unproven" });
+    await exhausted.close();
+    finalizeLease.mockClear();
+    const unverified = service({ stateRoot: join(folder, "other-state"), cleanup: async () => { throw new Error("cleanup unproven"); },
+      leaseRecoveryDelaysMs: [0], finalizeLease, acquireLease: async () => ({ release }) });
+    const b = await unverified.start({ repository: repo, task: "fixture", workflow: "investigate" });
+    await until(() => unverified.status(b.id).state === "unknown" && unverified.status(b.id).endedAt !== undefined);
+    expect(finalizeLease).not.toHaveBeenCalled();
+    expect(unverified.status(b.id)).toMatchObject({ cleanupVerified: false, leaseReleased: false });
+  });
+
   it("retains uncertain admission when the control channel fails without proof of rejection", async () => {
     const finalizeLease = vi.fn(async () => { throw new Error("Release remains unconfirmed"); });
     const runtime = service({ acquireLease: async () => { throw new BridgeError(503, "desktop_job_channel", "Fixture transport failure"); }, finalizeLease });
