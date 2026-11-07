@@ -49,6 +49,8 @@ export interface DesktopLeaseOptions {
   releaseTimeoutMs?: number;
 }
 export interface DesktopJobsOptions extends DesktopLeaseOptions {
+  /** Factory owns tool execution and workspace coordination in model-only mode. */
+  factoryNative?: boolean;
   /** Exact configured namespace for independently supervised worker tools. */
   workerMcpPrefix?: string;
   getBinding(input: RuntimeRequest): DesktopJobBinding | undefined;
@@ -254,7 +256,7 @@ export class DesktopJobsRuntime implements BridgeRuntime {
           pending: phase.unresolvedHostIds, usage: turn.response.usage, sdkSessionId: turn.sdkSessionId }, "unknown", cancelledCleanly === true);
         return turn;
       }
-      if (phase.request.workspacePolicy === "controller-host" && !phase.outcome) {
+      if (!this.options.factoryNative && phase.request.workspacePolicy === "controller-host" && !phase.outcome) {
         const held: HeldHostPhase = phase.heldHost ?? { request: phase.request, lease: phase.lease, pending: new Set() };
         for (const callId of phase.acknowledgedHostIds ?? []) held.pending.delete(callId);
         for (const block of turn.response.content) {
@@ -392,7 +394,7 @@ export class DesktopJobsRuntime implements BridgeRuntime {
 
   private markUnresolvedHostAction(id: string): void {
     const phase = this.active.get(id);
-    if (phase?.request.workspacePolicy !== "controller-host" || !phase.lease) return;
+    if (this.options.factoryNative || phase?.request.workspacePolicy !== "controller-host" || !phase.lease) return;
     const pending = (this.inner.pendingHostCalls?.(id) ?? [])
       .filter(call => hostActionNeedsWorkspaceReservation(call.toolName, this.options.workerMcpPrefix));
     if (pending.length) {

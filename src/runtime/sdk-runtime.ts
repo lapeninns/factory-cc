@@ -500,7 +500,7 @@ export class SdkRuntime implements BridgeRuntime {
       }
       if (modelRoute) await this.selectModel(live, modelRoute, results.length > 0);
       await this.selectReasoning(live, input, results.length > 0);
-      const context = buildHostContext(input, resolveCwd(input, this.config));
+      const context = buildHostContext(input, resolveCwd(input, this.config), this.config.factoryNative);
       // A cancellation or an assistant separator ends Droid's previous response.
       // Keep subsequent user input separate from the completed tool result.
       const cancelled = results.some((result) => isUserCancellation(result) && !live.resultFingerprints.has(result.tool_use_id));
@@ -539,8 +539,8 @@ export class SdkRuntime implements BridgeRuntime {
         if (live.terminal) throw live.terminal;
         const cwd = resolveCwd(input, this.config);
         const content = coldImport
-          ? buildInitialUserContent(input, cwd)
-          : buildDynamicUserContent(input, cwd, { includeContext: live.lastHostContext !== context });
+          ? buildInitialUserContent(input, cwd, this.config.factoryNative)
+          : buildDynamicUserContent(input, cwd, { includeContext: live.lastHostContext !== context, factoryNative: this.config.factoryNative });
         live.lastHostContext = context;
         live.sentUserTurns++;
         live.inputs.push({
@@ -740,7 +740,7 @@ export class SdkRuntime implements BridgeRuntime {
     const blocks = trailingUserMessages(input.request.messages).flatMap((message) => asBlocks(message.content)).filter((block) => block.type !== "tool_result");
     if (!blocks.length) return [];
     return buildDynamicUserContent({ ...input, request: { ...input.request, messages: [{ role: "user", content: blocks }] } },
-      resolveCwd(input, this.config), { includeContext: context !== live.lastHostContext });
+      resolveCwd(input, this.config), { includeContext: context !== live.lastHostContext, factoryNative: this.config.factoryNative });
   }
 
   private submitResults(live: LiveSdk, results: DroidResult[], continuation: ContentBlock[] = [], handoff?: TurnHandoff): Array<"accepted" | "duplicate"> {
@@ -786,7 +786,7 @@ export class SdkRuntime implements BridgeRuntime {
   private async updateCatalog(live: LiveSdk, input: RuntimeRequest): Promise<void> {
     const started = Date.now();
     if (!live.catalog) throw new BridgeError(503, "dynamic_tools_unavailable", "The live SDK session has no mutable Droid MCP catalog");
-    if (await live.catalog.update(selectDroidMcpTools(input.request.tools, this.config.desktopProfile)
+    if (await live.catalog.update(selectDroidMcpTools(input.request.tools, this.config.desktopProfile, this.config.factoryNative)
       .filter((tool) => controllerHostToolAllowed(this.config, tool.name)))) {
       await this.waitForCatalogVisibility(live);
       live.events.push({ at: now(), type: "droid_catalog_updated", data: {
@@ -915,7 +915,7 @@ export class SdkRuntime implements BridgeRuntime {
     const selection = route ? route.selection : await this.ensureSelection();
     if (selection) this.selection = selection;
     if (live.terminal) throw live.terminal;
-    const droidTools = (input.request.tools !== undefined ? selectDroidMcpTools(input.request.tools, this.config.desktopProfile) : live.catalog?.definitions() ?? [])
+    const droidTools = (input.request.tools !== undefined ? selectDroidMcpTools(input.request.tools, this.config.desktopProfile, this.config.factoryNative) : live.catalog?.definitions() ?? [])
       .filter((tool) => controllerHostToolAllowed(this.config, tool.name));
     const names = live.names ?? new StableDroidToolNames();
     live.names = names;
@@ -1037,9 +1037,11 @@ export class SdkRuntime implements BridgeRuntime {
       allowedTools: ["mcp__droid__*"],
       env, permissionMode: this.config.desktopProfile || this.config.permissionMode === "ask" ? "default" : "bypassPermissions",
       allowDangerouslySkipPermissions: !this.config.desktopProfile && this.config.permissionMode !== "ask", abortController: abort,
-      systemPrompt: { ...buildPresetSystemPrompt(this.config.desktopProfile, this.config.nativeWorkflows),
-        append: buildPresetSystemPrompt(this.config.desktopProfile, this.config.nativeWorkflows).append + desktopJobPolicy(this.config)
-          + (this.config.controllerHostTools
+      systemPrompt: { ...buildPresetSystemPrompt(this.config.desktopProfile, this.config.nativeWorkflows, this.config.factoryNative),
+        append: buildPresetSystemPrompt(this.config.desktopProfile, this.config.nativeWorkflows, this.config.factoryNative).append + (this.config.factoryNative ? "" : desktopJobPolicy(this.config))
+          + (this.config.factoryNative
+            ? "\nUse Factory SpawnAgent, SendMessage, ListAgents and InterruptAgent for native Workstream coordination, and Factory Task for custom Droid subagents when advertised. All actual tools run in Factory. Never delegate through factory_worker_start or other bridge worker tools. Each native Droid agent must use the configured bridge-backed custom model; never assume model inheritance or silently select a hosted model. Report blocked model configuration to the user. Give concurrent writers separate ownership and follow Factory instructions for workspaces and integration."
+            : this.config.controllerHostTools
             ? "\nThis Factory controller supports ordinary folders and repositories. Use the allowed host read tools for inspection. "
               + (this.config.controllerApprovalPolicy === "bypass"
                 ? "The operator disabled this bridge's extra confirmation for Factory Execute, Create and Edit. Use those advertised host tools within the user's task scope; Factory's own permissions still apply. "
@@ -1054,12 +1056,12 @@ export class SdkRuntime implements BridgeRuntime {
               + "For an ordinary folder or a workspace the worker cannot isolate, use authorized Factory host tools. Keep all actions within the user's task and current Factory permission mode."
             : this.config.controllerReadOnly ? "\nThis Factory controller is read-only. Inspect with the allowed read tools, discover only allowed tools with ToolSearch, and use AskUser for essential missing information or new permissions. Delegate all implementation to the configured supervised worker tools. Never use Execute, Create, Edit, Task, SpawnAgent, unrelated MCP tools or native side effects." : "")
           + (this.config.desktopProfile || this.config.desktopJobs ? "\n\n" + WORKSTREAM_DECISION_POLICY
-            + "\nWhen a worker returns a blocked handoff, its completed attempt does not complete the user task. Collect essential answers or new permissions with AskUser and provide the actual answer in a new worker assignment." : "") },
+            + (this.config.factoryNative ? "\nUse Factory native messaging to steer agents and collect blocked handoffs; a finished agent turn does not by itself complete the user task." : "\nWhen a worker returns a blocked handoff, its completed attempt does not complete the user task. Collect essential answers or new permissions with AskUser and provide the actual answer in a new worker assignment.") : "") },
       canUseTool: async (name: string, toolInput: Record<string, unknown>, context?: NativePermissionContext) => live.queryEpoch === epoch
         ? this.canUseTool(live, name, toolInput, context)
         : { behavior: "deny", message: "This native query has been retired." },
     };
-    if (this.config.desktopProfile || this.config.nativeWorkflows || this.config.controllerReadOnly) options.disallowedTools = DESKTOP_DISALLOWED_TOOLS.filter(name => !(this.config.nativeWorkflows && !this.config.controllerReadOnly && name === "Workflow"));
+    if (this.config.desktopProfile || this.config.nativeWorkflows || this.config.controllerReadOnly) options.disallowedTools = [...(this.config.factoryNative ? ["Read", "LS", "Grep", "Glob"] : []), ...DESKTOP_DISALLOWED_TOOLS].filter(name => !(this.config.nativeWorkflows && !this.config.controllerReadOnly && name === "Workflow"));
     if (this.config.nativeWorkflows) {
       options.maxBudgetUsd = this.config.workflowMaxBudgetUsd;
       env.CLAUDE_CONFIG_DIR = join(this.config.dataDir, "native-workflow-config");
@@ -1578,10 +1580,11 @@ export class SdkRuntime implements BridgeRuntime {
   }
 
   private toolAccessDenial(live: LiveSdk, name: string | undefined, factoryPermissionMode?: string): string | undefined {
+    if (this.config.factoryNative && !name?.startsWith("mcp__droid__")) return "BRIDGE_FACTORY_NATIVE: All tools execute in Factory. Use the advertised Factory MCP tools, including for reads.";
     if (this.config.controllerReadOnly) {
       const original = name?.startsWith("mcp__droid__") ? live.names?.toOriginal(name.slice("mcp__droid__".length)) : name;
       if (!original || !controllerHostToolAllowed(this.config, original)) return "BRIDGE_CONTROLLER_READ_ONLY: This tool is outside the controller's read-only and supervised-worker allowlist.";
-      if (this.config.controllerHostTools && !["Read", "LS", "Grep", "Glob", "ToolSearch", "AskUser", "ExitSpecMode"].includes(original)
+      if (this.config.controllerHostTools && !this.config.factoryNative && !["Read", "LS", "Grep", "Glob", "ToolSearch", "AskUser", "ExitSpecMode"].includes(original)
           && (factoryPermissionMode ?? live.current?.factoryPermissionMode) === "spec") {
         return "BRIDGE_FACTORY_SPEC_READ_ONLY: Leave Factory spec mode before authorizing a mutating host action.";
       }
@@ -2015,10 +2018,12 @@ function queryPolicy(input: RuntimeRequest, config: BridgeConfig): string {
   return JSON.stringify({ ...(config.models === undefined ? { model: input.request.model } : {}), role: input.role, cwd: resolveCwd(input, config), permission: config.permissionMode,
     controllerReadOnly: config.controllerReadOnly === true, controllerHostTools: config.controllerHostTools === true,
     ...(config.controllerSpawnAgents ? { controllerSpawnAgents: true } : {}),
+    ...(config.factoryNative ? { factoryNative: true } : {}),
     ...(config.controllerReadOnly ? { workerMcpPrefix: config.workerMcpPrefix } : {}),
     ...(config.controllerPool ? { subscriptionAccount: input.session.claudeAccount, nativeGeneration: input.session.nativeGeneration } : {}) });
 }
 function controllerHostToolAllowed(config: BridgeConfig, name: string): boolean {
+  if (config.factoryNative) return !/(?:^|___|__)factory_worker_/.test(name);
   if (!config.controllerReadOnly) return true;
   if (config.controllerHostTools) return name !== "Task" && (name !== "SpawnAgent" || config.controllerSpawnAgents === true);
   if (["Read", "LS", "Grep", "Glob", "ToolSearch", "AskUser"].includes(name)) return true;

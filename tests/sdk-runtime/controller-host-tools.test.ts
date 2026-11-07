@@ -13,6 +13,7 @@ import { sanitizedSubscriptionEnvironment } from "../../src/workers/subscription
 const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
 const ask = { name: "AskUser", input_schema: { type: "object", properties: { questionnaire: { type: "string" } }, required: ["questionnaire"], additionalProperties: false } };
 const actions = {
+  Read: { file_path: "/fixture/probe.txt" },
   AskUser: { questionnaire: "1. [question] Which production account should receive the release?\n[topic] Essential account selection\n[option] Account A (Recommended)\n[option] Account B" },
   Execute: { command: "df -h ." },
   Create: { file_path: "/fixture/report.txt", content: "report" },
@@ -61,7 +62,7 @@ class Fake implements SdkHandle {
   }
 }
 
-function setup(options: { original?: keyof typeof actions; hostTools?: boolean; spawnAgents?: boolean; askTool?: boolean; invoke?: boolean; approvalPolicy?: "ask" | "bypass" } = {}) {
+function setup(options: { original?: keyof typeof actions; hostTools?: boolean; spawnAgents?: boolean; factoryNative?: boolean; askTool?: boolean; invoke?: boolean; approvalPolicy?: "ask" | "bypass" } = {}) {
   const root = mkdtempSync(join(tmpdir(), "controller-host-tools-")); roots.push(root);
   mkdirSync(join(root, "policies")); mkdirSync(join(root, "workflows"));
   writeFileSync(join(root, "policies/team-policy.md"), "Fixture policy.\n");
@@ -70,7 +71,7 @@ function setup(options: { original?: keyof typeof actions; hostTools?: boolean; 
   vi.stubEnv("BRIDGE_SDK_CWD", root);
   const config = loadConfig({ mode: "sdk", authMode: "subscription", desktopProfile: true, desktopJobs: true, desktopLifecycle: true,
     desktopRuntimePath: root, desktopStateRoot: join(root, "state"), controllerReadOnly: true, workerPool: true, controllerPool: true,
-    controllerHostTools: options.hostTools !== false, controllerSpawnAgents: options.spawnAgents, controllerApprovalPolicy: options.approvalPolicy,
+    controllerHostTools: options.hostTools !== false, controllerSpawnAgents: options.spawnAgents, factoryNative: options.factoryNative, controllerApprovalPolicy: options.approvalPolicy,
     workerControlFile: join(root, "control.json"), workerMcpPrefix: "factory-workers-pool___",
     subscriptionProfile: "team1", subscriptionExpectedEmail: "team1@example.invalid",
     subscriptionAccounts: SUBSCRIPTION_PROFILES.map(profile => ({ profile, expectedEmail: `${profile}@example.invalid`, weight: 1,
@@ -155,6 +156,41 @@ describe("exactly approved Factory host operations", () => {
     expect((await runtime.handle(toolResult(base, action.id, "agent started"))).response.stop_reason).toBe("end_turn");
     expect(fake.observedResult).toMatchObject({ isError: false });
     expect(control.requestApproval).not.toHaveBeenCalled();
+  });
+
+  it.each(["Read", "Task", "SpawnAgent"] as const)("Factory-native mode returns %s to Droid and consumes its result", async original => {
+    const { runtime, fake, base } = setup({ original, factoryNative: true, spawnAgents: true, askTool: false });
+    const action = callFrom(await runtime.handle(base));
+    expect(action).toMatchObject({ name: original, input: actions[original] });
+    expect(fake.calls[0]!.options.systemPrompt.append).toContain("all tool execution");
+    expect(fake.calls[0]!.options.systemPrompt.append).not.toContain("Use factory_worker_start only when");
+    await runtime.handle(toolResult(base, action.id, "Factory-owned result"));
+    expect(fake.observedResult).toMatchObject({ isError: false });
+  });
+
+  it("Factory-native mode denies internal reads and nested Claude execution in hooks and permissions", async () => {
+    const { runtime, fake, base } = setup({ original: "Read", factoryNative: true, spawnAgents: true, invoke: false });
+    await runtime.handle(base);
+    const options = fake.calls[0]!.options, hook = options.hooks.PreToolUse[0].hooks[0];
+    for (const tool of ["Read", "LS", "Grep", "Glob", "Bash", "Write", "Agent", "Task", "Workflow"]) {
+      expect(options.disallowedTools).toContain(tool);
+      expect(await hook({ tool_name: tool, tool_input: {} })).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+      expect(await options.canUseTool(tool, {})).toMatchObject({ behavior: "deny" });
+    }
+  });
+
+  it.each(["factory-workers-pool___factory_worker_start", "factory-workers-pool___factory_worker_accounts"] as const)("Factory-native mode excludes %s", async original => {
+    const { runtime, fake, base } = setup({ original, factoryNative: true, spawnAgents: true, invoke: false });
+    await runtime.handle(base);
+    const name = new StableDroidToolNames().toMcp(original);
+    expect(fake.handlers.has(name)).toBe(false);
+    expect(await fake.calls[0]!.options.hooks.PreToolUse[0].hooks[0]({ tool_name: `mcp__droid__${name}`, tool_input: {} }))
+      .toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+  });
+
+  it("requires Factory-native mode's operator policies", () => {
+    expect(() => setup({ factoryNative: true })).toThrow(/requires pooled host tools and SpawnAgent/);
+    expect(() => setup({ factoryNative: true, spawnAgents: true, approvalPolicy: "ask" })).toThrow(/delegates approval decisions to Factory/);
   });
 
   it("keeps Factory Task on the managed worker path when SpawnAgent is enabled", async () => {

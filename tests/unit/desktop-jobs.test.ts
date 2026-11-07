@@ -247,6 +247,35 @@ describe("explicit host-directory controllers", () => {
     }
   });
 
+  it("Factory-native Task releases the parent reservation so its same-folder child can infer", async () => {
+    const first = hostFixture(), second = hostFixture();
+    const stateRoot = join(first.root, "native-state");
+    for (const fixture of [first, second]) {
+      fixture.options.factoryNative = true;
+      fixture.options.runtimePackagePath = resolve("native-runtime");
+      fixture.options.stateRoot = stateRoot;
+      fixture.options.admissionTimeoutMs = 5_000;
+      fixture.options.releaseTimeoutMs = 2_000;
+      fixture.options.acquireLease = undefined;
+      fixture.options.updateRecord = undefined;
+    }
+    second.binding.sessionId = "factory-child";
+    second.binding.cwd = first.cwd;
+    second.binding.subscriptionProfile = "team2";
+    second.input.session.bridgeSessionId = "bridge-child";
+    first.inner.handle.mockResolvedValueOnce(hostTurn("pending-task", "Task"));
+    try {
+      await first.runtime.handle(first.input);
+      expect(first.runtime.describe()).toMatchObject({ desktopJobs: { heldHostActions: 0 } });
+      await second.runtime.handle(second.input);
+      expect(second.inner.handle).toHaveBeenCalledOnce();
+      await first.runtime.handle(withResult(first.input, "pending-task"));
+      expect(first.inner.handle).toHaveBeenCalledTimes(2);
+    } finally {
+      await Promise.allSettled([first.runtime.close(), second.runtime.close()]);
+    }
+  });
+
   it.each(["Read", "ListAgents", "TodoWrite", "factory-workers-pool___factory_worker_start", "factory-workers-pool___factory_worker_wait"])("keeps safe read or supervised control %s outside workspace reservations", async name => {
     const fixture = hostFixture();
     fixture.options.workerMcpPrefix = "factory-workers-pool___";
