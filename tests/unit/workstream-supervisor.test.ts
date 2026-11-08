@@ -63,6 +63,7 @@ describe("independent Workstream supervision", () => {
     const s = superviseWorkstream(state(), rejected(), p).state;
     const r = superviseWorkstream(s, rejected({ busy: true }), p);
     expect(r.state.status).toBe("work-active");
+    expect(r.state.alert?.reason).toBe("native_start_rejected_recovery_deferred");
     expect(r.action?.type).toBe("pause-retry");
     expect(r.state.attempts).toBe(1);
   });

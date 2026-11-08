@@ -69,7 +69,7 @@ export function superviseWorkstream(previous: SupervisorState, o: SupervisorObse
   if (finiteTime(o.cancelledAt) && o.cancelledAt >= Math.max(s.armedAt, failureAt, s.failureAt ?? 0)) {
     return finish("operator-interrupted", "operator_interruption_requires_explicit_resume", s.pending ? { type: "pause-retry" } : undefined);
   }
-  if (o.busy) return finish("work-active", undefined, s.pending ? { type: "pause-retry" } : undefined); // Never interrupt an agent, tool, approval or another writer.
+  if (o.busy) return finish("work-active", rejection && rejection.at > (s.verifiedAt ?? 0) && o.now - rejection.at >= p.startupGraceMs ? "native_start_rejected_recovery_deferred" : undefined, s.pending ? { type: "pause-retry" } : undefined); // Never interrupt an agent, tool, approval or another writer.
 
   if (s.pending && finiteTime(o.cooldownUntil) && o.cooldownUntil > o.now) {
     s.pending.dueAt = Math.max(s.pending.dueAt, o.cooldownUntil + 60_000);
