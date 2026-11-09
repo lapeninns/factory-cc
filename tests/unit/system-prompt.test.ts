@@ -193,6 +193,23 @@ describe("T3-style system prompt", () => {
       toolResults: 1, erroredToolResults: 1, unansweredToolCalls: 1, unmatchedToolResults: 0 });
   });
 
+  it("pairs a call with its result when Droid returns the call id in its normalized form", () => {
+    const input = request();
+    const callId = "call-0b7f2c1e-1\nfc_9d3a6b40_0";
+    input.request.messages = [
+      { role: "user", content: "read the file" },
+      { role: "assistant", content: [{ type: "tool_use", id: callId, name: "Read", input: { file_path: "/work/a" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call-0b7f2c1e-1_fc_9d3a6b40_0", content: "contents" }] },
+      { role: "assistant", content: "Read it." },
+      { role: "user", content: "continue" },
+    ];
+    const text = buildInitialUserContent(input, "/work").flatMap((block) => block.type === "text" && typeof block.text === "string" ? [block.text] : []);
+    expect(text).toContain('Historical tool call call-0b7f2c1e-1_fc_9d3a6b40_0 Read: {"file_path":"/work/a"}');
+    expect(text).toContain("Historical tool result call-0b7f2c1e-1_fc_9d3a6b40_0:");
+    expect(text.join("\n")).not.toContain("no result was recorded");
+    expect(coldImportStats(input.request.messages)).toMatchObject({ toolCalls: 1, toolResults: 1, unansweredToolCalls: 0, unmatchedToolResults: 0 });
+  });
+
   it("leaves a short first turn as the plain current message", () => {
     const input = request();
     input.request.messages = [{ role: "user", content: "hello" }];

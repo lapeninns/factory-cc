@@ -224,6 +224,34 @@ class TelemetryTests(unittest.TestCase):
         with self.assertRaises(RuntimeRefused):
             capacity_view(jobs, max_running=9)
 
+    def test_capacity_covers_every_retained_record_beyond_the_detail_cap(self):
+        state = self.root / "state"
+        jobs = state / "jobs"
+        jobs.mkdir(parents=True)
+        for number in range(1000):
+            name = "job-%04d" % number
+            (jobs / (name + ".json")).write_text(json.dumps({"id": name, "profile": "team1", "kind": "native-session", "state": "completed"}))
+        late = {"id": "job-1000", "kind": "factory-session", "authMode": "subscription", "profile": "team2",
+                "subscriptionProfile": "team2", "workspacePolicy": "factory-native", "role": "worker", "state": "unknown"}
+        (jobs / "job-1000.json").write_text(json.dumps(late))
+        report = report_jobs(state, observe_processes=False, max_running=8)
+        self.assertEqual(len(report["jobs"]), 1000)
+        self.assertIn("Job report limited to 1000 records.", report["warnings"])
+        capacity = report["capacity"]
+        self.assertTrue(capacity["complete"])
+        self.assertEqual(capacity["records"], 1001)
+        self.assertEqual(capacity["lanes"]["worker"]["occupied"], 1)
+        self.assertEqual(capacity["accounts"]["team2"]["workerLane"], "excluded_until_cleanup_verified")
+        self.assertEqual(capacity["accounts"]["team2"]["controllerLane"], "excluded_until_cleanup_verified")
+
+        (jobs / "job-0500.json").write_text("{not json")
+        unknown = report_jobs(state, observe_processes=False, max_running=8)["capacity"]
+        self.assertFalse(unknown["complete"])
+        self.assertEqual(unknown["unreadableRecords"], 1)
+        self.assertIsNone(unknown["lanes"])
+        self.assertIsNone(unknown["accounts"])
+        self.assertIsNone(unknown["queue"])
+
     def test_report_rejects_symlinked_state(self):
         state = self.root / "state"
         state.mkdir()

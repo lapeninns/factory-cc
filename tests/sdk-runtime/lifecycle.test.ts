@@ -1827,6 +1827,37 @@ describe("startup and cold-import failure evidence", () => {
     expect(failureRecord()).toBeUndefined();
   });
 
+  it("finishes teardown and delivers the original failure when terminal diagnostics cannot be written", async () => {
+    const broken = {
+      info: vi.fn((event: string) => { if (event === "sdk_session_stopped") throw new Error("diagnostic write failed"); }),
+      warn: vi.fn((event: string) => { if (event === "sdk_session_failed") throw new Error("diagnostic write failed"); }),
+      error: vi.fn(),
+    };
+    const settle = (promise: Promise<unknown>) => Promise.race([promise.then(() => "resolved", (error: unknown) => error),
+      new Promise((resolve) => { setTimeout(() => resolve("unsettled"), 1_000); })]);
+    const closedInput = async (sdk: FakeSdk) => sdk.calls[0]!.prompt[Symbol.asyncIterator]().next();
+
+    const failing = new FakeSdk(async function* () {
+      yield { type: "result", subtype: "success", is_error: true, result: "Prompt is too long", terminal_reason: "prompt_too_long" };
+    });
+    const failed = new SdkRuntime(create(failing).config, broken, failing); runtimes.push(failed);
+    expect(await settle(failed.handle(request(session(), "unused", { messages: longHistory(2) }))))
+      .toMatchObject({ status: 400, code: "invalid_request_error", extra: { sdk_terminal_reason: "prompt_too_long" } });
+    expect(broken.warn).toHaveBeenCalledWith("sdk_session_failed", expect.anything());
+    expect(failing.close).toHaveBeenCalledTimes(1);
+    expect(await closedInput(failing)).toEqual({ value: undefined, done: true });
+    expect(failed.describe()).toMatchObject({ activeNativeSessions: 0, slotsInUse: 0 });
+
+    const idle = new FakeSdk(async function* () { yield success("done"); });
+    const cancelled = new SdkRuntime(create(idle).config, broken, idle); runtimes.push(cancelled);
+    await cancelled.handle(request(session({ bridgeSessionId: "cancel-me" }), "work"));
+    expect(await settle(cancelled.cancel("cancel-me", "host closed"))).toBe("resolved");
+    expect(broken.info).toHaveBeenCalledWith("sdk_session_stopped", expect.anything());
+    expect(idle.close).toHaveBeenCalledTimes(1);
+    expect(await closedInput(idle)).toEqual({ value: undefined, done: true });
+    expect(cancelled.describe()).toMatchObject({ activeNativeSessions: 0, slotsInUse: 0 });
+  });
+
   it("retains the startup phase and code when the native process cannot start, without its error text", async () => {
     const sdk = new FakeSdk(async function* () { yield success("unused"); });
     sdk.query = () => { throw new Error(`spawn failed while reading ${CLI_SECRET}`); };

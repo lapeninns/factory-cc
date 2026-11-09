@@ -208,17 +208,19 @@ def report_jobs(state_root, observe_processes=True, max_running=None):
             result["warnings"].append("Process identities could not be observed; liveness is unknown.")
     result["processSnapshotAvailable"] = table is not None
     paths = sorted((root / "jobs").glob("*.json"))
-    ledger = []
+    # Admission reads every retained record, so capacity does too; the cap below
+    # limits only the detailed job list.
+    records = [(path, _read_object(path, root)) for path in paths]
+    ledger = [job for _, job in records if job]
+    unreadable = len(records) - len(ledger)
     if len(paths) > 1000:
         result["warnings"].append("Job report limited to 1000 records.")
-    for path in paths[:1000]:
-        job = _read_object(path, root)
+    for path, job in records[:1000]:
         if not job or job.get("id") != path.stem or not NAME.fullmatch(path.stem):
             result["warnings"].append("Unreadable or invalid job record omitted.")
             continue
         if job.get("kind") == "executed-check":
             continue  # Check processes are reported under their owning job.
-        ledger.append(job)
         telemetry = extract_usage(job)
         checks = _checks(root, job)
         started = _time(_value(job, "startedAt", "started_at"))
@@ -256,5 +258,11 @@ def report_jobs(state_root, observe_processes=True, max_running=None):
         if telemetry["tokens"] is not None:
             result["totals"]["reportedTokens"] += telemetry["tokens"]["total"]
             result["totals"]["jobsWithTokenEvidence"] += 1
-    result["capacity"] = capacity_view(ledger, max_running, now)
+    if unreadable:
+        # An unreadable record may be an occupied or uncertain lease; never report its account as free.
+        result["capacity"] = {"complete": False, "unreadableRecords": unreadable, "records": len(records),
+                              "meaning": "occupancy cannot be established while a job record is unreadable",
+                              "lanes": None, "accounts": None, "queue": None}
+    else:
+        result["capacity"] = {"complete": True, "records": len(records), **capacity_view(ledger, max_running, now)}
     return result

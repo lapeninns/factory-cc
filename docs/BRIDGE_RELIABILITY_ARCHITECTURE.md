@@ -93,8 +93,11 @@ helper; the ledger does not store it, so supply it explicitly:
 `capacity` reports each lane's limit, occupied, free and waiting counts, queued
 jobs blocked by their own busy account, each account's controller and worker lane
 (`free`, `busy`, or `excluded_until_cleanup_verified` after uncertain execution),
-the oldest queue wait and recent admission delays. An unsafe or symlinked state
-root yields a warning and no capacity. It reads recorded states only;
+the oldest queue wait and recent admission delays. Like admission, it counts every
+retained record; the 1,000-record cap applies only to the detailed job list. If any
+record is unreadable, `complete` is false and lanes, accounts and queue are null,
+because that record could be an occupied or uncertain lease. An unsafe or
+symlinked state root yields a warning and no capacity. It reads recorded states only;
 the admission helper alone reconciles owner liveness. A controller's `/status`
 `desktopJobs.queue` and `desktopJobs.accounts` show that process's queued and
 running phases. Neither is service health, login, successful inference or

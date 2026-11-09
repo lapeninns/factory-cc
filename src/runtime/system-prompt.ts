@@ -1,4 +1,4 @@
-import { asBlocks, systemText, textFromBlocks } from "../protocol/content.js";
+import { asBlocks, canonicalToolUseId, systemText, textFromBlocks } from "../protocol/content.js";
 import type { RuntimeRequest } from "./types.js";
 import { orchestratorAppendix, roleAppendix } from "./mission-tools.js";
 import { BridgeError, type ContentBlock } from "../types.js";
@@ -120,7 +120,7 @@ export function buildInitialUserContent(input: RuntimeRequest, cwd?: string, fac
   const current = messages.length - trailingUserMessages(messages).length;
   if (current === 0) return buildDynamicUserContent(input, cwd, { factoryNative });
   const answered = new Set(messages.flatMap((message) => asBlocks(message.content))
-    .flatMap((block) => block.type === "tool_result" && typeof block.tool_use_id === "string" ? [block.tool_use_id] : []));
+    .flatMap((block) => block.type === "tool_result" && typeof block.tool_use_id === "string" ? [canonicalToolUseId(block.tool_use_id)] : []));
   const blocks: ContentBlock[] = [{
     type: "text",
     text: "Imported conversation history follows as reference context. Previous tool calls are historical records, not requests to execute them again. The final user messages are the current task.",
@@ -135,9 +135,10 @@ export function buildInitialUserContent(input: RuntimeRequest, cwd?: string, fac
         blocks.push({ type: "text", text: `Historical tool result ${block.tool_use_id}${block.is_error ? " (error)" : ""}:` });
         blocks.push(...userBlocks((block.content as string | ContentBlock[] | undefined) ?? ""));
       } else if (block.type === "tool_use") {
-        // The id pairs a call with its result. A call without one may or may not have run.
-        const outcome = answered.has(String(block.id)) ? "" : " (no result was recorded; its outcome is unknown, so check the current state instead of repeating it)";
-        blocks.push({ type: "text", text: `Historical tool call ${block.id} ${block.name}: ${JSON.stringify(block.input)}${outcome}` });
+        // The id pairs a call with its result, in the form Droid echoes. A call without one may or may not have run.
+        const id = canonicalToolUseId(String(block.id));
+        const outcome = answered.has(id) ? "" : " (no result was recorded; its outcome is unknown, so check the current state instead of repeating it)";
+        blocks.push({ type: "text", text: `Historical tool call ${id} ${block.name}: ${JSON.stringify(block.input)}${outcome}` });
       } else {
         // Signed thinking cannot be recreated in a different provider/session.
         blocks.push({ type: "text", text: `[Prior ${block.type} block omitted from the imported reference.]` });
@@ -172,9 +173,9 @@ export interface ColdImportStats {
 export function coldImportStats(messages: RuntimeRequest["request"]["messages"]): ColdImportStats {
   const blocks = messages.flatMap((message) => asBlocks(message.content));
   const nested = blocks.flatMap((block) => block.type === "tool_result" && Array.isArray(block.content) ? block.content as ContentBlock[] : []);
-  const calls = new Set(blocks.flatMap((block) => block.type === "tool_use" ? [String(block.id)] : []));
+  const calls = new Set(blocks.flatMap((block) => block.type === "tool_use" ? [canonicalToolUseId(String(block.id))] : []));
   const results = blocks.flatMap((block) => block.type === "tool_result" ? [block] : []);
-  const answered = new Set(results.map((block) => String(block.tool_use_id)));
+  const answered = new Set(results.map((block) => canonicalToolUseId(String(block.tool_use_id))));
   return {
     messages: messages.length,
     historyMessages: messages.length - trailingUserMessages(messages).length,

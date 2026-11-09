@@ -122,3 +122,21 @@ fixed with a regression test.
 Not executed: active-service replacement and the eight-account live inference
 scenario need the operator's activation decision. The prepared scenario and
 activation plan are in the candidate evidence file.
+
+## Review repair (coordinator review 1)
+
+The first candidate (`96b54b5`, package `native-factory-20261109-96b54b5`) is
+superseded. Its package and checks do not qualify the repaired tree. Each finding
+was reproduced on `96b54b5` before the fix:
+
+- P1: a logger that throws on `sdk_session_failed` left the failed turn unsettled
+  after 1 s and raised an unhandled rejection. Terminal diagnostics are now best
+  effort. The regression proves the original `prompt_too_long` error is delivered,
+  the input queue is closed, the native query is closed and no session or slot
+  remains, for both a throwing `warn` (failure) and a throwing `info` (cancellation).
+- P2: a call ID containing a newline, echoed by Droid with an underscore, was
+  labelled unanswered. Rendering and counts now use `canonicalToolUseId()`.
+- P3: with 1,000 completed records and an uncertain team2 lease stored after
+  them, capacity reported team2 free and 8 of 8 worker slots free. Capacity now
+  counts every retained record and reports `complete: false` with null lanes,
+  accounts and queue when any record is unreadable.

@@ -1978,21 +1978,25 @@ export class SdkRuntime implements BridgeRuntime {
   /**
    * One bounded record per stopped native generation. Codes, phase and counts
    * only: the message, prompts, CLI output and credentials never reach it.
+   * Best effort: stop() has already set the terminal state, so a throwing log
+   * write here would skip teardown and leave the waiter and process unresolved.
    */
   private recordTerminal(live: LiveSdk, error: BridgeError): void {
-    const session = live.current?.session;
-    const account = live.subscriptionAccount?.profile ?? session?.claudeAccount;
-    const data = {
-      sessionId: session?.bridgeSessionId, sdkSessionId: live.sdkSessionId, status: error.status, code: error.code,
-      phase: live.phase ?? "idle", ...live.failure, retryFromHistory: error.extra.retry_from_history === true,
-      ...(session?.nativeGeneration !== undefined ? { nativeGeneration: session.nativeGeneration } : {}),
-      ...(account ? { claudeProfile: account } : {}),
-      ...(live.importStats ? { coldImport: { ...live.importStats } } : {}),
-      ...(live.queryStartedAt !== undefined ? { queryAgeMs: Date.now() - live.queryStartedAt } : {}),
-      sentUserTurns: live.sentUserTurns,
-    };
-    if (error.code === "cancelled" || error.code === "host_session_ended") this.logger.info("sdk_session_stopped", data);
-    else this.logger.warn("sdk_session_failed", data);
+    try {
+      const session = live.current?.session;
+      const account = live.subscriptionAccount?.profile ?? session?.claudeAccount;
+      const data = {
+        sessionId: session?.bridgeSessionId, sdkSessionId: live.sdkSessionId, status: error.status, code: error.code,
+        phase: live.phase ?? "idle", ...live.failure, retryFromHistory: error.extra.retry_from_history === true,
+        ...(session?.nativeGeneration !== undefined ? { nativeGeneration: session.nativeGeneration } : {}),
+        ...(account ? { claudeProfile: account } : {}),
+        ...(live.importStats ? { coldImport: { ...live.importStats } } : {}),
+        ...(live.queryStartedAt !== undefined ? { queryAgeMs: Date.now() - live.queryStartedAt } : {}),
+        sentUserTurns: live.sentUserTurns,
+      };
+      if (error.code === "cancelled" || error.code === "host_session_ended") this.logger.info("sdk_session_stopped", data);
+      else this.logger.warn("sdk_session_failed", data);
+    } catch { /* Diagnostics never block teardown. */ }
   }
 
   private coldImportSafe(live: LiveSdk): boolean {
