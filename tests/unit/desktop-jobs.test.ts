@@ -125,6 +125,22 @@ describe("Factory model-phase supervision", () => {
     expect(fixture.releases).toHaveBeenCalledWith(expect.objectContaining({ state: "cancelled", cleanupVerified: true }));
   });
 
+  it("reports queued and running phases per account and lane with recent admission delay", async () => {
+    vi.useFakeTimers(); const fixture = setup(); const gate = deferred<DesktopJobLease>();
+    fixture.options.acquireLease = () => gate.promise;
+    fixture.binding.subscriptionProfile = "team3";
+    const running = fixture.runtime.handle(request());
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(fixture.runtime.describe()).toMatchObject({ desktopJobs: { maxRunning: 3, workerSlots: 2, controllerSlots: 1,
+      queue: { queuedPhases: 1, runningPhases: 0, oldestQueuedMs: 1_500, recentAdmissions: { count: 0, medianDelayMs: null, maxDelayMs: null } },
+      accounts: { team3: { workerQueued: 1, workerRunning: 0, controllerQueued: 0, controllerRunning: 0 } } } });
+    gate.resolve({ jobId: "job-1", release: fixture.releases }); await running;
+    const status = fixture.runtime.describe() as { desktopJobs: Record<string, unknown> };
+    expect(status.desktopJobs).toMatchObject({ queue: { queuedPhases: 0, runningPhases: 0, oldestQueuedMs: null,
+      recentAdmissions: { count: 1, medianDelayMs: 1_500, maxDelayMs: 1_500 } }, accounts: {} });
+    expect(JSON.stringify(status)).not.toContain("private prompt");
+  });
+
   it("records uncertain cleanup and does not claim native error cleanup succeeded", async () => {
     const fixture = setup(); fixture.inner.handle.mockRejectedValue(new Error("upstream failure"));
     fixture.inner.cancel.mockRejectedValue(new Error("cleanup failure"));

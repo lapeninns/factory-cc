@@ -1748,3 +1748,92 @@ it("reports the loaded Claude profile origin without helper commands or URL secr
   expect(JSON.stringify(runtime.describe())).not.toMatch(/HIDDEN|private/);
   expect(sdk.calls).toHaveLength(0);
 });
+
+describe("startup and cold-import failure evidence", () => {
+  const PROMPT_MARKER = "PRIVATE-PROMPT-MARKER-7f3a";
+  const CLI_SECRET = "sk-ant-api03-FAKE0000000000000000000000000000";
+  const loggedJson = () => JSON.stringify([...logger.info.mock.calls, ...logger.warn.mock.calls, ...logger.error.mock.calls]);
+  const failureRecord = () => logger.warn.mock.calls.filter(([event]) => event === "sdk_session_failed").at(-1)?.[1] as Record<string, unknown> | undefined;
+  /** A long Droid transcript whose last turn is new, with one interrupted tool call and one image. */
+  function longHistory(pairs: number): Message[] {
+    const messages: Message[] = [];
+    for (let i = 0; i < pairs; i += 1) {
+      messages.push(user(i === 0 ? [{ type: "text", text: `${PROMPT_MARKER} task` }, { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo=" } }] : `step ${i}`));
+      messages.push({ role: "assistant", content: [{ type: "tool_use", id: `call-${i}`, name: "Read", input: { file_path: `/work/${i}` } } as ContentBlock] });
+      if (i < pairs - 1) messages.push(user([{ type: "tool_result", tool_use_id: `call-${i}`, content: `result ${i}`, ...(i === 1 ? { is_error: true } : {}) } as ContentBlock]));
+    }
+    messages.push(user("continue the integration"));
+    return messages;
+  }
+  beforeEach(() => { logger.info.mockClear(); logger.warn.mockClear(); logger.error.mockClear(); });
+
+  it("reports an over-window cold import as a non-retryable context overflow with a sanitised record", async () => {
+    const sdk = new FakeSdk(async function* () {
+      yield { type: "assistant", error: "invalid_request", session_id: "native-sdk-session", message: { id: "api-error", content: [{ type: "text", text: "Prompt is too long" }] } };
+      yield { type: "result", subtype: "success", is_error: true, result: "Prompt is too long", errors: [`upstream said ${CLI_SECRET}`],
+        terminal_reason: "prompt_too_long", api_error_status: 400, session_id: "native-sdk-session" };
+    });
+    const { runtime } = create(sdk);
+    const messages = longHistory(500);
+    const failure = runtime.handle(request(session({ nativeGeneration: 2 }), "unused", { messages }));
+    await expect(failure).rejects.toMatchObject({ status: 400, code: "invalid_request_error",
+      extra: { sdk_terminal_reason: "prompt_too_long", recovery_action: "compact_conversation", retry_from_history: false, cold_import: true, imported_messages: messages.length } });
+    // The host's own classifier recognises a context overflow by this wording.
+    await expect(failure).rejects.toThrow(/prompt is too long/i);
+    // Every message reached the native prompt; nothing was truncated.
+    const imported = JSON.stringify(sdk.inputs[0]!.message.content);
+    expect(imported).toContain(`Prior user message 1:`);
+    expect(imported).toContain(`Prior assistant message ${messages.length - 1}:`);
+    expect(imported).toContain("Historical tool call call-0 Read:");
+    expect(imported).toContain("Historical tool result call-1 (error):");
+    expect(imported).toContain("Historical tool call call-499 Read: {\\\"file_path\\\":\\\"/work/499\\\"} (no result was recorded");
+
+    expect(failureRecord()).toMatchObject({
+      sessionId: "session-a", status: 400, code: "invalid_request_error", phase: "prompted", terminalReason: "prompt_too_long",
+      apiErrorStatus: 400, resultSubtype: "success", assistantError: "invalid_request", retryFromHistory: false, nativeGeneration: 2,
+      coldImport: { messages: messages.length, historyMessages: messages.length - 1, images: 1, toolCalls: 500, toolResults: 499,
+        erroredToolResults: 1, unansweredToolCalls: 1, unmatchedToolResults: 0, contentBytes: expect.any(Number) },
+    });
+    expect(loggedJson()).not.toContain(PROMPT_MARKER);
+    expect(loggedJson()).not.toContain(CLI_SECRET);
+    expect(loggedJson()).not.toContain("upstream said");
+    // The failed generation never qualifies for automatic replay on another account.
+    await expect(runtime.prepareColdRetry("session-a")).rejects.toMatchObject({ code: "native_retry_unsafe" });
+  });
+
+  it("classifies a producer without terminal_reason by Claude Code's fixed overflow text, and keeps other failures as execution errors", async () => {
+    const legacy = new FakeSdk(async function* () { yield { type: "result", subtype: "success", is_error: true, result: "Prompt is too long" }; });
+    await expect(create(legacy).runtime.handle(request(session(), "unused", { messages: longHistory(2) })))
+      .rejects.toMatchObject({ status: 400, code: "invalid_request_error", extra: { recovery_action: "compact_conversation" } });
+    const model = new FakeSdk(async function* () { yield { type: "result", subtype: "success", is_error: true, result: "model failed", terminal_reason: "model_error" }; });
+    await expect(create(model).runtime.handle(request(session({ bridgeSessionId: "model-error" }), "do work")))
+      .rejects.toMatchObject({ status: 502, code: "sdk_execution_error", extra: { sdk_terminal_reason: "model_error" } });
+    const unknown = new FakeSdk(async function* () { yield { type: "result", subtype: "success", is_error: true, result: "odd", terminal_reason: "invented_reason" }; });
+    await expect(create(unknown).runtime.handle(request(session({ bridgeSessionId: "unknown-reason" }), "do work")))
+      .rejects.toMatchObject({ status: 502, code: "sdk_execution_error", extra: {} });
+    expect(failureRecord()).not.toHaveProperty("terminalReason");
+    // A short first turn is not a cold import.
+    expect(failureRecord()).not.toHaveProperty("coldImport");
+  });
+
+  it("does not attribute a completed import to a later stop", async () => {
+    const sdk = new FakeSdk(async function* () { yield success("imported"); });
+    const { runtime } = create(sdk);
+    await runtime.handle(request(session(), "unused", { messages: longHistory(3) }));
+    await runtime.cancel("session-a", "host closed");
+    const stopped = logger.info.mock.calls.filter(([event]) => event === "sdk_session_stopped").at(-1)?.[1];
+    expect(stopped).toMatchObject({ code: "cancelled", phase: "idle", sentUserTurns: 1 });
+    expect(stopped).not.toHaveProperty("coldImport");
+    expect(failureRecord()).toBeUndefined();
+  });
+
+  it("retains the startup phase and code when the native process cannot start, without its error text", async () => {
+    const sdk = new FakeSdk(async function* () { yield success("unused"); });
+    sdk.query = () => { throw new Error(`spawn failed while reading ${CLI_SECRET}`); };
+    const { runtime } = create(sdk);
+    await expect(runtime.handle(request(session(), `${PROMPT_MARKER} start`))).rejects.toMatchObject({ code: "sdk_error" });
+    expect(failureRecord()).toMatchObject({ phase: "startup", code: "sdk_error", status: 502, sentUserTurns: 0, queryAgeMs: expect.any(Number) });
+    expect(loggedJson()).not.toContain(CLI_SECRET);
+    expect(loggedJson()).not.toContain(PROMPT_MARKER);
+  });
+});

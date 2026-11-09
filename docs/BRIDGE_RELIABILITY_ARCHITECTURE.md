@@ -43,6 +43,7 @@ HTTP endpoint or successful login does not establish remaining provider allowanc
 | A terminal result can be counted as free while lease release is false | Pool used result state and cleanup without checking explicit unsettled lease evidence | Retain reservation and report the worker requiring recovery until settlement is confirmed. |
 | Source and live admission limits disagree | Deployed JS contained an eight-slot overlay while source still used two slots | Derive the subscription eight-worker ceiling from the eight fixed profiles and apply it to pooled controller and worker services. Per-seat execution remains one. Non-pooled/API limits retain their existing settings. |
 | Releases cannot be reconstructed reliably from one revision | Controller/workers/pool and Python files came from different releases and manually overlaid hunks | Package complete artifacts from a clean commit with a fresh build, lockfile install, runtime verification and full file/mode/link manifest. Reject overlays and escaping dependency links. |
+| A 3.4 MB, ~1,433-message cold import exited about 2 s after verified login, twice, leaving no cause | Every SDK error result became a generic 502, the typed `terminal_reason` and `api_error_status` were discarded, and a stopped generation logged nothing. Imported tool calls lost their IDs, so large histories could not pair calls with results | Each stopped generation logs one `sdk_session_failed` record with code, lifecycle phase, allowlisted SDK reason/status, account, native generation and cold-import counts, never message text. `prompt_too_long` returns Messages-API style `400 invalid_request_error` with `recovery_action: compact_conversation` and is never replayed on another account. Imported calls carry their IDs; unanswered calls and failed results are marked. |
 
 The former CLI deletion's initiating process was not identified. This incident
 proves a missing dependency, not which updater or cleanup removed it. Provider
@@ -79,6 +80,32 @@ The doctor constructs no daemon, writes no saved state and sends no model prompt
 It separates login, configuration and saved worker evidence, reports recovered
 worker IDs, and labels remaining provider allowance unknown. It describes the
 candidate's behaviour; it does not attest that running services use the candidate.
+
+Admission capacity comes from the shared lease ledger that all ten services use.
+The worker-lane limit is the `--max-running` value the bridge passes to the lease
+helper; the ledger does not store it, so supply it explicitly:
+
+```sh
+/usr/bin/python3 -I -c 'import json,sys; sys.path.insert(0, sys.argv[1]); from native_runtime.reporting import report_jobs; r = report_jobs(sys.argv[2], max_running=int(sys.argv[3])); print(json.dumps({"capacity": r.get("capacity"), "warnings": r["warnings"]}, indent=2))' \
+  /absolute/release/native-runtime /absolute/private/lease-state-root 8
+```
+
+`capacity` reports each lane's limit, occupied, free and waiting counts, queued
+jobs blocked by their own busy account, each account's controller and worker lane
+(`free`, `busy`, or `excluded_until_cleanup_verified` after uncertain execution),
+the oldest queue wait and recent admission delays. An unsafe or symlinked state
+root yields a warning and no capacity. It reads recorded states only;
+the admission helper alone reconciles owner liveness. A controller's `/status`
+`desktopJobs.queue` and `desktopJobs.accounts` show that process's queued and
+running phases. Neither is service health, login, successful inference or
+remaining provider allowance.
+
+A stopped native generation writes one `sdk_session_failed` (or, for cancellation
+and host exit, `sdk_session_stopped`) record to `bridge.jsonl`. `phase` is
+`startup` (before identity verification completed), `prompted` (input sent, no
+model output yet), `continuation` or `responding`. `terminalReason`,
+`apiErrorStatus`, `resultSubtype` and `assistantError` are copied only from the
+SDK's enumerated fields. `coldImport` holds counts and the content size.
 
 ## Release and rollback
 

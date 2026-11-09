@@ -19,7 +19,7 @@ import { appendLogLine, type Logger } from "../logging.js";
 import { claudeToolTraceDetail, isDroidMcpName, selectDroidMcpTools } from "./droid-tools.js";
 import { DroidMcpCatalog, StableDroidToolNames } from "./droid-mcp-catalog.js";
 import { hostAllowsAnyTools, nativeToolAllowed } from "./native-tool-policy.js";
-import { buildDynamicUserContent, buildHostContext, buildInitialUserContent, buildPresetSystemPrompt, describePromptLayout, trailingUserMessages } from "./system-prompt.js";
+import { buildDynamicUserContent, buildHostContext, buildInitialUserContent, buildPresetSystemPrompt, coldImportStats, describePromptLayout, trailingUserMessages, type ColdImportStats } from "./system-prompt.js";
 import { UsageLedger } from "./usage.js";
 import { INTERRUPT_GRACE_MS, TurnWatchdog } from "./turn-watchdog.js";
 import type { BridgeRuntime, RuntimeApprovalRequest, RuntimeControl, RuntimeEvent, RuntimeHostCall, RuntimeHostCompletion, RuntimeHostEnd, RuntimePermissionDecision, RuntimeRequest, RuntimeTurn, StreamSink } from "./types.js";
@@ -197,7 +197,24 @@ interface LiveSdk {
   windDown?: () => void;
   /** Wind down the previous native response before delivering queued user input. */
   turnHandoff?: TurnHandoff;
+  /** Lifecycle position of the current request, kept for the terminal failure record. */
+  phase?: "startup" | "prompted" | "continuation" | "responding" | "waiting_host";
+  queryStartedAt?: number;
+  /** Counts only. Present while the current request is a cold import. */
+  importStats?: ColdImportStats & { contentBytes?: number };
+  /** Allowlisted SDK failure fields of the current request. Never message text. */
+  failure?: SdkFailure;
 }
+
+interface SdkFailure { terminalReason?: string; apiErrorStatus?: number; resultSubtype?: string; assistantError?: string }
+
+const TERMINAL_REASONS = new Set(["blocking_limit", "rapid_refill_breaker", "prompt_too_long", "image_error", "model_error", "api_error",
+  "malformed_tool_use_exhausted", "aborted_streaming", "aborted_tools", "stop_hook_prevented", "hook_stopped", "tool_deferred", "max_turns",
+  "background_requested", "completed", "budget_exhausted", "structured_output_retry_exhausted", "tool_deferred_unavailable", "turn_setup_failed"]);
+const ASSISTANT_ERRORS = new Set(["authentication_failed", "oauth_org_not_allowed", "account_on_hold", "verification_required", "billing_error",
+  "rate_limit", "overloaded", "invalid_request", "model_not_found", "server_error", "unknown", "max_output_tokens", "cloud_credential_error"]);
+/** Claude Code's fixed text for an over-window prompt, used by producers without terminal_reason. */
+const PROMPT_TOO_LONG_TEXT = /^Prompt is too long\b/;
 
 /**
  * The HTTP layer enforces the idle and maximum limits and interrupts cleanly
@@ -517,6 +534,9 @@ export class SdkRuntime implements BridgeRuntime {
       if (continuation.length) mcpContent(continuation);
       live.current = input;
       live.nativeCallsThisRequest = false;
+      live.failure = undefined;
+      live.importStats = undefined;
+      live.phase = results.length ? "continuation" : live.phase;
       waiting = this.waitForTurn(live);
       // Attach rejection handling before startup awaits, including startup timeouts.
       void waiting.catch(() => undefined);
@@ -535,12 +555,16 @@ export class SdkRuntime implements BridgeRuntime {
         const coldImport = !live.sentUserTurns && !live.sdkSessionId;
         const queryReused = Boolean(live.query);
         live.active = true;
+        live.importStats = coldImport && trailingUserMessages(input.request.messages).length < input.request.messages.length
+          ? coldImportStats(input.request.messages) : undefined;
         if (!live.query) await this.startQuery(input, live);
         if (live.terminal) throw live.terminal;
         const cwd = resolveCwd(input, this.config);
         const content = coldImport
           ? buildInitialUserContent(input, cwd, this.config.factoryNative)
           : buildDynamicUserContent(input, cwd, { includeContext: live.lastHostContext !== context, factoryNative: this.config.factoryNative });
+        if (live.importStats) live.importStats.contentBytes = Buffer.byteLength(JSON.stringify(content));
+        live.phase = "prompted";
         live.lastHostContext = context;
         live.sentUserTurns++;
         live.inputs.push({
@@ -824,6 +848,8 @@ export class SdkRuntime implements BridgeRuntime {
     if (live.retiring) await live.retiring;
     // Reserve synchronously, before capacity eviction or SDK import can yield.
     live.starting = true;
+    live.phase = "startup";
+    live.queryStartedAt = Date.now();
     try {
       await this.ensureQueryCapacity(live);
       if (live.terminal || this.closing) throw live.terminal ?? new BridgeError(503, "bridge_shutting_down", "Bridge is shutting down");
@@ -1657,6 +1683,9 @@ export class SdkRuntime implements BridgeRuntime {
             throw new BridgeError(mapped.status, mapped.code, mapped.message, retryAfter === undefined ? {} : { retry_after: retryAfter });
           }
         } else live.upstreamBackoff = undefined;
+        if (message.type === "assistant" && !message.parent_tool_use_id && typeof message.error === "string" && ASSISTANT_ERRORS.has(message.error)) {
+          live.failure = { ...live.failure, assistantError: message.error };
+        }
         if (message.type === "assistant" && message.error) {
           const mapped = upstreamError(message.error === "rate_limit" ? "rate_limit_error" : message.error === "overloaded" ? "overloaded_error" : extractText(message));
           if (mapped) throw message.error === "rate_limit" ? usageLimitError(mapped, extractText(message)) : mapped;
@@ -1691,6 +1720,7 @@ export class SdkRuntime implements BridgeRuntime {
             live.workflowDeferredResult = undefined;
           }
         }
+        if ((message.type === "stream_event" || (message.type === "assistant" && !message.error)) && !message.parent_tool_use_id && live.active) live.phase = "responding";
         if (message.type === "stream_event") {
           if (message.parent_tool_use_id) continue;
           this.trackAssistantTurn(live, message);
@@ -1761,8 +1791,13 @@ export class SdkRuntime implements BridgeRuntime {
             continue;
           }
           if (message.is_error === true || (typeof message.subtype === "string" && message.subtype !== "success")) {
+            live.failure = { ...live.failure, ...resultFailure(message) };
             const errors = Array.isArray(message.errors) ? message.errors.filter((item): item is string => typeof item === "string").join("; ") : "";
-            throw new BridgeError(502, "sdk_execution_error", errors || extractText(message) || String(message.subtype ?? "SDK execution failed"));
+            const detail = errors || extractText(message) || String(message.subtype ?? "SDK execution failed");
+            if (live.failure.terminalReason === "prompt_too_long" || (!live.failure.terminalReason && PROMPT_TOO_LONG_TEXT.test(detail))) {
+              throw promptTooLong(live);
+            }
+            throw new BridgeError(502, "sdk_execution_error", detail, live.failure.terminalReason ? { sdk_terminal_reason: live.failure.terminalReason } : {});
           }
           if (!live.active) continue;
           if (this.config.nativeWorkflows && (live.backgroundTasks.size || live.pending.size || live.workflowPermits?.pending)) { live.workflowDeferredResult = message; continue; }
@@ -1825,6 +1860,9 @@ export class SdkRuntime implements BridgeRuntime {
     const content: ContentBlock[] = text ? [{ type: "text", text }, ...extra] : [...live.blocks, ...extra];
     if (!content.length) content.push({ type: "text", text: "" });
     const usage = live.usage.drainTurnUsage() as Usage;
+    // A published reply ends this request's import and startup evidence.
+    live.phase = stop === "tool_use" ? "waiting_host" : undefined;
+    live.importStats = undefined;
     const turn: RuntimeTurn = {
       response: assistantMessage(live.current!.request.model, content, stop, usage),
       pendingToolIds: [...live.pending.keys()], sdkSessionId: live.sdkSessionId,
@@ -1898,6 +1936,7 @@ export class SdkRuntime implements BridgeRuntime {
       error = new BridgeError(error.status, error.code, error.message, { ...error.extra, retry_from_history: true });
     }
     live.terminal = error;
+    this.recordTerminal(live, error);
     if (live.workflowTimer) clearTimeout(live.workflowTimer);
     live.workflowTimer = undefined;
     live.workflowDeferredResult = undefined;
@@ -1934,6 +1973,26 @@ export class SdkRuntime implements BridgeRuntime {
     live.backgroundTasks.clear();
     live.usage = new UsageLedger();
     return live.cleanup;
+  }
+
+  /**
+   * One bounded record per stopped native generation. Codes, phase and counts
+   * only: the message, prompts, CLI output and credentials never reach it.
+   */
+  private recordTerminal(live: LiveSdk, error: BridgeError): void {
+    const session = live.current?.session;
+    const account = live.subscriptionAccount?.profile ?? session?.claudeAccount;
+    const data = {
+      sessionId: session?.bridgeSessionId, sdkSessionId: live.sdkSessionId, status: error.status, code: error.code,
+      phase: live.phase ?? "idle", ...live.failure, retryFromHistory: error.extra.retry_from_history === true,
+      ...(session?.nativeGeneration !== undefined ? { nativeGeneration: session.nativeGeneration } : {}),
+      ...(account ? { claudeProfile: account } : {}),
+      ...(live.importStats ? { coldImport: { ...live.importStats } } : {}),
+      ...(live.queryStartedAt !== undefined ? { queryAgeMs: Date.now() - live.queryStartedAt } : {}),
+      sentUserTurns: live.sentUserTurns,
+    };
+    if (error.code === "cancelled" || error.code === "host_session_ended") this.logger.info("sdk_session_stopped", data);
+    else this.logger.warn("sdk_session_failed", data);
   }
 
   private coldImportSafe(live: LiveSdk): boolean {
@@ -2087,6 +2146,29 @@ function summarizeSdk(message: Record<string, unknown>): Record<string, unknown>
   return { type: message.type, subtype: message.subtype, session_id: message.session_id,
     ...(message.subtype === "compact_boundary" ? { compact_metadata: structuredClone(message.compact_metadata) } : {}) };
 }
+function resultFailure(message: Record<string, unknown>): SdkFailure {
+  const failure: SdkFailure = {};
+  if (typeof message.terminal_reason === "string" && TERMINAL_REASONS.has(message.terminal_reason)) failure.terminalReason = message.terminal_reason;
+  if (Number.isSafeInteger(message.api_error_status) && (message.api_error_status as number) >= 100 && (message.api_error_status as number) <= 599) {
+    failure.apiErrorStatus = message.api_error_status as number;
+  }
+  if (typeof message.subtype === "string" && /^[a-z_]{1,48}$/.test(message.subtype)) failure.resultSubtype = message.subtype;
+  return failure;
+}
+
+/**
+ * The same request cannot fit on retry or on another account. Report it the way
+ * the Messages API does, so the host classifies it as a context overflow and
+ * does not replay it, and name the recovery the operator or host must take.
+ */
+function promptTooLong(live: LiveSdk): BridgeError {
+  const stats = live.importStats;
+  return new BridgeError(400, "invalid_request_error",
+    "Prompt is too long for the model context window. Retrying the same request will fail again; compact this conversation, or continue in a new session from a summary.",
+    { sdk_terminal_reason: "prompt_too_long", recovery_action: "compact_conversation", retry_from_history: false,
+      ...(stats ? { cold_import: true, imported_messages: stats.messages, ...(stats.contentBytes !== undefined ? { imported_bytes: stats.contentBytes } : {}) } : {}) });
+}
+
 function asBridgeError(error: unknown): BridgeError {
   if (error instanceof BridgeError) return error;
   const message = error instanceof Error ? error.message : String(error);

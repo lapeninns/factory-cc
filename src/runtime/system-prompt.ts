@@ -119,6 +119,8 @@ export function buildInitialUserContent(input: RuntimeRequest, cwd?: string, fac
   const messages = input.request.messages;
   const current = messages.length - trailingUserMessages(messages).length;
   if (current === 0) return buildDynamicUserContent(input, cwd, { factoryNative });
+  const answered = new Set(messages.flatMap((message) => asBlocks(message.content))
+    .flatMap((block) => block.type === "tool_result" && typeof block.tool_use_id === "string" ? [block.tool_use_id] : []));
   const blocks: ContentBlock[] = [{
     type: "text",
     text: "Imported conversation history follows as reference context. Previous tool calls are historical records, not requests to execute them again. The final user messages are the current task.",
@@ -130,10 +132,12 @@ export function buildInitialUserContent(input: RuntimeRequest, cwd?: string, fac
       if (block.type === "text" || block.type === "image" || block.type === "document") {
         blocks.push(...userBlocks([block]));
       } else if (block.type === "tool_result") {
-        blocks.push({ type: "text", text: `Historical tool result ${block.tool_use_id}:` });
+        blocks.push({ type: "text", text: `Historical tool result ${block.tool_use_id}${block.is_error ? " (error)" : ""}:` });
         blocks.push(...userBlocks((block.content as string | ContentBlock[] | undefined) ?? ""));
       } else if (block.type === "tool_use") {
-        blocks.push({ type: "text", text: `Historical tool call ${block.name}: ${JSON.stringify(block.input)}` });
+        // The id pairs a call with its result. A call without one may or may not have run.
+        const outcome = answered.has(String(block.id)) ? "" : " (no result was recorded; its outcome is unknown, so check the current state instead of repeating it)";
+        blocks.push({ type: "text", text: `Historical tool call ${block.id} ${block.name}: ${JSON.stringify(block.input)}${outcome}` });
       } else {
         // Signed thinking cannot be recreated in a different provider/session.
         blocks.push({ type: "text", text: `[Prior ${block.type} block omitted from the imported reference.]` });
@@ -144,12 +148,44 @@ export function buildInitialUserContent(input: RuntimeRequest, cwd?: string, fac
   // (an interrupted tool call); keep them as reference rather than dropping them.
   for (const block of messages.slice(current).flatMap((message) => asBlocks(message.content))) {
     if (block.type !== "tool_result") continue;
-    blocks.push({ type: "text", text: `Historical tool result ${block.tool_use_id}:` });
+    blocks.push({ type: "text", text: `Historical tool result ${block.tool_use_id}${block.is_error ? " (error)" : ""}:` });
     blocks.push(...userBlocks((block.content as string | ContentBlock[] | undefined) ?? ""));
   }
   blocks.push({ type: "text", text: "Current user message:" });
   blocks.push(...buildDynamicUserContent(input, cwd, { factoryNative }));
   return blocks;
+}
+
+/** Counts describing a cold import. Never carries message content. */
+export interface ColdImportStats {
+  messages: number;
+  historyMessages: number;
+  images: number;
+  documents: number;
+  toolCalls: number;
+  toolResults: number;
+  erroredToolResults: number;
+  unansweredToolCalls: number;
+  unmatchedToolResults: number;
+}
+
+export function coldImportStats(messages: RuntimeRequest["request"]["messages"]): ColdImportStats {
+  const blocks = messages.flatMap((message) => asBlocks(message.content));
+  const nested = blocks.flatMap((block) => block.type === "tool_result" && Array.isArray(block.content) ? block.content as ContentBlock[] : []);
+  const calls = new Set(blocks.flatMap((block) => block.type === "tool_use" ? [String(block.id)] : []));
+  const results = blocks.flatMap((block) => block.type === "tool_result" ? [block] : []);
+  const answered = new Set(results.map((block) => String(block.tool_use_id)));
+  return {
+    messages: messages.length,
+    historyMessages: messages.length - trailingUserMessages(messages).length,
+    images: [...blocks, ...nested].filter((block) => block.type === "image").length,
+    documents: [...blocks, ...nested].filter((block) => block.type === "document").length,
+    toolCalls: calls.size,
+    toolResults: results.length,
+    erroredToolResults: results.filter((block) => block.is_error === true).length,
+    unansweredToolCalls: [...calls].filter((id) => !answered.has(id)).length,
+    unmatchedToolResults: [...answered].filter((id) => !calls.has(id)).length,
+  };
 }
 
 /** Text-only compatibility helper for diagnostics and mock fixtures. */

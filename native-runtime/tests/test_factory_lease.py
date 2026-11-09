@@ -11,6 +11,7 @@ from unittest import mock
 
 from native_runtime.core import RuntimeConfig, now, process_identity, read_job, state_lock, write_job
 from native_runtime.factory_lease import ProtocolError, validate_worktree
+from native_runtime.reporting import report_jobs
 from native_runtime.supervisor import execution_lane, list_jobs, _reserve as reserve_native
 
 
@@ -669,6 +670,43 @@ class FactoryLeaseTests(unittest.TestCase):
                 self.assertFalse(self.receive(child)['ok'])
                 self.assertEqual(child.wait(timeout=3), 2)
         self.assertEqual(list((self.state / 'jobs').glob('*.json')), [])
+
+    def test_eight_seat_ceiling_keeps_controller_progress_and_skips_an_account_blocked_queue_head(self):
+        def acquire(suffix, profile, role='worker'):
+            child = self.start(max_running=8)
+            self.send(child, self.request(suffix, self.root, role=role, subscriptionProfile=profile,
+                                          workspacePolicy='factory-native'))
+            self.assertEqual(self.receive(child)['event'], 'queued')
+            return child
+
+        workers = {}
+        for number in range(1, 9):
+            child = acquire('seat-' + str(number), 'team' + str(number))
+            self.assertEqual(self.receive(child)['event'], 'ready')
+            workers[number] = child
+        controller = acquire('controller', 'team1', role='orchestrator')
+        self.assertEqual(self.receive(controller)['event'], 'ready')
+        older = acquire('older-team1', 'team1')
+        self.assertIsNone(self.receive(older, .2))
+        capacity = report_jobs(self.state, observe_processes=False, max_running=8)['capacity']
+        self.assertEqual(capacity['lanes']['worker'], {'limit': 8, 'occupied': 8, 'free': 0, 'waiting': 1, 'waitingBlockedByAccount': 1})
+        self.assertEqual(capacity['lanes']['controller']['occupied'], 1)
+        self.assertEqual(capacity['accounts']['team1']['workerLane'], 'busy')
+
+        self.release(workers.pop(2), 'completed', cleanupVerified=True)
+        self.assertIsNone(self.receive(older, .2))
+        younger = acquire('younger-team2', 'team2')
+        self.assertEqual(self.receive(younger)['event'], 'ready')
+        self.assertIsNone(self.receive(older, .1))
+
+        self.release(workers.pop(1), 'completed', cleanupVerified=True)
+        self.release(younger, 'completed', cleanupVerified=True)
+        self.assertEqual(self.receive(older)['event'], 'ready')
+        for child in [*workers.values(), controller, older]:
+            self.release(child, 'completed', cleanupVerified=True)
+        settled = report_jobs(self.state, observe_processes=False, max_running=8)['capacity']
+        self.assertEqual((settled['lanes']['worker']['occupied'], settled['lanes']['controller']['occupied'], settled['queue']['waiting']), (0, 0, 0))
+        self.assertEqual(settled['queue']['recentAdmissions']['count'], 11)
 
     def test_all_eight_fixed_profiles_are_admitted_without_rotation(self):
         for number in range(1, 9):

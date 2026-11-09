@@ -8,7 +8,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from native_runtime.telemetry import extract_usage
-from native_runtime.reporting import report_jobs
+from native_runtime.reporting import capacity_view, report_jobs
+from datetime import datetime, timezone
 from native_runtime.core import RuntimeRefused
 
 
@@ -183,6 +184,45 @@ class TelemetryTests(unittest.TestCase):
         self.assertFalse(item["quality"]["deliveryVerified"])
         self.assertNotIn("SECRET", json.dumps(report))
         self.assertNotIn(str(self.config), json.dumps(report))
+
+    def test_capacity_view_reports_lanes_accounts_exclusions_and_queue_delay(self):
+        controller = {"id": "controller", "kind": "factory-session", "authMode": "subscription", "profile": "team1",
+                      "subscriptionProfile": "team1", "workspacePolicy": "factory-native", "role": "orchestrator",
+                      "state": "running", "queuedAt": "2026-11-09T12:00:00+00:00", "admittedAt": "2026-11-09T12:00:02+00:00"}
+        worker = {"id": "worker-1", "kind": "factory-session", "authMode": "subscription", "profile": "team1",
+                  "subscriptionProfile": "team1", "workspacePolicy": "factory-native", "role": "worker", "state": "running",
+                  "queuedAt": "2026-11-09T12:00:00+00:00", "admittedAt": "2026-11-09T12:00:10+00:00", "prompt": "SECRET PROMPT"}
+        uncertain = dict(worker, id="worker-2", profile="team2", subscriptionProfile="team2", state="unknown")
+        settled = dict(worker, id="worker-3", profile="team3", subscriptionProfile="team3", state="completed",
+                       admittedAt="2026-11-09T12:00:04+00:00")
+        waiting_busy = dict(worker, id="worker-4", state="waiting_slot", queuedAt="2026-11-09T12:59:30+00:00")
+        waiting_free = dict(worker, id="worker-5", profile="team4", subscriptionProfile="team4", state="waiting_slot",
+                            queuedAt="2026-11-09T12:59:50+00:00")
+        waiting_excluded = dict(worker, id="worker-6", profile="team2", subscriptionProfile="team2", role="orchestrator",
+                                state="waiting_slot", queuedAt="2026-11-09T12:59:55+00:00")
+        jobs = [controller, worker, uncertain, settled, waiting_busy, waiting_free, waiting_excluded]
+        at = datetime(2026, 11, 9, 13, 0, tzinfo=timezone.utc).timestamp()
+
+        unknown_limit = capacity_view(jobs, at=at)
+        self.assertIsNone(unknown_limit["lanes"]["worker"]["limit"])
+        self.assertIsNone(unknown_limit["lanes"]["worker"]["free"])
+        self.assertTrue(unknown_limit["workerLimitSource"].startswith("unknown"))
+
+        view = capacity_view(jobs, max_running=8, at=at)
+        self.assertEqual(view["lanes"]["controller"], {"limit": 1, "occupied": 1, "free": 0, "waiting": 1, "waitingBlockedByAccount": 1})
+        self.assertEqual(view["lanes"]["worker"], {"limit": 8, "occupied": 2, "free": 6, "waiting": 2, "waitingBlockedByAccount": 1})
+        self.assertEqual(view["accounts"]["team1"], {"waiting": 1, "uncertain": 0, "controllerOccupied": 1, "controllerLane": "busy",
+                                                     "workerOccupied": 1, "workerLane": "busy"})
+        self.assertEqual(view["accounts"]["team2"]["controllerLane"], "excluded_until_cleanup_verified")
+        self.assertEqual(view["accounts"]["team2"]["workerLane"], "excluded_until_cleanup_verified")
+        self.assertEqual(view["accounts"]["team3"]["workerLane"], "free")
+        self.assertEqual(sorted(view["accounts"]), ["team" + str(number) for number in range(1, 9)])
+        self.assertEqual(view["queue"], {"waiting": 3, "oldestWaitSeconds": 30.0,
+                                         "recentAdmissions": {"count": 4, "medianDelaySeconds": 10.0, "maxDelaySeconds": 10.0}})
+        self.assertIn("remaining provider allowance", view["meaning"])
+        self.assertNotIn("SECRET", json.dumps(view))
+        with self.assertRaises(RuntimeRefused):
+            capacity_view(jobs, max_running=9)
 
     def test_report_rejects_symlinked_state(self):
         state = self.root / "state"

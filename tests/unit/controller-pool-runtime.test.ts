@@ -86,8 +86,12 @@ describe("native controller pool identity", () => {
   it("rejects an incorrect account before sending any prompt", async () => {
     const sdk = new FakeSdk(); sdk.identity = "member1@example.invalid";
     const runtime = new SdkRuntime(config(), logger, sdk); runtimes.push(runtime);
+    logger.warn.mockClear();
     await expect(runtime.handle(request("team7"))).rejects.toMatchObject({ code: "auth_mode_mismatch" });
     expect(sdk.inputs).toHaveLength(0);
+    const record = logger.warn.mock.calls.find(([event]) => event === "sdk_session_failed")?.[1];
+    expect(record).toMatchObject({ code: "auth_mode_mismatch", phase: "startup", claudeProfile: "team7", sentUserTurns: 0 });
+    expect(JSON.stringify(record)).not.toContain("member1@example.invalid");
   });
   it("rejects an unconfigured selected account before native startup", async () => {
     const sdk = new FakeSdk(), runtime = new SdkRuntime(config(), logger, sdk); runtimes.push(runtime);

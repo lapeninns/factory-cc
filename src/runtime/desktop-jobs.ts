@@ -61,6 +61,7 @@ export interface DesktopJobsOptions extends DesktopLeaseOptions {
 interface ActivePhase {
   controller: AbortController;
   request: DesktopJobAcquire;
+  queuedAt: number;
   lease?: DesktopJobLease;
   outcome?: DesktopJobState;
   done?: Promise<RuntimeTurn>;
@@ -92,6 +93,12 @@ export function hostActionNeedsWorkspaceReservation(name: string, workerMcpPrefi
 }
 
 function failure(code: string, message: string): BridgeError { return new BridgeError(503, code, message); }
+
+/** Mirrors the lease helper's lane rule: only a fully bound subscription controller uses the reserved slot. */
+function executionLane(request: DesktopJobAcquire): "controller" | "worker" {
+  return request.subscriptionProfile && request.workspacePolicy && (request.role === "chat" || request.role === "orchestrator") ? "controller" : "worker";
+}
+const RECENT_ADMISSIONS = 50;
 
 export function validateDesktopJobBinding(binding: DesktopJobBinding | undefined): DesktopJobBinding {
   if (!binding || typeof binding.sessionId !== "string" || !binding.sessionId || binding.sessionId.length > 256
@@ -134,6 +141,8 @@ export class DesktopJobsRuntime implements BridgeRuntime {
   private readonly known = new Map<string, DesktopJobAcquire>();
   private readonly heldHost = new Map<string, HeldHostPhase>();
   private readonly faults: string[] = [];
+  /** Queue delay of recent admissions in milliseconds, oldest first. */
+  private readonly admissionDelays: number[] = [];
   private closed = false;
   readonly interrupt?: BridgeRuntime["interrupt"];
   readonly pendingHostCalls?: BridgeRuntime["pendingHostCalls"];
@@ -236,7 +245,7 @@ export class DesktopJobsRuntime implements BridgeRuntime {
       return Promise.reject(new BridgeError(409, "desktop_host_action_pending", "Wait for the outstanding host action result before continuing this Workstream."));
     }
     this.known.set(id, request);
-    const phase: ActivePhase = { controller: new AbortController(), request,
+    const phase: ActivePhase = { controller: new AbortController(), request, queuedAt: Date.now(),
       ...(held ? { ...(held.parked ? {} : { lease: held.lease }), heldHost: held, acknowledgedHostIds: acknowledged } : {}) };
     this.active.set(id, phase);
     phase.done = this.execute(input, sink, phase);
@@ -248,7 +257,11 @@ export class DesktopJobsRuntime implements BridgeRuntime {
     const heartbeat = setInterval(() => sink?.activity?.(), 1_000);
     heartbeat.unref();
     try {
-      phase.lease ??= await (this.options.acquireLease ?? ((request, signal) => acquireDesktopJobLease(this.options, request, signal)))(phase.request, phase.controller.signal);
+      if (!phase.lease) {
+        phase.lease = await (this.options.acquireLease ?? ((request, signal) => acquireDesktopJobLease(this.options, request, signal)))(phase.request, phase.controller.signal);
+        this.admissionDelays.push(Date.now() - phase.queuedAt);
+        if (this.admissionDelays.length > RECENT_ADMISSIONS) this.admissionDelays.shift();
+      }
       if (phase.heldHost) { phase.heldHost.lease = phase.lease; phase.heldHost.parked = false; }
       if (phase.controller.signal.aborted) throw failure("desktop_job_cancelled", "The queued Factory job was cancelled.");
       clearInterval(heartbeat);
@@ -408,9 +421,23 @@ export class DesktopJobsRuntime implements BridgeRuntime {
 
   describe(): Record<string, unknown> {
     const workerSlots = this.options.maxRunning ?? 2;
+    const at = Date.now();
+    const phases = [...this.active.values()];
+    const queued = phases.filter((phase) => !phase.lease);
+    const accounts: Record<string, Record<"controllerQueued" | "controllerRunning" | "workerQueued" | "workerRunning", number>> = {};
+    for (const phase of phases) {
+      const account = accounts[phase.request.subscriptionProfile ?? "factory-api"] ??= { controllerQueued: 0, controllerRunning: 0, workerQueued: 0, workerRunning: 0 };
+      account[`${executionLane(phase.request)}${phase.lease ? "Running" : "Queued"}`]++;
+    }
+    const delays = [...this.admissionDelays].sort((left, right) => left - right);
     return { ...this.inner.describe?.(), desktopJobs: { activePhases: this.active.size,
       maxRunning: workerSlots + 1, workerSlots, controllerSlots: 1, faults: this.faults.slice(-32),
       heldHostActions: this.heldHost.size,
+      queue: { queuedPhases: queued.length, runningPhases: phases.length - queued.length,
+        oldestQueuedMs: queued.length ? Math.max(...queued.map((phase) => at - phase.queuedAt)) : null,
+        recentAdmissions: { count: delays.length, medianDelayMs: delays.length ? delays[Math.floor(delays.length / 2)] : null, maxDelayMs: delays.at(-1) ?? null } },
+      accounts,
+      capacityScope: "this process's phases; the shared lease ledger report covers every service and the remaining provider allowance stays unknown",
       scope: "active model phases; host action workspace reservations do not occupy compute; parked native processes remain managed by the inner runtime" } };
   }
 

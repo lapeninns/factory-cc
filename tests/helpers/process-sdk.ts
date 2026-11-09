@@ -11,7 +11,7 @@ export class ProcessSdk implements SdkHandle {
   readonly options: Record<string, unknown>[] = [];
   readonly handlers = new Map<string, (args: Record<string, unknown>, extra?: unknown) => Promise<unknown>>();
   account: "ok" | "timeout" | "rejected" = "ok";
-  mode: "success" | "hang" | "error" | "retry" | "tool" = "success";
+  mode: "success" | "hang" | "error" | "retry" | "tool" | "prompt_too_long" = "success";
   error = "API Error: Request rejected (429) rate_limit_error retry-after: 7";
   result = "ok";
   failAfterTool = false;
@@ -62,6 +62,7 @@ export class ProcessSdk implements SdkHandle {
           yield { type: "system", subtype: "init", session_id: nativeId };
           if (mode === "hang") { await once(child, "exit"); return; }
           if (mode === "retry") { yield { type: "system", subtype: "api_retry", error_status: 529, attempt: 1, max_retries: 10, retry_delay_ms: 2500, session_id: nativeId }; await once(child, "exit"); return; }
+          if (mode === "prompt_too_long") { yield { type: "result", subtype: "success", is_error: true, result: "Prompt is too long", terminal_reason: "prompt_too_long", api_error_status: 400, session_id: nativeId }; continue; }
           if (mode === "error") { yield { type: "result", subtype: "error_during_execution", is_error: true, errors: [self.error], session_id: nativeId }; continue; }
           if (mode === "tool") {
             const name = [...self.handlers.keys()][0]!;

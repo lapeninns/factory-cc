@@ -1,0 +1,124 @@
+# Bridge eight-account reliability ledger (BR-01 to BR-07)
+
+Date: 2026-11-09. Base: `88b3e4212ad7464da080172ecce01bbe96e7efab`, branch
+`codex/bridge-eight-account-reliability`. Evidence below uses sanitised aggregates
+only: event names, counts, sizes, codes and account labels. No transcript, prompt,
+credential or private configuration content was copied.
+
+## BR-01 Baseline and reproduction
+
+Source: the live controller log `reliable-20261103T123907Z/controller/logs/bridge.jsonl`,
+read by a parser that printed only allowlisted numeric and code fields.
+
+| Cold import (UTC) | Messages | Content bytes | Next turn |
+| --- | --- | --- | --- |
+| 2026-11-05 20:57 | 382 | 1,418,454 | continued |
+| 2026-11-08 13:22 | 761 | 1,397,478 | continued |
+| 2026-11-09 13:55 | 1,243 | 2,002,944 | continued |
+| 2026-11-09 14:01 | 545 | 1,798,224 | continued |
+| 2026-11-09 13:59 | 1,432 | 3,402,362 | none, no error event |
+| 2026-11-09 14:00 | 1,434 | 3,403,476 | none, no error event |
+
+Proven:
+
+- Both failed attempts passed subscription verification. Every import up to
+  2.0 MB continued. Only the two 3.4 MB imports stopped, and nothing was logged.
+- `SdkRuntime.stop()` wrote no record. Every SDK error result became
+  `502 sdk_execution_error` with the CLI's text, and the SDK's typed
+  `terminal_reason` and `api_error_status` fields were discarded.
+- A cold import sends the whole Droid history as one user message. Imported tool
+  calls carried only the tool name, while results carried the ID, so a large
+  history could not pair calls with results. Unanswered calls were not marked.
+- The pinned CLI (SDK 0.3.300) reports an over-window input as an assistant API
+  error starting `Prompt is too long`, with result `terminal_reason: prompt_too_long`.
+  The installed Droid classifies `/prompt is too long/i` as a non-retryable
+  context-length error.
+
+Inferred, not proven: the 3.4 MB imports (roughly 850K tokens at 4 bytes per
+token) exceeded the model window. Native Claude Code compacts its own transcript,
+so Droid's history can grow far beyond what a fresh session can accept.
+
+Unresolved: the provider's actual error for session `e92b48c1` was not retained.
+The bridge has no model context-window metadata, so it cannot predict the limit.
+
+Reproduced deterministically with injected SDKs: a 1,500-message history and an
+SDK `prompt_too_long` result previously produced an opaque 502 and no log record.
+
+## BR-02 Actionable failure reporting
+
+Each stopped native generation logs `sdk_session_failed` (warn) or
+`sdk_session_stopped` (cancellation and host exit, info). The record has:
+code, status, lifecycle phase (`startup`, `prompted`, `continuation`,
+`responding`, `waiting_host`, `idle`), allowlisted SDK `terminalReason`,
+`apiErrorStatus`, `resultSubtype` and `assistantError`, account, native
+generation, query age, user-turn count and cold-import counts. It never includes
+the error message, prompts, CLI output or identities. Tests assert that a prompt
+marker, a fake key in CLI errors and a mismatched account email do not appear.
+Error results without a known reason keep `502 sdk_execution_error`; a known
+reason is added as `sdk_terminal_reason`.
+
+## BR-03 Safe large-history handling
+
+- `prompt_too_long`, or the CLI's fixed text from producers without
+  `terminal_reason`, returns `400 invalid_request_error` with
+  `recovery_action: compact_conversation`, `retry_from_history: false` and
+  import counts. It is never replayed on another account. The session ends
+  explicitly instead of failing as an opaque 502.
+- Imported tool calls now carry their IDs. Calls without a result are marked
+  "outcome unknown, check the current state instead of repeating it", and failed
+  results are marked `(error)`.
+- No history is truncated. Short first turns are unchanged.
+- Decision (decided by default, owner to confirm): no guessed pre-flight token
+  limit. A byte or token threshold without model-window metadata would reject
+  imports that work (2.0 MB succeeded). Options were a configured ceiling, an
+  estimated ceiling, or classifying the provider's own rejection. The last is
+  exact and reversible.
+
+## BR-04 Capacity and queue observability
+
+- `report_jobs(..., max_running=N)` adds `capacity`, derived from the shared lease
+  ledger with the scheduler's own lane and occupancy predicates. It reports lanes
+  (limit, occupied, free, waiting, waiting blocked by account), each account's
+  controller and worker lane (`free`, `busy`, `excluded_until_cleanup_verified`),
+  the oldest queue wait and recent admission delays. The worker limit is shown
+  only when supplied, so the Python default of 2 is never mistaken for the live
+  value of 8. `native_runtime report` accepts `--max-running`.
+- Controller `/status` `desktopJobs.queue` and `desktopJobs.accounts` show that
+  process's queued and running phases and recent admission delay.
+- Both views state that they are admission capacity, not service health, login,
+  successful inference or remaining provider allowance. No new state store.
+- Live read-only snapshot, 2026-11-09 14:36:50 UTC, 505 ledger records, limit 8
+  supplied: worker lane 1 of 8 occupied (team4), controller lane free, no queue,
+  no excluded account; last 50 admissions median 0.093 s, maximum 14.233 s.
+  Admission capacity was not the constraint at that time.
+
+## BR-05 Eight-account routing and recovery
+
+Existing tests already cover idle-first selection across eight accounts, sticky
+operation routing, response-loss lookup without replay, settlement-gated capacity,
+uncertain-account exclusion, cooling, and failover only after verified retirement.
+Added: the helper at `--max-running 8` admits all eight accounts plus a controller
+on a shared account, skips an older queued job blocked by its own busy account in
+favour of a younger job on a free account, then admits the older job when its
+account settles. No defect was found, so routing code is unchanged. Weights, the
+global ceiling, workspace locks and sticky assignments are untouched.
+
+## BR-06 Verification and candidate
+
+Iteration on the working tree: typecheck, build, build:workers, vitest
+(128 files, 1,632 passed, 3 skipped) and the native suite (118 tests) passed
+before the review fix. After the review fix, the affected suites passed (267 tests).
+The final local-CI run, package path and verification are recorded in the
+candidate evidence file beside the packaged release, because recording them here
+would change the reviewed commit.
+
+Review: performed against the full diff by the implementing agent. No separate
+review agent could be started in this session, so this is not an independent review.
+It found that a completed import's counts could be attributed to a later stop;
+fixed with a regression test.
+
+## BR-07 Live acceptance and activation preparation
+
+Not executed: active-service replacement and the eight-account live inference
+scenario need the operator's activation decision. The prepared scenario and
+activation plan are in the candidate evidence file.
