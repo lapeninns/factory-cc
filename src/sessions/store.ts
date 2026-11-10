@@ -198,14 +198,18 @@ export class SessionStore {
   private flush(record: SessionRecord, committed?: () => void): void {
     record.notes = record.notes.slice(-128);
     if (!this.persist) { committed?.(); return; }
-    this.terminateLastLine();
-    appendFileSync(this.file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
-    // Readers now observe this complete record. A later durability or derived
-    // snapshot failure must not revert only the in-memory copy.
-    committed?.();
     if (committed) {
-      const fd = openSync(this.file, "r");
-      try { fsyncSync(fd); } finally { closeSync(fd); }
+      let previous: Buffer;
+      try { previous = readFileSync(this.file); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        previous = Buffer.alloc(0);
+      }
+      const separator = previous.length && previous.at(-1) !== 0x0a ? Buffer.from("\n") : Buffer.alloc(0);
+      atomicWrite(this.file, Buffer.concat([previous, separator, Buffer.from(`${JSON.stringify(record)}\n`)]), committed);
+    } else {
+      this.terminateLastLine();
+      appendFileSync(this.file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
     }
     this.writes++;
     if (this.writes >= 256 || statSync(this.file).size >= this.retention.journalMaxBytes) this.compact();
@@ -286,11 +290,16 @@ export class SessionStore {
 }
 
 /** Write a private file that readers see either complete or not at all. */
-function atomicWrite(path: string, data: string): void {
+function atomicWrite(path: string, data: string | Buffer, committed?: () => void): void {
   const temporary = `${path}.${randomUUID()}.tmp`;
   try {
     writeFileSync(temporary, data, { mode: 0o600, flag: "wx" });
+    if (committed) {
+      const fd = openSync(temporary, "r");
+      try { fsyncSync(fd); } finally { closeSync(fd); }
+    }
     renameSync(temporary, path);
+    committed?.();
   } finally {
     rmSync(temporary, { force: true });
   }
