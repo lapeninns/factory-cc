@@ -1,3 +1,4 @@
+import { hostAllowsAnyTools } from "../runtime/native-tool-policy.js";
 import { matchesSettledHostResult } from "../runtime/host-recovery.js";
 import { createHash } from "node:crypto";
 import { header } from "../security/auth.js";
@@ -197,10 +198,11 @@ export function resolveSession(
 
   const lastAssistant = request.messages.map(message => message.role).lastIndexOf("assistant");
   const userSuffix = request.messages.slice(lastAssistant + 1);
+  const suffixResultBlocks = userSuffix.flatMap(message => asBlocks(message.content)).filter(block => block.type === "tool_result");
   const suffixResults = collectToolResults(userSuffix);
   const hasRetainedCheckpointTail = (session: SessionRecord): boolean => {
     const proof = session.retainedCheckpoint, completed = session.historyMessageHashes;
-    return Boolean(sameExecutionScope(session) && session.model === request.model && session.contextHash === contextHash
+    return Boolean(sameExecutionScope(session) && hostAllowsAnyTools(request) && session.model === request.model && session.contextHash === contextHash
       && session.state === "IDLE" && !session.cancelRequested && !session.cancellation
       && (session.hostEnded === undefined || session.hostEnded === "resumable")
       && session.pendingToolIds.length === 0 && !session.endedToolIds?.length && !session.hostCompletionReceipts?.length
@@ -212,6 +214,8 @@ export function resolveSession(
       && Number.isSafeInteger(session.nativeGeneration) && session.nativeGeneration! <= 1_000_000 && session.nativeGeneration! > proof.sourceGeneration
       && lastAssistant >= 1 && request.messages[lastAssistant - 1]?.role === "user" && userSuffix.length > 0
       && userSuffix.every(message => message.role === "user" && asBlocks(message.content).every(block => block.type === "text" || block.type === "tool_result"))
+      && suffixResultBlocks.every(block => "tool_use_id" in block && typeof block.tool_use_id === "string" && block.tool_use_id.length > 0)
+      && suffixResults.length === suffixResultBlocks.length
       && new Set(suffixResults.map(result => result.tool_use_id)).size === suffixResults.length
       && suffixResults.every(result => !result.is_error && matchesSettledHostResult(result, proof.settledToolResults ?? []))
       && completed && completed.length >= 2 && completed.at(-2) === incoming[lastAssistant - 1] && completed.at(-1) === incoming[lastAssistant]);

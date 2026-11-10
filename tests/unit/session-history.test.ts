@@ -1,3 +1,4 @@
+import { parseMessagesRequest } from "../../src/protocol/validate.js";
 import { hostResultDigest } from "../../src/runtime/host-recovery.js";
 import { describe, expect, it } from "vitest";
 import { explicitSessionId, historyMessageHashes, resolveSession, sessionContextHash } from "../../src/sessions/correlate.js";
@@ -548,6 +549,16 @@ describe("conversation continuity and isolation", () => {
       ]) expect(resolveOwned([record], changed).match).toBeUndefined();
       expect(resolveOwned([record], { ...queued, messages: queued.messages.slice(0, 3) }).match).toBeUndefined();
       expect(resolveOwned([retained({ historyMessageHashes: ["changed", "pair"] })], queued).match).toBeUndefined();
+    });
+
+    it("keeps explicit no-tools auxiliary requests independent", () => {
+      expect(resolveOwned([retained()], { ...queued, tool_choice: { type: "none" } }).match).toBeUndefined();
+    });
+
+    it.each([undefined, null, 12, ""])("refuses a schema-valid result with invalid ID %j", id => {
+      const malformed = { type: "tool_result", content: "result", ...(id === undefined ? {} : { tool_use_id: id }) };
+      const request = parseMessagesRequest({ ...queued, messages: [...queued.messages, { role: "user", content: [malformed] }] });
+      expect(resolveOwned([retained()], request).match).toBeUndefined();
     });
 
     it("keeps explicit selection and ambiguity rules for retained checkpoint tails", () => {

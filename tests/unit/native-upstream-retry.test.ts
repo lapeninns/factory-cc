@@ -126,6 +126,19 @@ describe("established native upstream retry", () => {
     expect(f.runtime.prepareColdRetry).not.toHaveBeenCalled();
   });
 
+  it.each(["none", "missing-id", "null-id", "numeric-id"])("refuses %s through the normal HTTP path without selecting the retained checkpoint", async invalid => {
+    const f = await compactedRetryFixture(), before = structuredClone(f.record), count = f.runtime.handle.mock.calls.length;
+    const request = invalid === "none" ? { ...f.request, tool_choice: { type: "none" } } : { ...f.request,
+      messages: [...f.request.messages, { role: "user", content: [{ type: "tool_result", content: "done",
+        ...(invalid === "missing-id" ? {} : { tool_use_id: invalid === "null-id" ? null : 42 }) }] }] };
+    const response = await postMessages(f.app.url, "client", request);
+    expect(response.status).toBe(409);
+    expect(f.record).toEqual(before);
+    expect(f.app.store.list()).toHaveLength(1);
+    expect(f.runtime.handle).toHaveBeenCalledTimes(count);
+    expect(f.runtime.prepareColdRetry).not.toHaveBeenCalled();
+  });
+
   it("enforces the original account cooldown before a compacted retained retry", async () => {
     vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(new Date("2026-11-10T13:00:00Z"));
     const f = await compactedRetryFixture(429), calls = f.runtime.handle.mock.calls.length;

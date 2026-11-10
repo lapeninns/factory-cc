@@ -617,6 +617,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       throw new BridgeError(429, "rate_limit_error", "The native checkpoint is retained for its owning account. Retry after its observed cooldown.",
         { retry_after: Math.max(1, Math.ceil((Date.parse(until ?? "") - Date.now()) / 1000)), checkpoint_retained: true, retry_mode: "native_checkpoint" });
     }
+    let retainedCheckpointVerified = false;
     if (config.controllerPool && resolved.match?.retryableRequestKind === "native-upstream") {
       const retained = resolved.match.retainedCheckpoint;
       if (!retained || retained.sdkSessionId !== resolved.match.sdkSessionId || retained.account !== resolved.match.claudeAccount) {
@@ -632,6 +633,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       // hashes from the same verified immutable checkpoint before resuming.
       if (settledIds.length && !retained.settledToolResults) store.update(resolved.match.bridgeSessionId,
         { retainedCheckpoint: { ...retained, settledToolResults: inspected.settledToolResults } });
+      retainedCheckpointVerified = true;
     }
     if (claudeAccount) logger.info("claude_account_assigned", { model: request.model, account: claudeAccount });
     const session = resolved.match
@@ -661,7 +663,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     try {
       if (resolved.match) {
         const migration = await prepareControllerWorkspaceMigration(config, session, runtime);
-        if (migration) { store.update(sessionId, migration); workspaceMigrated = true; previous = structuredClone(session); }
+        if (migration) { store.update(sessionId, migration); workspaceMigrated = true; retainedCheckpointVerified = false; previous = structuredClone(session); }
       }
       if (isEnded(session)) throw new BridgeError(409, "session_unavailable", "this session has ended; start a new session");
       // The state write can be refused (session limit); the binding cannot be
@@ -775,7 +777,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       store.update(sessionId, {
         hostEnded: undefined,
         retryableRequestHash: undefined,
-        retryableRequestKind: undefined,
+        retryableRequestKind: retainedCheckpointVerified ? "native-upstream" : undefined,
         role,
         model: request.model,
         ...(provider === "cursor" ? { provider } : {}),
@@ -826,6 +828,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         historyMessageHashes: historyMessageHashes([...request.messages, { role: "assistant", content: assistantContent }]),
         usage: { ...turn.response.usage, estimated: turn.response.usage.estimated ?? false },
         retainedCheckpoint: undefined,
+        retryableRequestKind: undefined,
         checkpointRetryBlocked: undefined,
         ...(session.pendingHostRecovery ? { pendingHostRecovery: turn.pendingToolIds.length
           ? { ...session.pendingHostRecovery, notified: true } : undefined } : {}),
@@ -870,7 +873,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       const retryableUpstream = error instanceof BridgeError && ([429, 529].includes(error.status) || error.code === "sdk_start_timeout") && error.extra.retry_from_history === true
         && !cancellationRequested && current && !current.cancelRequested && current.hostEnded === undefined
         && (current.state === "GENERATING" || current.state === "RESUMING")
-        && (previous.historyMessageHashes ?? []).every((hash, index) => incomingHashes[index] === hash);
+        && (retainedCheckpointVerified || (previous.historyMessageHashes ?? []).every((hash, index) => incomingHashes[index] === hash));
       // A limited account sits out its cooldown; the conversation continues on another account.
       const limitedAccount = claudePool && error instanceof BridgeError && error.code === "rate_limit_error" && current && provider !== "cursor"
         ? current.claudeAccount ?? listed?.claudeProfile ?? PERSONAL_ACCOUNT : undefined;
@@ -887,7 +890,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         // Preserve the checkpoint and completed tool results for the same retry.
         store.update(sessionId, { ...previous, hostCompletionReceipts: current.hostCompletionReceipts,
           state: previous.state === "NEW" ? "IDLE" : previous.state,
-          retryableRequestHash: requestFingerprint, retryableRequestKind: "admission" });
+          retryableRequestHash: requestFingerprint, retryableRequestKind: retainedCheckpointVerified ? "native-upstream" : "admission" });
         error = new BridgeError(503, "desktop_job_timeout",
           "The request is deferred before model execution. Retry the same request with this session to continue.",
           { ...(error as BridgeError).extra, retry_after: 1, resumable: true, retry_mode: "same_request", session_id: sessionId,
