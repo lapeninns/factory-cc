@@ -172,7 +172,30 @@ describe("controller pool native lease generations", () => {
     ]);
     await runtime.close();
   });
-});
+  it("asks a new generation to continue the persisted checkpoint, except for a cold import", async () => {
+    const root = directory();
+    const binding: DesktopJobBinding = { sessionId: "factory", cwd: root, subscriptionProfile: "team1", workspacePolicy: "factory-native", nativeGeneration: 3 };
+    const inner = { kind: "fake" as const, handle: vi.fn(async () => turn()), cancel: vi.fn(async () => undefined), deliverResults: vi.fn(async () => []) };
+    const acquire = vi.fn(async (_request: import("../../src/runtime/desktop-jobs.js").DesktopJobAcquire) => ({ jobId: "job", release: vi.fn(async () => undefined) }));
+    const update = vi.fn(async (_request: import("../../src/runtime/desktop-jobs.js").DesktopJobAcquire) => undefined);
+    const runtime = new DesktopJobsRuntime(inner, { pythonExecutable: "/usr/bin/python3", runtimePackagePath: root, factoryNative: true,
+      stateRoot: join(root, "state"), getBinding: () => binding, acquireLease: acquire, updateRecord: update });
+    const resumed = request("team1", "bridge-resume"); resumed.session.sdkSessionId = "checkpoint-one";
+    await runtime.handle(resumed);
+    const imported = request("team1", "bridge-import"); imported.session.sdkSessionId = "checkpoint-one"; imported.recovery = "cold-import";
+    await runtime.handle(imported);
+    expect(acquire.mock.calls.map(([value]) => value.resumeSessionId)).toEqual(["checkpoint-one", undefined]);
+    expect(runtime.ownsNativeSession("bridge-resume")).toBe(true);
+
+    // A refused lineage leaves no identity for later cleanup to update.
+    acquire.mockRejectedValueOnce(new BridgeError(409, "native_generation_refused", "refused", { phase: "admission", checkpoint_retained: true, reason: "lease_binding_mismatch" }));
+    await expect(runtime.handle(request("team1", "bridge-refused"))).rejects.toMatchObject({ code: "native_generation_refused" });
+    expect(runtime.ownsNativeSession("bridge-refused")).toBe(false);
+    await runtime.cancel("bridge-refused", "request-failed");
+    expect(update).not.toHaveBeenCalled();
+    await runtime.close();
+    expect(update.mock.calls.map(([value]) => value.bridgeSessionId).sort()).toEqual(["bridge-import:g3", "bridge-resume:g3"]);
+  });});
 
 describe("controller account selection and failover", () => {
   async function start() {

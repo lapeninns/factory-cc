@@ -106,7 +106,8 @@ describe("explicit idle Desktop binding recovery", () => {
       console.log(JSON.stringify({jobId: lease.jobId}));
     `], { cwd: process.cwd(), encoding: "utf8", timeout: 15_000 }));
     await expect(acquireDesktopJobLease(options, oldRequest as Parameters<typeof acquireDesktopJobLease>[1],
-      new AbortController().signal)).rejects.toMatchObject({ code: "desktop_job_protocol" });
+      new AbortController().signal)).rejects.toMatchObject({ code: "native_generation_refused",
+      extra: { reason: "lease_binding_mismatch", checkpoint_retained: true } });
 
     await f.send();
     const config: BridgeConfig = { ...loadConfig({ mode: "mock", dataDir: join(f.cwd, "config"),

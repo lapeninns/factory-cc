@@ -22,6 +22,8 @@ export interface SessionRecord {
   nativeGeneration?: number;
   /** Operator-selected workspace capability associated with the native generation. */
   controllerWorkspacePolicy?: "controller-readonly" | "controller-host";
+  /** Operator recoveries of a failed pre-prompt continuation; the failure stays recorded here. */
+  checkpointRecoveries?: NativeCheckpointRecovery[];
   /** Persist replay safety independently of process-local callback state. */
   hostEnded?: "resumable" | "terminal" | "interrupted";
   role: RoleTag;
@@ -49,6 +51,16 @@ export interface SessionRecord {
     output_tokens: number;
     estimated: boolean;
   };
+}
+
+export interface NativeCheckpointRecovery {
+  at: string;
+  sdkSessionId: string;
+  fromGeneration: number;
+  toGeneration: number;
+  /** Last change to the failed record before recovery. */
+  failedAt: string;
+  leaseEndedAt: string;
 }
 
 /** A session in this condition can never resume or complete another tool round trip. */

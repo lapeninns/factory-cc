@@ -881,6 +881,144 @@ class FactoryLeaseTests(unittest.TestCase):
         self.assertNotIn('never-copy-this', (self.state / 'jobs' / (job_id + '.json')).read_text())
         self.assertTrue(read_job(self.config, job_id)['externalCleanupRequired'])
 
+    def lineage(self, generation, op='acquire', factory='factory-lineage', **extra):
+        return {'op': op, 'factorySessionId': factory, 'bridgeSessionId': 'bridge-lineage:g%d' % generation,
+                'cwd': str(self.root), 'role': 'orchestrator', 'subscriptionProfile': 'team1',
+                'workspacePolicy': 'factory-native', **extra}
+
+    def closed_generation(self, generation=0, checkpoint='checkpoint-a'):
+        child = self.start()
+        self.send(child, self.lineage(generation))
+        self.assertEqual(self.receive(child)['event'], 'queued')
+        job_id = self.receive(child)['jobId']
+        self.release(child, 'idle', sdkSessionId=checkpoint, cleanupVerified=False)
+        # An orderly controller close confirms the session ended without an admitted phase.
+        close = self.start()
+        self.send(close, self.lineage(generation, op='update', state='cancelled', cleanupVerified=True))
+        self.assertEqual(self.receive(close)['event'], 'updated')
+        self.assertEqual(close.wait(timeout=3), 0)
+        return job_id
+
+    def refused(self, request):
+        child = self.start()
+        self.send(child, request)
+        result = self.receive(child)
+        self.assertEqual(child.wait(timeout=3), 2)
+        return result
+
+    def jobs_snapshot(self):
+        return {path.name: path.read_bytes() for path in sorted((self.state / 'jobs').glob('*.json'))}
+
+    def test_new_generation_continues_a_closed_predecessor_checkpoint(self):
+        previous_id = self.closed_generation()
+        before = read_job(self.config, previous_id)
+        child, job_id = self.admitted(**{key: value for key, value in self.lineage(1, resumeSessionId='checkpoint-a').items()
+                                         if key != 'op'})
+        self.assertNotEqual(job_id, previous_id)
+        self.assertEqual(read_job(self.config, previous_id), before)
+        self.release(child, 'idle', sdkSessionId='checkpoint-a', cleanupVerified=False)
+        self.assertNotIn('resumeSessionId', read_job(self.config, job_id))
+
+    def test_new_generation_waits_for_unresolved_or_foreign_predecessors(self):
+        sleeper = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+        self.addCleanup(lambda: (sleeper.kill(), sleeper.wait(timeout=3)))
+        foreign = None
+        for _ in range(50):
+            foreign = process_identity(sleeper.pid)
+            if foreign:
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(foreign)
+        dead = dict(process_identity(os.getpid()), start='an exited controller')
+        previous_id = self.closed_generation()
+        cases = {
+            'running': {'state': 'running', 'externalCleanupRequired': True},
+            'unknown': {'state': 'unknown', 'externalCleanupRequired': True},
+            'waiting_host_exited_owner': {'state': 'waiting_host', 'leaseOwnerIdentity': dead},
+            'waiting_host_live_foreign_owner': {'state': 'waiting_host', 'leaseOwnerIdentity': foreign},
+            'host_reservation': {'state': 'cancelled', 'hostActionReservation': True},
+            'idle_live_foreign_owner': {'state': 'idle', 'leaseOwnerIdentity': foreign},
+        }
+        original = read_job(self.config, previous_id)
+        for name, patch in cases.items():
+            with self.subTest(name=name):
+                with state_lock(self.config):
+                    write_job(self.config, {**original, **patch})
+                before = self.jobs_snapshot()
+                result = self.refused(self.lineage(1, resumeSessionId='checkpoint-a'))
+                self.assertEqual(result, {'ok': False, 'error': 'factory_lease_refused', 'code': 'native_generation',
+                                          'reason': 'native_predecessor_unresolved'})
+                after = self.jobs_snapshot()
+                self.assertEqual(set(after), set(before))
+        # The same controller may continue beside its own released phase, for
+        # example after a Factory compact handoff to a new session ID.
+        with state_lock(self.config):
+            write_job(self.config, {**original, 'state': 'waiting_host'})
+        child, sibling_id = self.admitted(**{key: value for key, value in self.lineage(0, factory='factory-handoff').items() if key != 'op'})
+        self.release(child, 'idle', cleanupVerified=False)
+        with state_lock(self.config):
+            write_job(self.config, {**read_job(self.config, sibling_id), 'state': 'cancelled'})
+        # A released idle phase whose controller exited is not executing.
+        with state_lock(self.config):
+            write_job(self.config, {**original, 'state': 'idle', 'leaseOwnerIdentity': dead})
+        child, _ = self.admitted(**{key: value for key, value in self.lineage(1).items() if key != 'op'})
+        self.release(child, 'idle', cleanupVerified=False)
+
+    def test_stale_generation_and_checkpoint_mismatch_are_refused_before_any_write(self):
+        self.closed_generation(checkpoint='checkpoint-a')
+        before = self.jobs_snapshot()
+        mismatch = self.refused(self.lineage(1, resumeSessionId='checkpoint-b'))
+        self.assertEqual(mismatch.get('reason'), 'native_checkpoint_mismatch')
+        self.assertEqual(self.jobs_snapshot(), before)
+        child, _ = self.admitted(**{key: value for key, value in self.lineage(1, resumeSessionId='checkpoint-a').items()
+                                    if key != 'op'})
+        self.release(child, 'idle', sdkSessionId='checkpoint-a', cleanupVerified=False)
+        before = self.jobs_snapshot()
+        for request in (self.lineage(0), self.lineage(0, factory='factory-other')):
+            with self.subTest(factory=request['factorySessionId']):
+                self.assertEqual(self.refused(request).get('reason'), 'stale_native_generation')
+                self.assertEqual(self.jobs_snapshot(), before)
+
+    def test_inherited_lease_identity_is_refused_with_a_fixed_category(self):
+        job_id = self.closed_generation()
+        with state_lock(self.config):
+            job = read_job(self.config, job_id)
+            job['leaseOwnerIdentity'] = dict(job['leaseOwnerIdentity'], start='an exited controller')
+            write_job(self.config, job)
+        before = self.jobs_snapshot()
+        result = self.refused(self.lineage(0, resumeSessionId='checkpoint-a'))
+        self.assertEqual(result, {'ok': False, 'error': 'factory_lease_refused', 'code': 'native_generation',
+                                  'reason': 'lease_binding_mismatch'})
+        self.assertEqual(self.jobs_snapshot(), before)
+
+    def test_inspect_reports_sanitized_lineage_without_changing_leases(self):
+        self.closed_generation(checkpoint='checkpoint-a')
+        before = self.jobs_snapshot()
+        child = self.start()
+        request = {key: value for key, value in self.lineage(0, op='inspect', sdkSessionId='checkpoint-a').items() if key != 'role'}
+        self.send(child, request)
+        result = self.receive(child)
+        self.assertEqual(child.wait(timeout=3), 0)
+        self.assertEqual(result['event'], 'inspected')
+        [generation] = result['generations']
+        self.assertEqual({key: value for key, value in generation.items() if key != 'endedAt'}, {
+            'generation': 0, 'state': 'cancelled', 'externalCleanupRequired': False, 'hostActionReservation': False,
+            'ownerAlive': True, 'supervisorAlive': False, 'cleanupVerified': True, 'checkpointMatches': True,
+            'bindingMatches': True, 'endedBy': 'session_update'})
+        self.assertNotIn(str(self.root), json.dumps(result))
+        self.assertEqual(self.jobs_snapshot(), before)
+        for patch, field, expected in (({'sdkSessionId': 'checkpoint-b'}, 'checkpointMatches', False),
+                                       ({'subscriptionProfile': 'team2'}, 'bindingMatches', False),
+                                       ({'factorySessionId': 'factory-other'}, 'bindingMatches', False)):
+            with self.subTest(field=field, patch=patch):
+                child = self.start()
+                self.send(child, {**request, **patch})
+                self.assertIs(self.receive(child)['generations'][0][field], expected)
+                self.assertEqual(child.wait(timeout=3), 0)
+        for extra in ({'role': 'orchestrator'}, {'bridgeSessionId': 'bridge-lineage'}):
+            with self.subTest(extra=extra):
+                self.assertFalse(self.refused({**request, **extra})['ok'])
+        self.assertEqual(self.jobs_snapshot(), before)
     def test_update_requires_the_original_parent_identity(self):
         child, job_id = self.admitted()
         self.release(child)

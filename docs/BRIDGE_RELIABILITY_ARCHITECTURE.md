@@ -44,6 +44,7 @@ HTTP endpoint or successful login does not establish remaining provider allowanc
 | Source and live admission limits disagree | Deployed JS contained an eight-slot overlay while source still used two slots | Derive the subscription eight-worker ceiling from the eight fixed profiles and apply it to pooled controller and worker services. Per-seat execution remains one. Non-pooled/API limits retain their existing settings. |
 | Releases cannot be reconstructed reliably from one revision | Controller/workers/pool and Python files came from different releases and manually overlaid hunks | Package complete artifacts from a clean commit with a fresh build, lockfile install, runtime verification and full file/mode/link manifest. Reject overlays and escaping dependency links. |
 | A 3.4 MB, ~1,433-message cold import exited about 2 s after verified login, twice, leaving no cause | Every SDK error result became a generic 502, the typed `terminal_reason` and `api_error_status` were discarded, and a stopped generation logged nothing. Imported tool calls lost their IDs, so large histories could not pair calls with results | Each stopped generation logs one `sdk_session_failed` record with code, lifecycle phase, allowlisted SDK reason/status, account, native generation and cold-import counts, never message text. `prompt_too_long` returns Messages-API style `400 invalid_request_error` with `recovery_action: compact_conversation` and is never replayed on another account. Imported calls carry their IDs; unanswered calls and failed results are marked. |
+| After an orderly controller restart, an existing native Workstream lost its 256k-token checkpoint and cold-imported 1,859 messages (1.2M tokens, rejected) | Only marker restore advanced the native lease generation. A fresh authenticated SessionStart reused the previous controller's terminal lease, the refusal failed the record, and correlation skips failed records | A fresh Desktop start advances resumable records to a new generation. The lease helper refuses a stale, unresolved or checkpoint-mismatched lineage before writing, and the bridge keeps the record and checkpoint instead of failing them. An admin-only, idempotent operation recovers an already-failed pre-prompt continuation from matched record and lease evidence. |
 
 The former CLI deletion's initiating process was not identified. This incident
 proves a missing dependency, not which updater or cleanup removed it. Provider
@@ -57,6 +58,9 @@ allowance exhaustion was not established by the generic startup failures.
   timeout, absent PID or a model's assertion alone cannot authorize replacement.
 - Cleanup confirmation precedes lease settlement. Model success never supplies
   process-cleanup evidence. The executor result remains distinct from settlement.
+- A native lease generation belongs to one controller process. A later process
+  continues the same SDK checkpoint under a new generation, and only after every
+  predecessor generation is resolved.
 - Original snapshots and native lease records remain available for investigation.
   A reconciliation projection reports its own reason and terminal ledger timestamp.
 - Private operator configuration selects identity and scope. Worker prompts cannot

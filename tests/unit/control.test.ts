@@ -210,3 +210,43 @@ describe("approval control page", () => {
     expect(ui.get("approvals").children).toHaveLength(0);
   });
 });
+
+describe("native checkpoint recovery CLI", () => {
+  const env = (url: string) => ({ BRIDGE_ADMIN_TOKEN: "test-secret", BRIDGE_CONTROL_URL: url });
+  const args = ["recover-checkpoint", "sess_fixture", "--factory-session", "factory-one", "--sdk-session", "checkpoint-one", "--generation", "0"];
+
+  it("sends one explicit identity and shows only fixed refusal codes", async () => {
+    const received: unknown[] = [];
+    let refuse = false;
+    const url = await localServer(async (req, res) => {
+      let raw = "";
+      for await (const chunk of req) raw += chunk;
+      received.push({ path: req.url, authorization: req.headers.authorization, body: JSON.parse(raw) });
+      res.statusCode = refuse ? 409 : 200;
+      res.end(refuse ? JSON.stringify({ type: "error", error: { type: "native_recovery_refused", reason: "lease_owner_alive", message: "server text /private/path" } })
+        : '{"ok":true,"recovered":true}');
+    });
+    expect(await runControl([...args, "--dry-run"], env(url))).toEqual({ ok: true, recovered: true });
+    expect(received).toEqual([{ path: "/internal/native-checkpoint-recovery", authorization: "Bearer test-secret", body: {
+      bridgeSessionId: "sess_fixture", factorySessionId: "factory-one", sdkSessionId: "checkpoint-one", nativeGeneration: 0, dryRun: true } }]);
+    refuse = true;
+    const error = await runControl(args, env(url)).catch((value: Error) => value);
+    expect(String(error)).toContain("Recovery refused: native_recovery_refused (lease_owner_alive).");
+    expect(String(error)).not.toContain("/private/path");
+  });
+
+  it.each([
+    ["recover-checkpoint"],
+    ["recover-checkpoint", "sess_fixture", "--factory-session", "factory-one", "--sdk-session", "checkpoint-one"],
+    [...args.slice(0, -1), "-1"],
+    [...args.slice(0, -1), "01"],
+    [...args, "--generation", "1"],
+    [...args, "--dry-run", "--dry-run"],
+    [...args, "--unknown", "value"],
+  ])("refuses incomplete or ambiguous arguments before contacting the bridge: %j", async (...input) => {
+    const fetch = vi.spyOn(globalThis, "fetch");
+    await expect(runControl(input, env("http://127.0.0.1:9"))).rejects.toThrow("recover-checkpoint requires");
+    expect(fetch).not.toHaveBeenCalled();
+    fetch.mockRestore();
+  });
+});

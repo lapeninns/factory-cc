@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import type { BridgeRuntime, RuntimeApprovalRequest, RuntimeControl, RuntimePermissionDecision, NativeWorkstreamIdentity } from "../runtime/types.js";
 import type { SessionStore } from "../sessions/store.js";
+import { isEnded } from "../sessions/state.js";
 import { BridgeError, type ContentBlock, type MessagesRequest } from "../types.js";
 import { canonicalWorkspacePath, COMPACTION_SUMMARY } from "../workspace.js";
 
@@ -316,6 +317,7 @@ export class ControlBroker implements RuntimeControl {
         this.hosts.set(key, host);
         this.tokens.set(host.token, host);
         launch?.hosts.add(host);
+        if (desktopLifecycle) this.advanceInheritedGenerations(host);
       }
       host.cwdAliases.add(resolve(event.cwd));
       this.observeNativeWorkstream(host, event);
@@ -446,6 +448,29 @@ export class ControlBroker implements RuntimeControl {
     this.tokens.set(token, host);
     this.restoredDesktopBindings++;
     return host;
+  }
+
+  /**
+   * A durable native lease belongs to the controller process that acquired it,
+   * and an orderly close makes it terminal. A fresh authenticated start in a
+   * later process continues the same native checkpoint under a new generation.
+   * The lease helper still refuses that generation while any predecessor is
+   * active, uncertain or owned by another live controller.
+   */
+  private advanceInheritedGenerations(host: HostBinding): void {
+    const owns = this.runtime.ownsNativeSession?.bind(this.runtime);
+    if (!owns) return;
+    for (const record of this.store.list()) {
+      const generation = record.nativeGeneration;
+      if (record.factorySessionId !== host.sessionId || record.factoryCwd !== host.cwd || record.state !== "IDLE" || isEnded(record)
+          || record.cancelRequested || record.pendingToolIds.length
+          || generation === undefined || !Number.isSafeInteger(generation) || generation < 0 || generation >= 1_000_000
+          || owns(record.bridgeSessionId) || this.runtime.isSessionUsable?.(record.bridgeSessionId) === true
+          || Boolean(this.runtime.protectedSessionIds?.().includes(record.bridgeSessionId))
+          || this.hasApprovals(record.bridgeSessionId) || Boolean(this.runtime.pendingHostCalls?.(record.bridgeSessionId).length)
+          || [...this.hosts.values()].some(other => other !== host && !other.ended && other.bridgeSessions.has(record.bridgeSessionId))) continue;
+      this.store.update(record.bridgeSessionId, { nativeGeneration: generation + 1 });
+    }
   }
 
   private async endHost(host: HostBinding, cancelled: boolean, reason: string): Promise<void> {

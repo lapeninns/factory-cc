@@ -30,7 +30,8 @@ import { ControlBroker } from "../control/broker.js";
 import { controlPageHtml, controlPageHeaders } from "./control-page.js";
 import { configuredModels, providerFromModelId, resolveRequestModel, type BridgeModel, type ModelProvider } from "../models.js";
 import { ClaudePool, PERSONAL_ACCOUNT, POOL_PROFILE } from "../upstream/claude-pool.js";
-import { DesktopJobsRuntime, SUBSCRIPTION_WORKER_SLOTS, type DesktopJobBinding } from "../runtime/desktop-jobs.js";
+import { DesktopJobsRuntime, SUBSCRIPTION_WORKER_SLOTS, type DesktopJobBinding, type DesktopWorkspacePolicy } from "../runtime/desktop-jobs.js";
+import { recoverNativeCheckpoint } from "../control/native-recovery.js";
 import type { RuntimeRequest } from "../runtime/types.js";
 
 export interface BridgeApp {
@@ -54,6 +55,12 @@ function listenUrl(host: string, port: number): string {
   return `http://${formatListenHost(host)}:${port}`;
 }
 
+/** Lease workspace policy fixed by immutable operator configuration. */
+export function controllerWorkspacePolicy(config: BridgeConfig): DesktopWorkspacePolicy | undefined {
+  if (!config.controllerReadOnly) return undefined;
+  return config.factoryNative ? "factory-native" : config.controllerHostTools ? "controller-host" : "controller-readonly";
+}
+
 /** Only persisted, privately selected controller identities reach the lease. */
 export function controllerJobBinding(config: BridgeConfig, input: RuntimeRequest): DesktopJobBinding | undefined {
   if (!input.factorySession?.desktopLifecycle) return undefined;
@@ -71,7 +78,7 @@ export function controllerJobBinding(config: BridgeConfig, input: RuntimeRequest
     ...(config.factoryNative ? { inferenceRole: native?.role === "orchestrator" ? "orchestrator" as const : "worker" as const } : {}),
     sessionId: input.factorySession.sessionId, cwd: input.factorySession.cwd, launchId: input.factorySession.launchId,
     ...(profile === undefined ? {} : { subscriptionProfile: profile }),
-    ...(config.controllerReadOnly ? { workspacePolicy: config.factoryNative ? "factory-native" as const : config.controllerHostTools ? "controller-host" as const : "controller-readonly" as const } : {}),
+    ...(config.controllerReadOnly ? { workspacePolicy: controllerWorkspacePolicy(config) } : {}),
     ...(config.controllerPool ? { nativeGeneration: input.session.nativeGeneration } : {}),
   };
 }
@@ -102,11 +109,12 @@ export async function prepareControllerWorkspaceMigration(config: BridgeConfig, 
 }
 
 export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath: string, runtime: BridgeRuntime = createRuntime(config, logger, canaryPath)): BridgeApp {
-  if (config.desktopJobs) runtime = new DesktopJobsRuntime(runtime, {
+  const desktopJobs = config.desktopJobs ? new DesktopJobsRuntime(runtime, {
     pythonExecutable: "/usr/bin/python3", runtimePackagePath: config.desktopRuntimePath!,
     stateRoot: config.desktopStateRoot!, maxRunning: config.workerPool ? SUBSCRIPTION_WORKER_SLOTS : 2, workerMcpPrefix: config.workerMcpPrefix,
     factoryNative: config.factoryNative, getBinding: (input) => controllerJobBinding(config, input),
-  });
+  }) : undefined;
+  if (desktopJobs) runtime = desktopJobs;
   const store = new SessionStore(join(config.dataDir, "sessions"), config.persistSessions, config.maxSessions, logger, {
     ...DEFAULT_SESSION_RETENTION, maxRecords: config.sessionMaxRecords ?? 1000, maxAgeMs: config.sessionRetentionMs ?? DEFAULT_SESSION_RETENTION.maxAgeMs,
   });
@@ -432,6 +440,26 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       json(res, 200, { sessions: store.list() });
       return;
     }
+    if (req.method === "POST" && path === "/internal/native-checkpoint-recovery") {
+      requireAdminToken(req.headers, config.adminToken);
+      const workspacePolicy = controllerWorkspacePolicy(config);
+      if (!desktopJobs || !config.controllerPool || !workspacePolicy || !(desktopJobs instanceof DesktopJobsRuntime)) {
+        throw new BridgeError(409, "native_recovery_unavailable", "Native checkpoint recovery requires the supervised subscription controller pool.");
+      }
+      try {
+        const result = await recoverNativeCheckpoint({ store, runtime, workspacePolicy,
+          accounts: (config.subscriptionAccounts ?? []).map(account => account.profile),
+          busy: id => activeRequests.has(id) || control.hasApprovals(id),
+          inspect: request => desktopJobs.inspectNativeGenerations(request) }, await readJson(req, config.maxBodyBytes));
+        logger.info("native_checkpoint_recovery", { sessionId: result.bridgeSessionId, recovered: result.recovered,
+          alreadyRecovered: result.alreadyRecovered === true, eligible: result.eligible === true, nativeGeneration: result.nativeGeneration });
+        json(res, 200, result);
+      } catch (error) {
+        if (error instanceof BridgeError) logger.warn("native_checkpoint_recovery_refused", { code: error.code, reason: error.extra.reason });
+        throw error;
+      }
+      return;
+    }
     if (req.method === "POST" && path === "/internal/cancel") {
       requireAdminToken(req.headers, config.adminToken);
       const body = (await readJson(req, config.maxBodyBytes)) as { sessionId?: string };
@@ -713,6 +741,11 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         && error.extra.retry_safe === true && error.extra.phase === "admission"
         && !cancellationRequested && current && !current.cancelRequested && current.hostEnded === undefined
         && (current.state === "GENERATING" || current.state === "RESUMING");
+      // The lease helper refused this generation before writing or admitting anything.
+      const refusedGeneration = error instanceof BridgeError && error.code === "native_generation_refused"
+        && error.extra.checkpoint_retained === true && previous.state !== "NEW"
+        && !cancellationRequested && current && !current.cancelRequested && current.hostEnded === undefined
+        && (current.state === "GENERATING" || current.state === "RESUMING");
       const recoverableSwitch = error instanceof BridgeError && error.status === 409
         && ["model_switch_busy", "model_switch_requires_persistence", "model_switch_unavailable", "reasoning_switch_busy", "reasoning_switch_requires_persistence", "reasoning_switch_unavailable"].includes(error.code);
       const rejectedInput = error instanceof BridgeError && [400, 409, 422].includes(error.status) && runtime.isSessionUsable?.(sessionId) === true;
@@ -739,6 +772,13 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
           "The request is deferred before model execution. Retry the same request with this session to continue.",
           { ...(error as BridgeError).extra, retry_after: 1, resumable: true, retry_mode: "same_request", session_id: sessionId,
             session_state: store.require(sessionId).state });
+      } else if (refusedGeneration) {
+        // Failing here would make the next request cold-import the whole host
+        // history. Keep the native checkpoint and its predecessor protection.
+        const reason = String((error as BridgeError).extra.reason);
+        store.update(sessionId, { ...previous, hostCompletionReceipts: current.hostCompletionReceipts,
+          notes: [...new Set([...previous.notes, `native-generation-refused:${reason}`])] });
+        logger.warn("native_generation_refused", { sessionId, reason, nativeGeneration: previous.nativeGeneration });
       } else if (retryableUpstream) {
         let retired = true;
         try {

@@ -31,7 +31,28 @@ export interface DesktopJobAcquire {
   subscriptionProfile?: SubscriptionProfile;
   /** Supplied only by the immutable read-only controller configuration. */
   workspacePolicy?: DesktopWorkspacePolicy;
+  /** Persisted native checkpoint this phase resumes; a new generation must continue its lineage's latest one. */
+  resumeSessionId?: string;
 }
+/** Sanitised lease facts for one generation of a bridge conversation. */
+export interface NativeGenerationEvidence {
+  generation: number;
+  state: string;
+  externalCleanupRequired: boolean;
+  hostActionReservation: boolean;
+  ownerAlive: boolean;
+  supervisorAlive: boolean;
+  cleanupVerified: boolean;
+  /** Null when the lease never recorded a native checkpoint. */
+  checkpointMatches: boolean | null;
+  bindingMatches: boolean;
+  endedAt: string | null;
+  /** How the lease reached its current state: a session-level update, an admitted phase's release, or another path. */
+  endedBy: "session_update" | "phase_release" | "other";
+}
+export type NativeGenerationInspection = Omit<DesktopJobAcquire, "role" | "resumeSessionId"> & { sdkSessionId: string };
+export const NATIVE_GENERATION_REFUSALS = ["lease_binding_mismatch", "terminal_session_cannot_reacquire", "stale_native_generation",
+  "native_predecessor_unresolved", "native_checkpoint_mismatch"] as const;
 export interface DesktopJobLease { jobId: string; release(result: DesktopJobRelease): Promise<void> }
 /**
  * Release, update and deferral confirmations wait for the shared state lock.
@@ -56,6 +77,7 @@ export interface DesktopJobsOptions extends DesktopLeaseOptions {
   getBinding(input: RuntimeRequest): DesktopJobBinding | undefined;
   acquireLease?(request: DesktopJobAcquire, signal: AbortSignal): Promise<DesktopJobLease>;
   updateRecord?(request: DesktopJobAcquire, result: DesktopJobRelease): Promise<void>;
+  inspectGenerations?(request: NativeGenerationInspection): Promise<NativeGenerationEvidence[]>;
 }
 
 interface ActivePhase {
@@ -69,6 +91,8 @@ interface ActivePhase {
   heldHost?: HeldHostPhase;
   acknowledgedHostIds?: Set<string>;
   unresolvedHostIds?: Set<string>;
+  /** This phase introduced the process's identity for the session. */
+  claimedIdentity?: boolean;
 }
 
 interface HeldHostPhase {
@@ -229,7 +253,9 @@ export class DesktopJobsRuntime implements BridgeRuntime {
     const request: DesktopJobAcquire = { factorySessionId: binding.sessionId,
       bridgeSessionId: binding.nativeGeneration === undefined ? id : `${id}:g${binding.nativeGeneration}`, cwd: binding.cwd, role: binding.inferenceRole ?? input.role,
       ...(binding.subscriptionProfile === undefined ? {} : { subscriptionProfile: binding.subscriptionProfile }),
-      ...(binding.workspacePolicy === undefined ? {} : { workspacePolicy: binding.workspacePolicy }) };
+      ...(binding.workspacePolicy === undefined ? {} : { workspacePolicy: binding.workspacePolicy }),
+      ...(binding.nativeGeneration !== undefined && input.recovery !== "cold-import" && input.session.sdkSessionId
+        ? { resumeSessionId: input.session.sdkSessionId } : {}) };
     try { validateWorkspacePolicy(request.workspacePolicy, request.subscriptionProfile, request.role); }
     catch (error) { return Promise.reject(error); }
     const known = this.known.get(id);
@@ -245,7 +271,7 @@ export class DesktopJobsRuntime implements BridgeRuntime {
       return Promise.reject(new BridgeError(409, "desktop_host_action_pending", "Wait for the outstanding host action result before continuing this Workstream."));
     }
     this.known.set(id, request);
-    const phase: ActivePhase = { controller: new AbortController(), request, queuedAt: Date.now(),
+    const phase: ActivePhase = { controller: new AbortController(), request, queuedAt: Date.now(), claimedIdentity: !known,
       ...(held ? { ...(held.parked ? {} : { lease: held.lease }), heldHost: held, acknowledgedHostIds: acknowledged } : {}) };
     this.active.set(id, phase);
     phase.done = this.execute(input, sink, phase);
@@ -298,6 +324,10 @@ export class DesktopJobsRuntime implements BridgeRuntime {
         usage: turn.response.usage, sdkSessionId: turn.sdkSessionId, cleanupVerified: cancelledCleanly === true });
       return turn;
     } catch (error) {
+      // A refused lineage wrote no lease for this process. Later cleanup must
+      // not try to update a lease that another controller generation owns.
+      if (!phase.lease && phase.claimedIdentity && error instanceof BridgeError && error.extra.checkpoint_retained === true
+          && this.known.get(id) === phase.request) this.known.delete(id);
       let cleanupVerified = !phase.lease;
       if (phase.lease) {
         const held = phase.heldHost ?? this.heldHost.get(id) ?? (phase.unresolvedHostIds?.size
@@ -371,6 +401,15 @@ export class DesktopJobsRuntime implements BridgeRuntime {
     await this.inner.prepareColdRetry(sessionId);
     await this.update(sessionId, { state: "failed", cleanupVerified: true });
     this.known.delete(sessionId);
+  }
+
+  /** This process has used the session's current lease identity and must keep it. */
+  ownsNativeSession(sessionId: string): boolean {
+    return this.active.has(sessionId) || this.heldHost.has(sessionId) || this.known.has(sessionId);
+  }
+
+  inspectNativeGenerations(request: NativeGenerationInspection): Promise<NativeGenerationEvidence[]> {
+    return (this.options.inspectGenerations ?? (item => inspectDesktopJobGenerations(this.options, item)))(request);
   }
 
   private async update(id: string, result: DesktopJobRelease): Promise<void> {
@@ -477,6 +516,7 @@ class LeaseChannel {
   private admitted = false;
   private deferring = false;
   private deferred = false;
+  inspection?: unknown;
 
   constructor(options: DesktopLeaseOptions, first: WireMessage, private readonly signal?: AbortSignal) {
     if (!isAbsolute(options.pythonExecutable) || !isAbsolute(options.runtimePackagePath) || !isAbsolute(options.stateRoot)) throw new Error("Desktop supervisor paths must be absolute.");
@@ -536,6 +576,12 @@ class LeaseChannel {
           message.code === "invalid_workspace" ? 422 : 400);
         return;
       }
+      if (message?.ok === false && message.error === "factory_lease_refused" && message.code === "native_generation"
+          && (NATIVE_GENERATION_REFUSALS as readonly string[]).includes(String(message.reason))) {
+        this.fail("native_generation_refused", "This Workstream's native lease generation is unavailable to this controller. Nothing ran and its checkpoint was retained.",
+          409, { phase: "admission", checkpoint_retained: true, reason: String(message.reason) });
+        return;
+      }
       if (!message || message.ok !== true || typeof message.jobId !== "string" || !/^[a-zA-Z0-9_-]{1,160}$/.test(message.jobId)) {
         this.fail("desktop_job_protocol", "The Factory job helper refused the operation."); return;
       }
@@ -552,6 +598,7 @@ class LeaseChannel {
         this.deferred = true;
         this.finalMessage = true;
       } else if (message.event === "released" || message.event === "updated" || message.event === "cancelled") this.finalMessage = true;
+      else if (message.event === "inspected") { this.inspection = message.generations; this.finalMessage = true; }
       else if (message.event !== "queued") this.fail("desktop_job_protocol", "Invalid Factory job helper response.");
     }
   }
@@ -563,12 +610,12 @@ class LeaseChannel {
       "The scheduler admission deadline elapsed without a confirmed deferral."), timeoutMs);
     this.timer.unref();
   }
-  private fail(code: string, message: string, status = 503): void {
+  private fail(code: string, message: string, status = 503, extra: Record<string, string | boolean> = {}): void {
     if (this.settled) return;
     this.settled = true;
     clearTimeout(this.timer);
     this.signal?.removeEventListener("abort", this.abort);
-    const error = new BridgeError(status, code, message);
+    const error = new BridgeError(status, code, message, extra);
     this.rejectReady(error); this.rejectExit(error);
     // Only this child is signalled. Its EOF policy records uncertain ownership.
     this.child.stdin.end();
@@ -604,8 +651,37 @@ export async function acquireDesktopJobLease(options: DesktopLeaseOptions, reque
 }
 
 export async function updateDesktopJobRecord(options: DesktopLeaseOptions, request: DesktopJobAcquire, result: DesktopJobRelease): Promise<void> {
-  const channel = new LeaseChannel({ ...options, admissionTimeoutMs: options.releaseTimeoutMs ?? DEFAULT_RELEASE_TIMEOUT_MS }, { op: "update", ...safeAcquire(request), ...safeRelease(result) });
+  const channel = new LeaseChannel({ ...options, admissionTimeoutMs: options.releaseTimeoutMs ?? DEFAULT_RELEASE_TIMEOUT_MS }, { op: "update", ...safeAcquire(request, false), ...safeRelease(result) });
   await channel.exited;
+}
+
+/** Read-only lease lineage for one bridge conversation. */
+export async function inspectDesktopJobGenerations(options: DesktopLeaseOptions, request: NativeGenerationInspection): Promise<NativeGenerationEvidence[]> {
+  validateSubscriptionProfile(request.subscriptionProfile);
+  if (!request.subscriptionProfile || !request.workspacePolicy || !/:g(?:0|[1-9]\d{0,6})$/.test(request.bridgeSessionId)) {
+    throw new BridgeError(400, "desktop_job_binding", "Lease inspection requires a subscription generation identity.");
+  }
+  const channel = new LeaseChannel({ ...options, admissionTimeoutMs: options.releaseTimeoutMs ?? DEFAULT_RELEASE_TIMEOUT_MS }, { op: "inspect",
+    factorySessionId: request.factorySessionId, bridgeSessionId: request.bridgeSessionId, cwd: request.cwd,
+    subscriptionProfile: request.subscriptionProfile, workspacePolicy: request.workspacePolicy, sdkSessionId: request.sdkSessionId });
+  await channel.exited;
+  const value = channel.inspection;
+  if (!Array.isArray(value) || value.length > 64 || !value.every(isGenerationEvidence)) {
+    throw failure("desktop_job_protocol", "Invalid Factory job helper response.");
+  }
+  return value.map(item => ({ ...item }));
+}
+
+function isGenerationEvidence(value: unknown): value is NativeGenerationEvidence {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  return Number.isSafeInteger(item.generation) && (item.generation as number) >= 0 && (item.generation as number) <= 1_000_000
+    && typeof item.state === "string" && item.state.length <= 64
+    && ["externalCleanupRequired", "hostActionReservation", "ownerAlive", "supervisorAlive", "cleanupVerified", "bindingMatches"]
+      .every(key => typeof item[key] === "boolean")
+    && (item.checkpointMatches === null || typeof item.checkpointMatches === "boolean")
+    && (item.endedAt === null || (typeof item.endedAt === "string" && item.endedAt.length <= 64))
+    && ["session_update", "phase_release", "other"].includes(String(item.endedBy));
 }
 
 function validateSubscriptionProfile(profile: unknown): void {
@@ -625,11 +701,12 @@ function validateWorkspacePolicy(policy: unknown, profile: unknown, role?: unkno
   }
 }
 
-function safeAcquire(request: DesktopJobAcquire): WireMessage {
+function safeAcquire(request: DesktopJobAcquire, resume = true): WireMessage {
   validateSubscriptionProfile(request.subscriptionProfile);
   validateWorkspacePolicy(request.workspacePolicy, request.subscriptionProfile, request.role);
   return { factorySessionId: request.factorySessionId, bridgeSessionId: request.bridgeSessionId,
     cwd: request.cwd, role: request.role,
     ...(request.subscriptionProfile === undefined ? {} : { subscriptionProfile: request.subscriptionProfile }),
-    ...(request.workspacePolicy === undefined ? {} : { workspacePolicy: request.workspacePolicy }) };
+    ...(request.workspacePolicy === undefined ? {} : { workspacePolicy: request.workspacePolicy }),
+    ...(resume && request.resumeSessionId !== undefined ? { resumeSessionId: request.resumeSessionId } : {}) };
 }

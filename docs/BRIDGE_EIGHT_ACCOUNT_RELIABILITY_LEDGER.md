@@ -1,4 +1,4 @@
-# Bridge eight-account reliability ledger (BR-01 to BR-07)
+# Bridge eight-account reliability ledger (BR-01 to BR-08)
 
 Date: 2026-11-09. Base: `88b3e4212ad7464da080172ecce01bbe96e7efab`, branch
 `codex/bridge-eight-account-reliability`. Evidence below uses sanitised aggregates
@@ -140,3 +140,54 @@ was reproduced on `96b54b5` before the fix:
   them, capacity reported team2 free and 8 of 8 worker slots free. Capacity now
   counts every retained record and reports `complete: false` with null lanes,
   accounts and queue when any record is unreadable.
+
+## BR-08 Durable native checkpoint recovery
+
+Root cause: native lease generations belong to the controller process that
+acquired them. After an orderly close, the lease is terminal (`cancelled`). Only
+the marker-restore path (`restoreIdleDesktopBinding`, triggered by
+`UserPromptSubmit`) advanced `nativeGeneration`. A fresh authenticated
+`SessionStart` for the existing orchestrator created a new host binding but kept
+`g0`. The helper refused that generation with `lease_binding_mismatch` (owner
+changed and lease terminal), which the bridge reported as the generic
+`desktop_job_protocol`. The app then marked the record FAILED and tried to
+update the foreign lease during cleanup (`runtime_cancel_failed`). Session
+correlation skips FAILED records, so the next request cold-imported the full
+history into a new SDK session, which then failed with `prompt_too_long`.
+
+Evidence (sanitised, read-only): the original record is FAILED at generation 0
+with SDK checkpoint `11a7ce5d…`, no pending or ended tools, no cancel request or
+host-end marker, and 1,857 completed message fingerprints. Its `g0` lease is
+`cancelled` by `bridge_confirmed_session_end`, ended at 23:32:27, before the
+record failed at 23:38:39. That lease records the same checkpoint, verified
+cleanup, no external cleanup flag and no host reservation. No other generation
+exists for that bridge session. The cold-import sibling is FAILED and never
+completed a turn.
+
+Repair:
+
+- A fresh authenticated Desktop `SessionStart` advances the generation of each
+  resumable (IDLE, not ended) record of that Factory session and workspace that
+  this process does not hold, while keeping its SDK checkpoint and account.
+- On first use of a generation, the lease helper refuses it in these cases: a
+  newer generation exists; a predecessor is active, uncertain or held for a host
+  action; a released predecessor still belongs to another controller (any
+  controller for one waiting on a host, a live one for an idle one); or the
+  latest recorded checkpoint differs from the one being resumed. These refusals
+  happen before anything is written and carry a fixed `native_generation` reason.
+- The bridge maps these refusals to `409 native_generation_refused`. It keeps the
+  record and checkpoint, drops the refused process-local identity, and never
+  marks the record FAILED or cold-imports it.
+- A supported operator operation recovers a record that already failed this way.
+  Its contract is in `OPERATIONS.md`, "Recover a failed native continuation".
+
+Verification: `tests/unit/native-checkpoint-recovery.test.ts` runs the first
+controller in a separate Node process with a real lease helper and orderly close,
+then the second controller over HTTP. The continuation resumes the same checkpoint
+under `g1` without a cold import, and the `g0` lease is unchanged. With the
+generation advance disabled, the same test fails at generation 0. Further tests
+cover inherited-generation refusal, the operator recovery over HTTP (dry run,
+wrong identities, apply, repeat, continuation, repeat after later work), and every
+recovery predicate. The Python lease tests cover predecessor states, stale
+generations, checkpoint mismatch, the fixed refusal category and read-only
+inspection.

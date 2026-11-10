@@ -17,7 +17,7 @@ import sys
 import time
 
 from .core import (RuntimeConfig, RuntimeRefused, matches, now, process_identity,
-                   read_job, state_lock, write_job)
+                   process_table, read_job, state_lock, write_job)
 from .supervisor import (CONTROLLER_SLOTS, OCCUPIED, TERMINAL, _all_jobs,
                          _host_workspace_conflict, _reconcile_locked,
                          execution_lane, holds_workspace, occupies_compute,
@@ -30,6 +30,11 @@ RELEASE_STATES = frozenset(("waiting_host", "idle", "completed", "failed", "canc
 UPDATE_STATES = frozenset(("idle", "waiting_host", "unknown", "completed", "failed", "cancelled", "interrupted"))
 TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 SUBSCRIPTION_PROFILES = frozenset("team" + str(number) for number in range(1, 9))
+# Bridge conversation identity plus its durable native lease generation.
+GENERATION = re.compile(r"^(?P<base>.+):g(?P<generation>0|[1-9][0-9]{0,6})$")
+LINEAGE_REFUSALS = frozenset(("lease_binding_mismatch", "terminal_session_cannot_reacquire", "stale_native_generation",
+                              "native_predecessor_unresolved", "native_checkpoint_mismatch"))
+MAX_INSPECTED_GENERATIONS = 64
 
 
 class ProtocolError(RuntimeRefused):
@@ -85,6 +90,8 @@ def _base_request(request, operation):
     if not isinstance(request, dict) or request.get("op") != operation:
         raise ProtocolError("invalid_operation")
     allowed = {"op", "factorySessionId", "bridgeSessionId", "cwd", "role", "subscriptionProfile", "workspacePolicy"}
+    if operation == "acquire":
+        allowed |= {"resumeSessionId"}
     if operation == "update":
         allowed |= {"state", "usage", "sdkSessionId", "cleanupVerified", "hostActionReservation"}
     if set(request) - allowed:
@@ -141,12 +148,64 @@ def _verify_binding(job, factory, bridge, workspace, owner, subscription_profile
         raise ProtocolError("lease_binding_mismatch")
 
 
+def _lineage(bridge):
+    match = GENERATION.fullmatch(bridge) if isinstance(bridge, str) else None
+    return (match["base"], int(match["generation"])) if match else None
+
+
+def _generations(jobs, base):
+    """Every lease of one bridge conversation, across Factory sessions and accounts."""
+    found = []
+    for job in jobs:
+        lineage = _lineage(job.get("bridgeSessionId")) if job.get("kind") == "factory-session" else None
+        if lineage and lineage[0] == base:
+            found.append((lineage[1], job))
+    return found
+
+
+def _predecessor_unresolved(job, owner):
+    if job.get("externalCleanupRequired") or job.get("hostActionReservation") is True:
+        return True
+    state = job.get("state")
+    if state in TERMINAL:
+        return False
+    if state not in ("idle", "waiting_host"):
+        return True
+    # A released phase is not executing, but its controller may still hold the
+    # parked native process. Only that controller may continue beside it; an
+    # idle phase whose controller exited has nothing left to continue.
+    lease_owner = job.get("leaseOwnerIdentity")
+    if lease_owner == owner:
+        return False
+    return state == "waiting_host" or matches(lease_owner)
+
+
+def _check_lineage(jobs, job_id, bridge, owner, resume_session_id, first_use):
+    lineage = _lineage(bridge)
+    if not lineage:
+        return
+    others = [(number, job) for number, job in _generations(jobs, lineage[0]) if job.get("id") != job_id]
+    if any(number > lineage[1] for number, _ in others):
+        raise ProtocolError("stale_native_generation")
+    if not first_use:
+        return
+    if any(_predecessor_unresolved(job, owner) for _, job in others):
+        raise ProtocolError("native_predecessor_unresolved")
+    recorded = [(number, job["sessionId"]) for number, job in others if job.get("sessionId")]
+    if resume_session_id is not None and recorded and max(recorded, key=lambda item: item[0])[1] != resume_session_id:
+        raise ProtocolError("native_checkpoint_mismatch")
+
+
 def create_or_resume(config, request):
     factory, bridge, role, workspace, job_id, subscription_profile = _base_request(request, "acquire")
+    resume_session_id = request.get("resumeSessionId")
+    if resume_session_id is not None:
+        _identifier(resume_session_id)
     owner, supervisor = _owner()
     with state_lock(config):
         jobs = _reconcile_locked(config)
         existing = next((job for job in jobs if job.get("id") == job_id), None)
+        _check_lineage(jobs, job_id, bridge, owner, resume_session_id, existing is None)
         if existing:
             _verify_binding(existing, factory, bridge, workspace, owner, subscription_profile)
             if existing.get("state") in TERMINAL:
@@ -313,6 +372,50 @@ def update(config, request):
         return job
 
 
+def inspect(config, request):
+    """Read-only lineage evidence for an operator recovery; never changes a lease."""
+    if not isinstance(request, dict) or request.get("op") != "inspect":
+        raise ProtocolError("invalid_operation")
+    if set(request) - {"op", "factorySessionId", "bridgeSessionId", "cwd", "subscriptionProfile", "workspacePolicy", "sdkSessionId"}:
+        raise ProtocolError("unexpected_fields")
+    factory = _identifier(request.get("factorySessionId"))
+    bridge = _identifier(request.get("bridgeSessionId"))
+    checkpoint = _identifier(request.get("sdkSessionId"))
+    lineage = _lineage(bridge)
+    profile = request.get("subscriptionProfile")
+    policy = request.get("workspacePolicy")
+    if not lineage:
+        raise ProtocolError("invalid_identifier")
+    if not isinstance(profile, str) or profile not in SUBSCRIPTION_PROFILES:
+        raise ProtocolError("invalid_subscription_profile")
+    if policy not in ("controller-readonly", "controller-host", "factory-native"):
+        raise ProtocolError("invalid_workspace_policy")
+    workspace = validate_worktree(request.get("cwd"), policy)
+    with state_lock(config):
+        jobs = _generations(_all_jobs(config), lineage[0])
+    if len(jobs) > MAX_INSPECTED_GENERATIONS:
+        raise ProtocolError("lineage_too_large")
+    table = process_table()
+    generations = [{
+        "generation": number, "state": str(job.get("state")),
+        "externalCleanupRequired": bool(job.get("externalCleanupRequired")),
+        "hostActionReservation": job.get("hostActionReservation") is True,
+        "ownerAlive": matches(job.get("leaseOwnerIdentity"), table),
+        "supervisorAlive": matches(job.get("supervisorIdentity"), table),
+        "cleanupVerified": job.get("reportedCleanupVerified") is True,
+        "checkpointMatches": (job.get("sessionId") == checkpoint) if job.get("sessionId") else None,
+        "bindingMatches": (job.get("factorySessionId") == factory and job.get("worktree") == workspace["worktree"]
+                           and job.get("workspacePolicy") == policy and job.get("subscriptionProfile") == profile
+                           and job.get("profile") == profile and job.get("authMode") == "subscription"),
+        "endedAt": job.get("endedAt") if isinstance(job.get("endedAt"), str) else None,
+        # A session update is refused while a helper owns an admitted phase.
+        "endedBy": {"bridge_confirmed_session_end": "session_update",
+                    "bridge_confirmed_phase_end": "phase_release"}.get(job.get("reason"), "other"),
+    } for number, job in sorted(jobs, key=lambda item: (item[0], str(item[1].get("id"))))]
+    job_id = "factory-" + hashlib.sha256((factory + "\0" + bridge).encode()).hexdigest()[:32]
+    return job_id, generations
+
+
 class Lines:
     def __init__(self, fd):
         self.fd, self.buffer, self.eof = fd, b"", False
@@ -371,6 +474,10 @@ def serve(config, input_fd=0):
             job = update(config, request)
             emit("updated", job, state=job["state"])
             return 0
+        if request.get("op") == "inspect":
+            job_id, generations = inspect(config, request)
+            emit("inspected", {"id": job_id}, generations=generations)
+            return 0
         job = create_or_resume(config, request)
         emit("queued", job)
         # Each scheduling attempt holds the shared lock while it snapshots
@@ -420,7 +527,7 @@ def serve(config, input_fd=0):
             emit("released", job, state=job["state"])
             return 0
     except (EOFError, ProtocolError, RuntimeRefused, BrokenPipeError) as error:
-        if job and request.get("op") != "update":
+        if job and request.get("op") not in ("update", "inspect"):
             if admitted:
                 uncertain(config, job, "bridge_release_unconfirmed")
             else:
@@ -436,6 +543,10 @@ def serve(config, input_fd=0):
                     response["code"] = "invalid_workspace"
                 elif str(error) in {"invalid_identifier", "invalid_subscription_profile", "invalid_workspace_policy", "invalid_controller_policy"}:
                     response["code"] = "invalid_binding"
+                elif str(error) in LINEAGE_REFUSALS:
+                    # Refused before this attempt wrote or admitted anything.
+                    response["code"] = "native_generation"
+                    response["reason"] = str(error)
             print(json.dumps(response), flush=True)
         except BrokenPipeError:
             pass
