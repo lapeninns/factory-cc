@@ -57,6 +57,8 @@ Add the returned `checkpointSha256` and `evidenceSha256` to that request file, t
 
 A purpose-built retained-checkpoint proof permits an orderly host end after the in-memory SDK object has been retired. The bridge rechecks identity, file hash and settled leases before recording a resumable host end. A generic idle record receives no such exemption. If checkpoint retry preparation cannot be verified, the original SDK reference remains recorded and further cold imports for that Workstream are refused pending operator recovery.
 
+Changed or compacted history cannot create a sibling native conversation in the same authenticated Factory scope while a retained checkpoint is unresolved. The caller must continue the exact lineage or complete its operator restoration. A different Factory session retains its independent admission path. A same-generation cancellation received while orderly host shutdown is awaiting proof remains terminal, including cancellation through the owning launch.
+
 ## Upgrade an existing installation
 
 Merge the reviewed source into the checkout recorded in the desktop installation, then run these commands from that checkout:

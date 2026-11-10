@@ -65,6 +65,44 @@ describe("live permission requests", () => {
 });
 
 describe("authentic Factory lifecycle", () => {
+  it.each(["notification", "launch"])("latches %s cancellation while an orderly checkpoint proof is pending", async route => {
+    let finish!: (value: boolean) => void;
+    const verify = vi.fn(() => new Promise<boolean>(resolve => { finish = resolve; }));
+    const f = fixture({ restoreRetainedCheckpoint: verify });
+    vi.mocked(f.runtime.endHostSession!).mockResolvedValue({ resumable: false });
+    const launchId = f.broker.createLaunch({ cwd: f.dir }).launchId;
+    const start = await f.broker.hostEvent({ eventId: randomUUID(), event: f.event("SessionStart"), launchId });
+    const token = start.bindingToken as string, id = f.session(); f.calls.delete(id); f.broker.bind(token, id);
+    f.store.update(id, { state: "IDLE", pendingToolIds: [], sdkSessionId: "retained", retainedCheckpoint: {
+      sdkSessionId: "retained", account: "team5", checkpointSha256: "0".repeat(64), sourceGeneration: 4,
+      preparedAt: "2026-11-10T11:00:00Z", origin: "clean-upstream" } });
+    const ending = f.send("SessionEnd", token);
+    await vi.waitFor(() => expect(verify).toHaveBeenCalled());
+    const cancellation = route === "notification"
+      ? f.send("Notification", token, { notification_type: "cancelled" })
+      : f.broker.endLaunch(launchId, true);
+    await vi.waitFor(() => expect(f.store.require(id).cancelRequested).toBe(true));
+    finish(true);
+    await Promise.all([ending, cancellation]);
+    expect(f.store.require(id)).toMatchObject({ state: "CANCELLED", cancelRequested: true, hostEnded: "interrupted", cancellation: { source: "host" } });
+    expect(f.runtime.cancel).toHaveBeenCalledExactlyOnceWith(id, "factory-cancelled");
+  });
+
+  it("keeps a stale generation's cancellation away from its replacement", async () => {
+    const f = fixture();
+    const oldLaunch = f.broker.createLaunch({ cwd: f.dir }).launchId;
+    const old = await f.broker.hostEvent({ eventId: randomUUID(), event: f.event("SessionStart"), launchId: oldLaunch });
+    await f.send("SessionEnd", old.bindingToken as string);
+    const newLaunch = f.broker.createLaunch({ cwd: f.dir }).launchId;
+    const next = await f.broker.hostEvent({ eventId: randomUUID(), event: f.event("SessionStart"), launchId: newLaunch });
+    const id = f.session(); f.calls.delete(id); f.broker.bind(next.bindingToken as string, id);
+    f.store.update(id, { state: "IDLE", pendingToolIds: [] });
+    await expect(f.send("Notification", old.bindingToken as string, { notification_type: "cancelled" })).rejects.toMatchObject({ code: "stale_host_event" });
+    await f.broker.endLaunch(oldLaunch, true);
+    expect(f.store.require(id)).toMatchObject({ state: "IDLE", cancelRequested: false });
+    expect(f.runtime.cancel).not.toHaveBeenCalled();
+  });
+
   it("preserves a proved retained checkpoint when its native object was already disposed", async () => {
     const verify = vi.fn(async () => true), f = fixture({ restoreRetainedCheckpoint: verify });
     vi.mocked(f.runtime.endHostSession!).mockResolvedValue({ resumable: false });

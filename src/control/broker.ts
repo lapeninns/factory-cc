@@ -17,6 +17,8 @@ interface HostBinding {
   ended: boolean;
   drained?: boolean;
   ending?: Promise<void>;
+  cancelRequested?: boolean;
+  cancellation?: Promise<unknown[]>;
   terminalResults: Map<string, { toolUseId: string; input: unknown; response: unknown; isError: boolean }>;
   launchId?: string;
   permissionMode?: string;
@@ -328,8 +330,9 @@ export class ControlBroker implements RuntimeControl {
     if (!host) host = this.restoreIdleDesktopBinding(event, cwd, token, launchId);
     if (!host) throw new BridgeError(409, "host_not_registered", "SessionStart must register the Factory session first.");
     if (token !== host.token) throw new BridgeError(409, "stale_host_event", "Factory event is missing its live session generation or belongs to a prior one.");
+    const cancelled = event.hook_event_name === "Notification" && (event.notification_type === "cancelled" || event.notification_type === "session_cancelled");
     if (host.ended) {
-      if (!host.drained) await this.endHost(host, false, "Factory SessionEnd retry");
+      if (!host.drained) await this.endHost(host, cancelled, "Factory SessionEnd retry");
       return { ok: true, alreadyEnded: true };
     }
     this.observeNativeWorkstream(host, event);
@@ -379,7 +382,6 @@ export class ControlBroker implements RuntimeControl {
     }
 
     // idle_prompt also means ordinary idle. It does not authorize cancellation.
-    const cancelled = event.hook_event_name === "Notification" && (event.notification_type === "cancelled" || event.notification_type === "session_cancelled");
     if (event.hook_event_name === "SessionEnd" || cancelled) {
       await this.endHost(host, cancelled, `Factory SessionEnd: ${String(event.reason ?? "other")}`);
       return { ok: true, ended: true, sessions: host.bridgeSessions.size };
@@ -475,8 +477,11 @@ export class ControlBroker implements RuntimeControl {
   }
 
   private async endHost(host: HostBinding, cancelled: boolean, reason: string): Promise<void> {
-    if (host.ending) return host.ending;
     if (host.drained) return;
+    // Latch a same-generation cancellation before joining a normal drain.
+    // A drained old generation cannot cancel its later replacement.
+    if (cancelled) this.cancelHost(host);
+    if (host.ending) return host.ending;
     host.ended = true;
     const ending = (async () => {
       const errors: unknown[] = [];
@@ -490,20 +495,20 @@ export class ControlBroker implements RuntimeControl {
         // Persist replay prohibition before awaiting any live callback cleanup.
         if (this.store.get(sessionId)) {
           this.store.update(sessionId, { hostEnded: "interrupted", pendingHostRecovery: undefined,
-            ...(cancelled ? { cancelRequested: true, cancellation: { at: new Date().toISOString(), source: "host" as const } } : {}) });
-          if (cancelled) this.store.setState(sessionId, "CANCELLED");
+            ...(host.cancelRequested ? { cancelRequested: true, cancellation: { at: new Date().toISOString(), source: "host" as const } } : {}) });
+          if (host.cancelRequested) this.store.setState(sessionId, "CANCELLED");
         }
         const fenced = JSON.stringify(this.store.get(sessionId));
         try {
-          if (!cancelled && terminal && call && !terminal.isError && this.runtime.completeHostTool) {
+          if (!host.cancelRequested && terminal && call && !terminal.isError && this.runtime.completeHostTool) {
             await this.runtime.completeHostTool(sessionId, { ...call, content: typeof terminal.response === "string" ? terminal.response : JSON.stringify(terminal.response), terminal: true });
             disposition = "terminal";
-          } else if (cancelled) await this.runtime.cancel(sessionId, "factory-cancelled");
+          } else if (host.cancelRequested) await host.cancellation;
           else {
             const result = await this.runtime.endHostSession?.(sessionId, reason);
             disposition = result?.resumable ? "resumable" : "interrupted";
             sdkSessionId = result?.sdkSessionId;
-            if (!result?.resumable && previous?.state === "IDLE" && previous.retainedCheckpoint && previous.sdkSessionId
+            if (!host.cancelRequested && !result?.resumable && previous?.state === "IDLE" && previous.retainedCheckpoint && previous.sdkSessionId
                 && !previous.cancelRequested && previous.hostEnded === undefined && !previous.pendingToolIds.length
                 && !previous.endedToolIds?.length && !previous.hostCompletionReceipts?.length
                 && this.options.restoreRetainedCheckpoint && await this.options.restoreRetainedCheckpoint(previous)
@@ -519,18 +524,34 @@ export class ControlBroker implements RuntimeControl {
         }
         const session = this.store.get(sessionId);
         if (session) {
-          if (session.cancelRequested || session.state === "CANCELLED") { disposition = "interrupted"; sdkSessionId = undefined; }
-          this.store.update(sessionId, { pendingToolIds: [], hostEnded: disposition, ...(sdkSessionId ? { sdkSessionId } : {}), notes: [...session.notes, cancelled ? "factory-cancelled" : "factory-session-ended"] });
+          if (host.cancelRequested || session.cancelRequested || session.state === "CANCELLED") { disposition = "interrupted"; sdkSessionId = undefined; }
+          this.store.update(sessionId, { pendingToolIds: [], hostEnded: disposition, ...(sdkSessionId ? { sdkSessionId } : {}), notes: [...session.notes, host.cancelRequested ? "factory-cancelled" : "factory-session-ended"] });
           // A normal exec exit can be resumed later with the same official native checkpoint.
           if (session.state !== "FAILED" && session.state !== "CANCELLED") this.store.setState(sessionId, "IDLE");
         }
       }
+      if (host.cancellation) errors.push(...await host.cancellation);
       host.drained = true;
       host.terminalResults.clear();
       if (errors.length) throw new AggregateError(errors, "Factory session cleanup reported failures");
     })();
     host.ending = ending;
     try { await ending; } catch (error) { host.ending = undefined; throw error; }
+  }
+
+  private cancelHost(host: HostBinding): void {
+    if (host.cancelRequested) return;
+    host.cancelRequested = true;
+    const ids = [...host.bridgeSessions];
+    for (const id of ids) {
+      this.cancelApprovals(id);
+      if (this.store.get(id)) this.store.update(id, { state: "CANCELLED", cancelRequested: true, hostEnded: "interrupted",
+        pendingHostRecovery: undefined, cancellation: { at: new Date().toISOString(), source: "host" } });
+    }
+    host.cancellation = Promise.all(ids.map(async id => {
+      try { await this.runtime.cancel(id, "factory-cancelled"); return undefined; }
+      catch (error) { return error; }
+    })).then(errors => errors.filter(error => error !== undefined));
   }
 
   close(): void {

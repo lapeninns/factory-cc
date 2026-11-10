@@ -581,6 +581,16 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       // Droid desktop has no conversation ID header or hooks to disambiguate.
       continueIdenticalTranscripts: config.desktopProfile,
     });
+    if (config.controllerPool && factorySession) {
+      const retainedLineages = store.list().filter(session => session.factorySessionId === factorySession.sessionId
+        && session.factoryCwd === factorySession.cwd
+        && (session.retainedCheckpoint || session.retryableRequestKind === "native-upstream"
+          || session.retryableRequestKind === "upstream" && !session.sdkSessionId && session.historyMessageHashes?.length));
+      if (retainedLineages.some(session => session.bridgeSessionId !== resolved.match?.bridgeSessionId)) {
+        throw new BridgeError(409, "native_checkpoint_selection_required", "This Factory session has an unresolved retained checkpoint. Continue its exact native lineage or restore it before starting another request.",
+          { checkpoint_retained: true, retry_mode: "existing_checkpoint" });
+      }
+    }
     if (config.controllerPool && resolved.match?.retryableRequestKind === "upstream" && !resolved.match.sdkSessionId
         && resolved.match.historyMessageHashes?.length) {
       throw new BridgeError(409, "native_checkpoint_restoration_required", "This established Workstream needs its retained checkpoint restored before retry. A cold import was refused.");

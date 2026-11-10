@@ -8,6 +8,7 @@ import type { BridgeRuntime, RuntimeRequest } from "../../src/runtime/types.js";
 import { BridgeError } from "../../src/types.js";
 import { continuation, firstTurn, hostStart, restartConfig } from "../helpers/native-restart.js";
 import { postMessages } from "../helpers/server.js";
+import { COMPACTION_SUMMARY } from "../../src/workspace.js";
 
 const roots: string[] = [], apps: BridgeApp[] = [];
 afterEach(async () => {
@@ -47,6 +48,38 @@ async function fixture() {
 }
 
 describe("established native upstream retry", () => {
+  it.each(["legacy", "retained", "cooling"])("fences the same Factory scope's %s checkpoint when changed history no longer correlates", async kind => {
+    const f = await fixture();
+    if (kind === "legacy") f.app.store.update(f.record.bridgeSessionId, { sdkSessionId: undefined, retryableRequestKind: "upstream", retryableRequestHash: "1".repeat(64) });
+    else {
+      f.runtime.handle.mockRejectedValueOnce(new BridgeError(kind === "cooling" ? 429 : 529,
+        kind === "cooling" ? "rate_limit_error" : "overloaded_error", "limit", { retry_from_history: true, retry_after: 120 }));
+      await postMessages(f.app.url, "client", f.next);
+    }
+    const calls = f.runtime.handle.mock.calls.length, before = f.app.store.list().length;
+    const cooldowns = structuredClone(f.record.accountCooldowns);
+    for (const messages of [
+      [{ role: "user", content: `[factory-cc-session:${f.token}] Different history` }],
+      [{ role: "user", content: `${COMPACTION_SUMMARY}\nA compacted transcript without the prior tail.` },
+        { role: "assistant", content: "Compacted." }, { role: "user", content: `[factory-cc-session:${f.token}] Continue` }],
+    ]) {
+      const reply = await postMessages(f.app.url, "client", { model: "opus", max_tokens: 20, messages });
+      expect(reply.status).toBe(409);
+      expect(reply.json.error).toMatchObject({ type: "native_checkpoint_selection_required" });
+      expect(f.app.store.list()).toHaveLength(before);
+      expect(f.runtime.handle).toHaveBeenCalledTimes(calls);
+      expect(f.record.accountCooldowns).toEqual(cooldowns);
+    }
+    const otherId = randomUUID();
+    const response = await fetch(`${f.app.url}/internal/host-events`, { method: "POST", headers: { authorization: "Bearer hook", "content-type": "application/json" },
+      body: JSON.stringify({ eventId: randomUUID(), desktopLifecycle: true, event: { hook_event_name: "SessionStart", session_id: otherId,
+        cwd: join(f.root, "workspace"), bridgeNativeWorkstream: { role: "agent", workstreamId: randomUUID() } } }) });
+    const other = await response.json() as { bindingToken: string };
+    expect(response.status).toBe(200);
+    expect((await postMessages(f.app.url, "client", firstTurn(other.bindingToken))).status).toBe(200);
+    expect(f.app.store.list()).toHaveLength(before + 1);
+  });
+
   it("refuses a legacy established retry whose SDK reference needs operator restoration", async () => {
     const f = await fixture();
     f.app.store.update(f.record.bridgeSessionId, { sdkSessionId: undefined, retryableRequestKind: "upstream", retryableRequestHash: "1".repeat(64) });
