@@ -8,6 +8,7 @@ import type { BridgeRuntime, RuntimeRequest } from "../../src/runtime/types.js";
 import { BridgeError } from "../../src/types.js";
 import { continuation, firstTurn, hostStart, restartConfig } from "../helpers/native-restart.js";
 import { postMessages } from "../helpers/server.js";
+import { hostResultDigest, mcpResultContent } from "../../src/runtime/host-recovery.js";
 import { COMPACTION_SUMMARY } from "../../src/workspace.js";
 
 const roots: string[] = [], apps: BridgeApp[] = [];
@@ -97,13 +98,71 @@ describe("established native upstream retry", () => {
     f.app.store.recordHostCompletion(f.record.bridgeSessionId, receipt);
     writeFileSync(f.file, [
       { sessionId: f.sdkSessionId, message: { role: "assistant", content: [{ type: "tool_use", id: receipt.toolUseId, name: "mcp__droid__Read", input: receipt.input }] } },
-      { sessionId: f.sdkSessionId, message: { role: "user", content: [{ type: "tool_result", tool_use_id: receipt.toolUseId, content: receipt.content }] } },
+      { sessionId: f.sdkSessionId, message: { role: "user", content: [{ type: "tool_result", tool_use_id: receipt.toolUseId, content: mcpResultContent(receipt.content) }] } },
     ].map(row => JSON.stringify(row)).join("\n") + "\n");
     f.runtime.handle.mockRejectedValueOnce(new BridgeError(529, "overloaded_error", "limit", { retry_from_history: true }));
     const failed = await postMessages(f.app.url, "client", f.next, { "x-bridge-session": f.record.bridgeSessionId });
     expect(failed.status).toBe(529);
     expect(f.record).toMatchObject({ sdkSessionId: f.sdkSessionId, pendingToolIds: [], hostCompletionReceipts: [],
       retainedCheckpoint: { settledToolIds: [receipt.toolUseId] } });
+  });
+
+  it("carries proven consumed results through consecutive quota failures", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(new Date("2026-11-10T10:00:00Z"));
+    const f = await fixture();
+    const receipt = { toolUseId: "settled-twice", toolName: "Script", input: { script: "read fixture" }, content: "done" };
+    f.app.store.update(f.record.bridgeSessionId, { state: "WAITING_DROID_TOOL", pendingToolIds: [receipt.toolUseId] });
+    f.app.store.recordHostCompletion(f.record.bridgeSessionId, receipt);
+    writeFileSync(f.file, [
+      { sessionId: f.sdkSessionId, message: { role: "assistant", content: [{ type: "tool_use", id: receipt.toolUseId, name: "mcp__droid__Script", input: receipt.input }] } },
+      { sessionId: f.sdkSessionId, message: { role: "user", content: [{ type: "tool_result", tool_use_id: receipt.toolUseId, content: mcpResultContent(receipt.content) }] } },
+    ].map(row => JSON.stringify(row)).join("\n") + "\n");
+    for (let attempt = 0; attempt < 2; attempt++) {
+      f.runtime.handle.mockRejectedValueOnce(new BridgeError(429, "rate_limit_error", "limit", { retry_from_history: true, retry_after: 60 }));
+      const response = await postMessages(f.app.url, "client", f.next, { "x-bridge-session": f.record.bridgeSessionId });
+      expect(response.status).toBe(429);
+      expect(f.record.retainedCheckpoint?.settledToolResults).toEqual([{ toolUseId: receipt.toolUseId, resultSha256: hostResultDigest(receipt.content, false) }]);
+      expect(f.record.hostCompletionReceipts).toEqual([]);
+      expect(f.record.nativeGeneration).toBe(attempt + 1);
+      vi.setSystemTime(new Date(`2026-11-10T10:0${attempt + 1}:30Z`));
+    }
+    expect((await postMessages(f.app.url, "client", f.next)).status).toBe(200);
+    expect(f.record.retainedCheckpoint).toBeUndefined();
+  });
+
+  it("derives missing legacy result hashes from the unchanged retained checkpoint", async () => {
+    const f = await fixture();
+    const result = { toolUseId: "legacy-settled", content: "done" };
+    writeFileSync(f.file, [
+      { sessionId: f.sdkSessionId, message: { role: "assistant", content: [{ type: "tool_use", id: result.toolUseId, name: "mcp__droid__Script", input: {} }] } },
+      { sessionId: f.sdkSessionId, message: { role: "user", content: [{ type: "tool_result", tool_use_id: result.toolUseId, content: mcpResultContent(result.content) }] } },
+    ].map(row => JSON.stringify(row)).join("\n") + "\n");
+    f.runtime.handle.mockRejectedValueOnce(new BridgeError(529, "overloaded_error", "limit", { retry_from_history: true }));
+    await postMessages(f.app.url, "client", f.next);
+    f.record.retainedCheckpoint!.settledToolIds = [result.toolUseId];
+    delete f.record.retainedCheckpoint!.settledToolResults;
+    const calls = f.runtime.handle.mock.calls.length;
+    f.runtime.handle.mockImplementationOnce(async input => {
+      expect(input.session.retainedCheckpoint?.settledToolResults).toEqual([{ toolUseId: result.toolUseId, resultSha256: hostResultDigest(result.content, false) }]);
+      return { response: { id: randomUUID(), type: "message", role: "assistant", model: "opus", content: [{ type: "text", text: "Continued" }],
+        stop_reason: "end_turn", stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } }, pendingToolIds: [], sdkSessionId: f.sdkSessionId };
+    });
+    expect((await postMessages(f.app.url, "client", f.next)).status).toBe(200);
+    expect(f.runtime.handle).toHaveBeenCalledTimes(calls + 1);
+  });
+
+  it("preserves a paired failed host result during ordinary checkpoint retry", async () => {
+    const f = await fixture();
+    const receipt = { toolUseId: "failed-host", toolName: "Script", input: {}, content: "command failed", isError: true };
+    f.app.store.update(f.record.bridgeSessionId, { state: "WAITING_DROID_TOOL", pendingToolIds: [receipt.toolUseId] });
+    f.app.store.recordHostCompletion(f.record.bridgeSessionId, receipt);
+    writeFileSync(f.file, [
+      { sessionId: f.sdkSessionId, message: { role: "assistant", content: [{ type: "tool_use", id: receipt.toolUseId, name: "mcp__droid__Script", input: {} }] } },
+      { sessionId: f.sdkSessionId, message: { role: "user", content: [{ type: "tool_result", tool_use_id: receipt.toolUseId, content: mcpResultContent(receipt.content), is_error: true }] } },
+    ].map(row => JSON.stringify(row)).join("\n") + "\n");
+    f.runtime.handle.mockRejectedValueOnce(new BridgeError(529, "overloaded_error", "limit", { retry_from_history: true }));
+    expect((await postMessages(f.app.url, "client", f.next)).status).toBe(529);
+    expect(f.record.retainedCheckpoint?.settledToolResults).toEqual([{ toolUseId: receipt.toolUseId, resultSha256: hostResultDigest(receipt.content, true) }]);
   });
 
   it.each([429, 529])("retains checkpoint and account after %s, then resumes without cold import", async status => {

@@ -1,3 +1,4 @@
+import { inspectRetiredSibling } from "./dormant-checkpoint-retirement.js";
 import type { DesktopWorkspacePolicy, NativeGenerationEvidence, NativeGenerationInspection, SubscriptionProfile } from "../runtime/desktop-jobs.js";
 import type { BridgeRuntime } from "../runtime/types.js";
 import { isEnded, type SessionRecord } from "../sessions/state.js";
@@ -23,6 +24,7 @@ export interface NativeCheckpointRecoveryContext {
   busy(sessionId: string): boolean;
   inspect(request: NativeGenerationInspection): Promise<NativeGenerationEvidence[]>;
   now?: () => Date;
+  retiredCheckpoint?(record: SessionRecord): string;
 }
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
@@ -66,7 +68,7 @@ export async function recoverNativeCheckpoint(context: NativeCheckpointRecoveryC
     bridgeSessionId: `${request.bridgeSessionId}:g${request.nativeGeneration}`, cwd: record.factoryCwd!,
     subscriptionProfile: record.claudeAccount as SubscriptionProfile, workspacePolicy: context.workspacePolicy, sdkSessionId: request.sdkSessionId });
   const leaseEndedAt = verifyLineage(evidence, request.nativeGeneration, failedAt);
-  await inspectRecoverySiblings(context, request.factorySessionId, siblings);
+  await inspectRecoverySiblings(context, request.factorySessionId, siblings, request.bridgeSessionId);
   // Inspection is asynchronous. A concurrent recovery or write may have won.
   const repeated = priorRecovery(context.store, request);
   if (repeated) return repeated;
@@ -88,8 +90,12 @@ export async function recoverNativeCheckpoint(context: NativeCheckpointRecoveryC
   return { ok: true, recovered: true, bridgeSessionId: request.bridgeSessionId, nativeGeneration: nextGeneration };
 }
 
-export async function inspectRecoverySiblings(context: NativeCheckpointRecoveryContext, factorySessionId: string, siblings: SessionRecord[]): Promise<void> {
+export async function inspectRecoverySiblings(context: NativeCheckpointRecoveryContext, factorySessionId: string, siblings: SessionRecord[], targetBridgeSessionId?: string): Promise<void> {
   for (const sibling of siblings) {
+    if (sibling.dormantCheckpointRetirement) {
+      await inspectRetiredSibling(context, sibling, targetBridgeSessionId);
+      continue;
+    }
     const generation = sibling.nativeGeneration;
     if (!sibling.factoryCwd || !sibling.claudeAccount || !context.accounts.includes(sibling.claudeAccount)
         || sibling.provider === "cursor" || typeof generation !== "number" || !Number.isSafeInteger(generation)
@@ -140,21 +146,24 @@ function eligibleRecord(context: NativeCheckpointRecoveryContext, request: Nativ
 }
 
 export function verifyRecoverySessionInactive(context: NativeCheckpointRecoveryContext, record: SessionRecord): void {
-  const { runtime, store } = context;
   const id = record.bridgeSessionId;
-  const active = (sessionId: string): boolean => context.busy(sessionId) || runtime.ownsNativeSession?.(sessionId) === true
-    || runtime.isSessionUsable?.(sessionId) === true || Boolean(runtime.protectedSessionIds?.().includes(sessionId))
-    || Boolean(runtime.pendingHostCalls?.(sessionId).length);
-  if (active(id)) refuse("session_active");
-  for (const sibling of store.list()) {
+  if (recoverySessionActive(context, id)) refuse("session_active");
+  for (const sibling of context.store.list()) {
     if (sibling.bridgeSessionId === id || sibling.factorySessionId !== record.factorySessionId) continue;
-    if (active(sibling.bridgeSessionId)) refuse("sibling_active");
+    if (recoverySessionActive(context, sibling.bridgeSessionId)) refuse("sibling_active");
     // A completed turn elsewhere is either live work or newer than this
     // checkpoint. Reviving the older checkpoint would fork the conversation.
     if (sibling.historyMessageHashes?.length && (!isEnded(sibling) || Date.parse(sibling.createdAt) > Date.parse(record.createdAt))) {
       refuse("later_work_exists");
     }
   }
+}
+
+export function recoverySessionActive(context: NativeCheckpointRecoveryContext, sessionId: string): boolean {
+  const runtime = context.runtime;
+  return context.busy(sessionId) || runtime.ownsNativeSession?.(sessionId) === true
+    || runtime.isSessionUsable?.(sessionId) === true || Boolean(runtime.protectedSessionIds?.().includes(sessionId))
+    || Boolean(runtime.pendingHostCalls?.(sessionId).length);
 }
 
 function verifyLineage(evidence: NativeGenerationEvidence[], generation: number, failedAt: string): string {

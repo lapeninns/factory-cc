@@ -33,7 +33,7 @@ An established supervised subscription session keeps its SDK checkpoint and assi
 
 Observed account cooldowns are minimum wait times. They are retained in session records, restored from those records and owned controller logs after restart, and excluded from session pruning while unexpired. An elapsed deadline permits another provider attempt. It does not establish remaining allowance or successful inference.
 
-For a legacy clean upstream-retry record whose SDK field was already cleared, `restore-upstream-checkpoint` requires matching durable failure and cooling events, a previously reconciled checkpoint identity, the exact current record version, complete native tool pairing, and a settled predecessor lease. The current generation must be unused. Explicit cancellation, unresolved work and newer conflicting evidence refuse restoration.
+For a legacy clean upstream-retry record whose SDK field was already cleared, `restore-upstream-checkpoint` requires matching durable failure and cooling events, the exact current record version, complete native tool pairing, and a settled predecessor lease with the same SDK identity. The current generation must be unused. Explicit cancellation, unresolved work and newer conflicting evidence refuse restoration. Residual successful nonterminal host receipts are accepted only when their exact tool IDs, names, inputs and complete serialized results match the native checkpoint. The same atomic recovery record archives those full receipts and retires their consumed queue entries.
 
 Prepare a private request file using the actual record identities and a new operation ID.
 
@@ -53,7 +53,37 @@ Prepare a private request file using the actual record identities and a new oper
 npm run control -- restore-upstream-checkpoint --input /absolute/private/restore.json --dry-run
 ```
 
-Add the returned `checkpointSha256` and `evidenceSha256` to that request file, then repeat the command without `--dry-run`. The operator supplies neither an account transfer nor a shorter cooldown. The bridge derives and preserves the greatest observed account deadline. Preserve the still-open Factory session until restoration is applied when its older runtime cannot preserve an SDK-absent record on host end.
+Add the returned `checkpointSha256`, `evidenceSha256` and `receiptsSha256` to that request file, then repeat the command without `--dry-run`. The operator supplies neither an account transfer nor a shorter cooldown. The bridge derives and preserves the greatest observed account deadline. Preserve the still-open Factory session until restoration is applied when its older runtime cannot preserve an SDK-absent record on host end.
+
+On a fresh warm continuation, only exact previously settled tool IDs and result payloads may be omitted from the resent tool results. The proof retains these identities across repeated quota failures. Changed payloads and unrelated tool results are refused. Native history stays intact. Arbitrary extra native result blocks are refused during consumed-receipt restoration.
+
+### Explicit retirement of an unused predecessor
+
+An older idle checkpoint can block recovery even when its current generation never acquired a lease. After explicit operator approval, `retire-dormant-checkpoint` can permanently end that exact old record for one intended recovery target. It requires the old Factory, bridge, SDK, account, workspace, generation and record version, plus the target bridge identity and current version. Set `confirmNonResumable` to `true` in the private input file.
+
+```json
+{
+  "operationId": "operator-selected-retirement-id",
+  "bridgeSessionId": "sess_old",
+  "factorySessionId": "factory-session-id",
+  "sdkSessionId": "11111111-2222-4333-8444-555555555555",
+  "account": "team5",
+  "factoryCwd": "/absolute/verified/workspace",
+  "nativeGeneration": 1,
+  "expectedUpdatedAt": "2026-11-10T10:30:58.305Z",
+  "targetBridgeSessionId": "sess_target",
+  "targetExpectedUpdatedAt": "2026-11-10T11:47:01.835Z",
+  "confirmNonResumable": true
+}
+```
+
+```sh
+npm run control -- retire-dormant-checkpoint --input /absolute/private/retirement.json --dry-run
+```
+
+The dry run requires an unused current generation, an exact terminal predecessor lease with verified cleanup and stopped owners, complete native tool pairing and an unchanged checkpoint. Runtime work, callbacks, approvals, receipts, state changes and newer leases cause refusal. Add the returned `checkpointSha256` and `evidenceSha256` before applying the same command without `--dry-run`.
+
+The atomic record preserves the full original state and proof, retains its generation, SDK, history and cooldown, and marks the old session terminal and non-resumable. Recovery of the intended target revalidates that audit against the current native file and complete lease lineage. Ordinary cancellation and old timestamps alone provide insufficient evidence for the unused-generation exception.
 
 A purpose-built retained-checkpoint proof permits an orderly host end after the in-memory SDK object has been retired. The bridge rechecks identity, file hash and settled leases before recording a resumable host end. A generic idle record receives no such exemption. If checkpoint retry preparation cannot be verified, the original SDK reference remains recorded and further cold imports for that Workstream are refused pending operator recovery.
 

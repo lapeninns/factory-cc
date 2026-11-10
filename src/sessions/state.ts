@@ -1,3 +1,4 @@
+import type { NativeGenerationEvidence } from "../runtime/desktop-jobs.js";
 import type { ModelProvider } from "../models.js";
 import type { RoleTag, SessionState } from "../types.js";
 import type { RuntimeHostCompletion } from "../runtime/types.js";
@@ -19,6 +20,7 @@ export interface SessionRecord {
   /** Retained identity exists, but a failed preparation has no safe resume proof. */
   checkpointRetryBlocked?: boolean;
   upstreamCheckpointRecoveries?: UpstreamCheckpointRecovery[];
+  dormantCheckpointRetirement?: DormantCheckpointRetirement;
   /** Authenticated host receipts retained until an admitted turn consumes them. */
   hostCompletionReceipts?: RuntimeHostCompletion[];
   /** Runtime that owns sdkSessionId. Absent on Claude sessions created before Cursor coexisted. */
@@ -93,6 +95,11 @@ export interface CompletedHostRecovery {
   reconciledAt?: string;
 }
 
+export interface SettledToolResult {
+  toolUseId: string;
+  resultSha256: string;
+}
+
 export interface RetainedCheckpoint {
   sdkSessionId: string;
   account: string;
@@ -102,6 +109,7 @@ export interface RetainedCheckpoint {
   coolingUntil?: string;
   origin: "clean-upstream" | "operator-restored";
   settledToolIds?: string[];
+  settledToolResults?: SettledToolResult[];
 }
 
 export interface UpstreamCheckpointRecovery {
@@ -111,7 +119,8 @@ export interface UpstreamCheckpointRecovery {
   nativeGeneration: number;
   proof: RetainedCheckpoint;
   evidenceSha256: string;
-  before: { sdkSessionId?: string; retryableRequestKind?: SessionRecord["retryableRequestKind"]; retryableRequestHash?: string; accountCooldowns?: Record<string, string> };
+  receiptsSha256?: string;
+  before: { sdkSessionId?: string; retryableRequestKind?: SessionRecord["retryableRequestKind"]; retryableRequestHash?: string; accountCooldowns?: Record<string, string>; hostCompletionReceipts?: RuntimeHostCompletion[] };
 }
 
 /** A session in this condition can never resume or complete another tool round trip. */
@@ -148,4 +157,16 @@ export function transition(record: SessionRecord, next: SessionState): SessionRe
   record.state = next;
   record.updatedAt = new Date().toISOString();
   return retirePendingTools(record);
+}
+
+export interface DormantCheckpointRetirement {
+  operationId: string;
+  at: string;
+  before: Omit<SessionRecord, "dormantCheckpointRetirement">;
+  targetBridgeSessionId: string;
+  targetCreatedAt: string;
+  targetRecordUpdatedAt: string;
+  checkpointSha256: string;
+  evidenceSha256: string;
+  evidence: NativeGenerationEvidence[];
 }

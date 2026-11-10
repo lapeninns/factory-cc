@@ -33,7 +33,7 @@ import { OwnedProcesses } from "./owned-processes.js";
 import { hostActionNeedsWorkspaceReservation } from "./desktop-jobs.js";
 import { upstreamError } from "./upstream-error.js";
 import { redactValue } from "../security/redact.js";
-import { historicalHostResult, hostReceiptContent, RECOVERY_ONLY_DENIAL, recoveredHostContext } from "./host-recovery.js";
+import { historicalHostResult, hostReceiptContent, hostResultDigest, mcpResultContent as mcpContent, RECOVERY_ONLY_DENIAL, recoveredHostContext } from "./host-recovery.js";
 
 type ModelRoute = ReturnType<typeof resolveRequestModel>;
 
@@ -482,7 +482,11 @@ export class SdkRuntime implements BridgeRuntime {
       const earlier = live.pending.size ? collectToolResults(input.request.messages
         .slice(0, input.request.messages.length - trailing.length).filter((message) => message.role === "user"))
         .filter((result) => live.pending.has(result.tool_use_id)) : [];
-      let results = [...earlier, ...latestToolResults(input, live.active || live.pending.size > 0)];
+      const retained = input.session.retainedCheckpoint;
+      const retainedResume = Boolean(retained && input.session.retryableRequestKind === "native-upstream"
+        && retained.sdkSessionId === input.session.sdkSessionId && retained.account === input.session.claudeAccount
+        && live.sdkSessionId === retained.sdkSessionId && !live.query && !live.active && !live.pending.size && !live.sentUserTurns);
+      let results = [...earlier, ...latestToolResults(input, live.active || live.pending.size > 0 || retainedResume)];
       const recovery = input.session.pendingHostRecovery;
       const recovered = recovery && input.session.completedHostRecoveries?.find(item => item.operationId === recovery.operationId);
       if (recovery && !recovered) throw new BridgeError(409, "recovery_receipt_missing", "The recovered host actions are unavailable; do not replay them.");
@@ -490,6 +494,18 @@ export class SdkRuntime implements BridgeRuntime {
         live.recoveryReceipts = structuredClone(recovered.receipts);
         const settled = new Set(recovered.receipts.map(receipt => receipt.toolUseId));
         results = results.filter(result => !settled.has(result.tool_use_id));
+      }
+      if (retainedResume && retained?.settledToolResults?.length) {
+        results = results.filter(result => {
+          const settled = retained.settledToolResults!.find(item => item.toolUseId === result.tool_use_id);
+          if (!settled) return true;
+          // Hooks persist array output as an exact JSON scalar. Accept that
+          // representation only when its complete serialized payload matches.
+          const matches = hostResultDigest(result.content, Boolean(result.is_error)) === settled.resultSha256
+            || Array.isArray(result.content) && hostResultDigest(JSON.stringify(result.content), Boolean(result.is_error)) === settled.resultSha256;
+          if (!matches) throw new BridgeError(409, "conflicting_settled_result", "A previously consumed tool result changed.");
+          return false;
+        });
       }
       // Hook receipts are authenticated independently of a model continuation.
       // Their representation may differ from Droid's display wrapper. Deliver
@@ -2108,20 +2124,6 @@ function recoveryActionDenied(live: LiveSdk, name: string | undefined, input: un
   if (!live.recoveryReceipts) return false;
   const original = name?.startsWith("mcp__droid__") ? live.names?.toOriginal(name.slice("mcp__droid__".length)) : undefined;
   return !original || !live.recoveryReceipts.some(receipt => receipt.toolName === original && canonicalJson(receipt.input) === canonicalJson(input));
-}
-
-function mcpContent(content: string | ContentBlock[]): Record<string, unknown>[] {
-  if (typeof content === "string") return [{ type: "text", text: content }];
-  return content.map((block) => {
-    if (block.type === "text") return { type: "text", text: block.text };
-    if (block.type === "image") {
-      const source = (block as { source?: unknown }).source as { type?: string; data?: string; media_type?: string; url?: string };
-      if (source?.type === "base64") return { type: "image", data: source.data, mimeType: source.media_type };
-      if (source?.type === "url") return { type: "resource_link", uri: source.url, name: "Droid image" };
-    }
-    if (["resource", "resource_link", "audio"].includes(block.type)) return { ...block };
-    throw new BridgeError(422, "unsupported_tool_result_content", `Cannot preserve tool result block ${block.type} in MCP`);
-  });
 }
 
 function queryPolicy(input: RuntimeRequest, config: BridgeConfig): string {

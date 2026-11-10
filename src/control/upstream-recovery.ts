@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, realpathSync } from "node:fs";
 import { join } from "node:path";
+import { receiptDigest, type ConsumedCheckpoint } from "./completed-host-recovery.js";
+import type { RuntimeHostCompletion } from "../runtime/types.js";
 import type { NativeGenerationEvidence, SubscriptionProfile } from "../runtime/desktop-jobs.js";
 import type { RetainedCheckpoint, SessionRecord, UpstreamCheckpointRecovery } from "../sessions/state.js";
 import { BridgeError, type Json } from "../types.js";
@@ -10,6 +12,7 @@ interface LogEvent { at: string; event: string; data: Record<string, unknown> }
 export interface UpstreamFailureEvidence { sha256: string; failedAt: string; coolingUntil: string }
 export interface UpstreamRecoveryContext extends NativeCheckpointRecoveryContext {
   checkpoint(record: SessionRecord): string;
+  consumedCheckpoint(record: SessionRecord, receipts: RuntimeHostCompletion[]): ConsumedCheckpoint;
   evidence(record: SessionRecord, sdkSessionId: string, sourceGeneration: number): UpstreamFailureEvidence;
   restoreCooldown(account: string, until: string): void;
 }
@@ -23,11 +26,12 @@ interface RecoveryRequest {
   expectedUpdatedAt: string;
   checkpointSha256?: string;
   evidenceSha256?: string;
+  receiptsSha256?: string;
   dryRun: boolean;
 }
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 const HASH = /^[a-f0-9]{64}$/;
-const FIELDS = ["operationId", "bridgeSessionId", "factorySessionId", "account", "sdkSessionId", "nativeGeneration", "expectedUpdatedAt", "checkpointSha256", "evidenceSha256", "dryRun"];
+const FIELDS = ["operationId", "bridgeSessionId", "factorySessionId", "account", "sdkSessionId", "nativeGeneration", "expectedUpdatedAt", "checkpointSha256", "evidenceSha256", "receiptsSha256", "dryRun"];
 
 function parseRequest(input: unknown): RecoveryRequest {
   const invalid = (): never => { throw new BridgeError(400, "invalid_control_request", "Explicit upstream checkpoint recovery identity and record version are required. Apply also requires both evidence hashes."); };
@@ -43,6 +47,7 @@ function parseRequest(input: unknown): RecoveryRequest {
   for (const key of ["checkpointSha256", "evidenceSha256"]) {
     if ((body[key] !== undefined || body.dryRun !== true) && (typeof body[key] !== "string" || !HASH.test(body[key] as string))) return invalid();
   }
+  if (body.receiptsSha256 !== undefined && (typeof body.receiptsSha256 !== "string" || !HASH.test(body.receiptsSha256))) return invalid();
   return { ...body, dryRun: body.dryRun === true } as unknown as RecoveryRequest;
 }
 
@@ -56,13 +61,18 @@ export async function restoreUpstreamCheckpoint(context: UpstreamRecoveryContext
   const sourceGeneration = request.nativeGeneration - 1;
   const evidence = context.evidence(record, request.sdkSessionId, sourceGeneration);
   const checkpointRecord = { ...record, sdkSessionId: request.sdkSessionId };
-  const checkpointSha256 = context.checkpoint(checkpointRecord);
+  const receipts = structuredClone(record.hostCompletionReceipts ?? []);
+  const receiptsSha256 = receiptDigest(receipts);
+  if (request.receiptsSha256 !== undefined && request.receiptsSha256 !== receiptsSha256) refuse("receipt_digest_mismatch");
+  if (!request.dryRun && receipts.length && !request.receiptsSha256) refuse("receipt_digest_required");
+  const consumed = context.consumedCheckpoint(checkpointRecord, receipts);
+  const checkpointSha256 = consumed.checkpointSha256;
   if (request.checkpointSha256 !== undefined && request.checkpointSha256 !== checkpointSha256) refuse("checkpoint_digest_mismatch");
   if (request.evidenceSha256 !== undefined && request.evidenceSha256 !== evidence.sha256) refuse("upstream_evidence_changed");
   const leases = await context.inspect({ factorySessionId: request.factorySessionId, bridgeSessionId: `${request.bridgeSessionId}:g${sourceGeneration}`,
     cwd: record.factoryCwd!, subscriptionProfile: request.account as SubscriptionProfile, workspacePolicy: context.workspacePolicy, sdkSessionId: request.sdkSessionId });
   verifySettledSource(leases, sourceGeneration, true, evidence.failedAt, request.expectedUpdatedAt);
-  await inspectRecoverySiblings(context, request.factorySessionId, related.filter(item => item.bridgeSessionId !== request.bridgeSessionId));
+  await inspectRecoverySiblings(context, request.factorySessionId, related.filter(item => item.bridgeSessionId !== request.bridgeSessionId), request.bridgeSessionId);
   const checkedAgain = await context.inspect({ factorySessionId: request.factorySessionId, bridgeSessionId: `${request.bridgeSessionId}:g${sourceGeneration}`,
     cwd: record.factoryCwd!, subscriptionProfile: request.account as SubscriptionProfile, workspacePolicy: context.workspacePolicy, sdkSessionId: request.sdkSessionId });
   if (JSON.stringify(checkedAgain) !== JSON.stringify(leases)) refuse("lease_changed_during_recovery");
@@ -70,18 +80,20 @@ export async function restoreUpstreamCheckpoint(context: UpstreamRecoveryContext
   if (repeated) return repeated;
   const current = eligibleRecord(context, request);
   if (JSON.stringify(relatedRecoveryRecords(context.store, request.factorySessionId)) !== snapshot
-      || context.checkpoint({ ...current, sdkSessionId: request.sdkSessionId }) !== checkpointSha256
-      || context.evidence(current, request.sdkSessionId, sourceGeneration).sha256 !== evidence.sha256) refuse("changed_during_recovery");
+      || context.evidence(current, request.sdkSessionId, sourceGeneration).sha256 !== evidence.sha256
+      || JSON.stringify(context.consumedCheckpoint({ ...current, sdkSessionId: request.sdkSessionId }, current.hostCompletionReceipts ?? [])) !== JSON.stringify(consumed)) refuse("changed_during_recovery");
   if (request.dryRun) return { ok: true, eligible: true, recovered: false, operationId: request.operationId, bridgeSessionId: request.bridgeSessionId,
-    nativeGeneration: request.nativeGeneration, checkpointSha256, evidenceSha256: evidence.sha256, coolingUntil: evidence.coolingUntil };
+    nativeGeneration: request.nativeGeneration, checkpointSha256, evidenceSha256: evidence.sha256, receiptsSha256, receiptCount: receipts.length, coolingUntil: evidence.coolingUntil };
   const at = (context.now?.() ?? new Date()).toISOString();
   const proof: RetainedCheckpoint = { sdkSessionId: request.sdkSessionId, account: request.account, checkpointSha256,
-    sourceGeneration, preparedAt: at, coolingUntil: evidence.coolingUntil, origin: "operator-restored" };
+    sourceGeneration, preparedAt: at, coolingUntil: evidence.coolingUntil, origin: "operator-restored",
+    settledToolIds: consumed.settledToolResults.map(result => result.toolUseId), settledToolResults: consumed.settledToolResults };
   const audit: UpstreamCheckpointRecovery = { operationId: request.operationId, at, recordUpdatedAt: request.expectedUpdatedAt,
-    nativeGeneration: request.nativeGeneration, proof, evidenceSha256: evidence.sha256,
+    nativeGeneration: request.nativeGeneration, proof, evidenceSha256: evidence.sha256, receiptsSha256,
     before: { sdkSessionId: current.sdkSessionId, retryableRequestKind: current.retryableRequestKind,
-      retryableRequestHash: current.retryableRequestHash, accountCooldowns: current.accountCooldowns ? structuredClone(current.accountCooldowns) : undefined } };
-  context.store.update(request.bridgeSessionId, { sdkSessionId: request.sdkSessionId, retryableRequestKind: "native-upstream", retainedCheckpoint: proof, checkpointRetryBlocked: undefined,
+      retryableRequestHash: current.retryableRequestHash, accountCooldowns: current.accountCooldowns ? structuredClone(current.accountCooldowns) : undefined, hostCompletionReceipts: receipts } };
+  if (Buffer.byteLength(JSON.stringify([...(current.upstreamCheckpointRecoveries ?? []), audit])) > 16 * 1024 * 1024) refuse("recovery_audit_full");
+  context.store.updateAtomic(request.bridgeSessionId, { hostCompletionReceipts: [], sdkSessionId: request.sdkSessionId, retryableRequestKind: "native-upstream", retainedCheckpoint: proof, checkpointRetryBlocked: undefined,
     accountCooldowns: extendCooldowns(current.accountCooldowns, request.account, evidence.coolingUntil),
     upstreamCheckpointRecoveries: [...(current.upstreamCheckpointRecoveries ?? []), audit],
     notes: [...current.notes, `upstream-checkpoint-restored:${request.operationId}`] });
@@ -97,7 +109,8 @@ function priorRecovery(context: UpstreamRecoveryContext, request: RecoveryReques
   if (record.factorySessionId !== request.factorySessionId || record.claudeAccount !== request.account || audit.proof.sdkSessionId !== request.sdkSessionId
       || audit.recordUpdatedAt !== request.expectedUpdatedAt || audit.nativeGeneration !== request.nativeGeneration
       || request.checkpointSha256 !== undefined && request.checkpointSha256 !== audit.proof.checkpointSha256
-      || request.evidenceSha256 !== undefined && request.evidenceSha256 !== audit.evidenceSha256) refuse("operation_identity_mismatch");
+      || request.evidenceSha256 !== undefined && request.evidenceSha256 !== audit.evidenceSha256
+      || request.receiptsSha256 !== undefined && request.receiptsSha256 !== audit.receiptsSha256) refuse("operation_identity_mismatch");
   if (record.sdkSessionId !== request.sdkSessionId || record.cancelRequested || record.state === "FAILED" || record.state === "CANCELLED"
       || record.hostEnded === "terminal" || record.hostEnded === "interrupted") refuse("recovery_no_longer_active");
   return { ok: true, alreadyRecovered: true, recovered: false, operationId: request.operationId,
@@ -114,10 +127,11 @@ function eligibleRecord(context: UpstreamRecoveryContext, request: RecoveryReque
   if (record.state !== "IDLE" || record.sdkSessionId !== undefined || record.retryableRequestKind !== "upstream"
       || !record.retryableRequestHash || !HASH.test(record.retryableRequestHash)) refuse("not_clean_upstream_retry");
   if (record.cancelRequested || record.cancellation || record.hostEnded !== undefined || record.pendingToolIds.length
-      || record.endedToolIds?.length || record.hostCompletionReceipts?.length || record.pendingHostRecovery) refuse("unresolved_or_ended_session");
+      || record.endedToolIds?.length || record.pendingHostRecovery) refuse("unresolved_or_ended_session");
   if (!record.factoryCwd || record.provider === "cursor" || !record.historyMessageHashes?.length) refuse("checkpoint_identity_unproven");
-  if (!record.completedHostRecoveries?.some(item => item.sdkSessionId === request.sdkSessionId && item.reconciledAt)) refuse("checkpoint_audit_missing");
-  if ((record.upstreamCheckpointRecoveries?.length ?? 0) >= 32) refuse("recovery_audit_full");
+  if ((record.hostCompletionReceipts?.length ?? 0) > 128
+      || (record.upstreamCheckpointRecoveries?.length ?? 0) >= 32
+      || Buffer.byteLength(JSON.stringify([record.upstreamCheckpointRecoveries ?? [], record.hostCompletionReceipts ?? []])) > 16 * 1024 * 1024) refuse("recovery_audit_full");
   if (context.store.list().some(other => other.bridgeSessionId !== record.bridgeSessionId && other.sdkSessionId === request.sdkSessionId)) refuse("duplicate_checkpoint_lineage");
   verifyRecoverySessionInactive(context, record);
   return record;
@@ -143,7 +157,7 @@ export async function verifyRetainedHostCheckpoint(context: UpstreamRecoveryCont
     subscriptionProfile: proof.account as SubscriptionProfile, workspacePolicy: context.workspacePolicy, sdkSessionId: proof.sdkSessionId });
   verifySettledSource(leases, proof.sourceGeneration, false, undefined, proof.preparedAt);
   await inspectRecoverySiblings(context, record.factorySessionId,
-    relatedRecoveryRecords(context.store, record.factorySessionId).filter(item => item.bridgeSessionId !== record.bridgeSessionId).map(item => structuredClone(item)));
+    relatedRecoveryRecords(context.store, record.factorySessionId).filter(item => item.bridgeSessionId !== record.bridgeSessionId).map(item => structuredClone(item)), record.bridgeSessionId);
   const checkedAgain = await context.inspect({ factorySessionId: record.factorySessionId,
     bridgeSessionId: `${record.bridgeSessionId}:g${proof.sourceGeneration}`, cwd: record.factoryCwd,
     subscriptionProfile: proof.account as SubscriptionProfile, workspacePolicy: context.workspacePolicy, sdkSessionId: proof.sdkSessionId });

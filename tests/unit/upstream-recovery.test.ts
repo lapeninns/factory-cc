@@ -3,10 +3,11 @@ import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmS
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { inspectCompletedHostCheckpoint } from "../../src/control/completed-host-recovery.js";
+import { inspectConsumedHostCheckpoint, inspectCompletedHostCheckpoint, receiptDigest } from "../../src/control/completed-host-recovery.js";
 import { persistedCooldowns, readUpstreamFailureEvidence, restoreUpstreamCheckpoint, verifyRetainedHostCheckpoint, type UpstreamRecoveryContext } from "../../src/control/upstream-recovery.js";
 import { DesktopJobsRuntime, type NativeGenerationEvidence } from "../../src/runtime/desktop-jobs.js";
-import type { BridgeRuntime } from "../../src/runtime/types.js";
+import { hostResultDigest, mcpResultContent } from "../../src/runtime/host-recovery.js";
+import type { BridgeRuntime, RuntimeHostCompletion } from "../../src/runtime/types.js";
 import type { SessionRecord } from "../../src/sessions/state.js";
 import { SessionStore } from "../../src/sessions/store.js";
 import { createBridgeApp, listen, type BridgeApp } from "../../src/http/app.js";
@@ -50,12 +51,13 @@ function fixture(patch: Partial<SessionRecord> = {}) {
   const runtime: BridgeRuntime = { kind: "fake", handle: vi.fn(), cancel: vi.fn(), deliverResults: vi.fn() };
   const context: UpstreamRecoveryContext = { store, runtime, accounts: ["team5"], workspacePolicy: "factory-native", busy: () => false,
     inspect: vi.fn(async () => [lease]), checkpoint: row => inspectCompletedHostCheckpoint([account], row, []),
+    consumedCheckpoint: (row, receipts) => inspectConsumedHostCheckpoint([account], row, receipts),
     evidence: (row, sdk, generation) => readUpstreamFailureEvidence(logDir, row, sdk, generation, store.list()),
     restoreCooldown: vi.fn(), now: () => new Date("2026-11-10T12:00:00Z") };
   const body = { operationId: randomUUID(), bridgeSessionId: record.bridgeSessionId, factorySessionId, account: "team5", sdkSessionId,
     nativeGeneration: 5, expectedUpdatedAt: updatedAt, checkpointSha256: createHash("sha256").update(readFileSync(file)).digest("hex"),
     evidenceSha256: context.evidence(record, sdkSessionId, 4).sha256 };
-  return { root, record, store, context, body, lease, file, logFile, logDir, failure, cooling };
+  return { root, record, store, context, body, lease, file, logFile, logDir, failure, cooling, account };
 }
 
 async function reason(promise: Promise<unknown>): Promise<string> {
@@ -64,8 +66,100 @@ async function reason(promise: Promise<unknown>): Promise<string> {
 }
 
 describe("operator restoration after a clean upstream retry", () => {
-  it("exposes guarded dry-run and apply through the administrator HTTP route", async () => {
-    const f = fixture(), base = restartConfig(f.root);
+  function consumedFixture() {
+    const f = fixture({ completedHostRecoveries: [], nativeGeneration: 1 });
+    f.body.nativeGeneration = 1;
+    f.lease.generation = 0;
+    f.failure.data.nativeGeneration = 0;
+    writeFileSync(f.logFile, [f.failure, f.cooling].map(row => JSON.stringify(row)).join("\n") + "\n");
+    const factoryContent = [{ type: "text" as const, text: "Script result" }, { type: "text" as const, text: "owned document read" }];
+    const receipt: RuntimeHostCompletion = { toolUseId: "consumed-script", toolName: "Script", input: { script: "read fixture" },
+      content: JSON.stringify(factoryContent), isError: false, terminal: false };
+    f.record.hostCompletionReceipts = [receipt];
+    const nativeResult = { type: "tool_result", tool_use_id: receipt.toolUseId, content: mcpResultContent(receipt.content), is_error: false };
+    const rows = [
+      { sessionId: f.body.sdkSessionId, message: { role: "assistant", content: [{ type: "tool_use", id: receipt.toolUseId, name: "mcp__droid__Script", input: receipt.input }] } },
+      { sessionId: f.body.sdkSessionId, message: { role: "user", content: [nativeResult] } },
+    ];
+    writeFileSync(f.file, rows.map(row => JSON.stringify(row)).join("\n") + "\n");
+    f.body.checkpointSha256 = createHash("sha256").update(readFileSync(f.file)).digest("hex");
+    f.body.evidenceSha256 = f.context.evidence(f.record, f.body.sdkSessionId, 0).sha256;
+    return { ...f, receipt, rows, nativeResult, factoryContent, apply: { ...f.body, receiptsSha256: receiptDigest([receipt]) } };
+  }
+
+  it("restores a source-lease-proven checkpoint without a historical cancellation audit", async () => {
+    const f = fixture({ completedHostRecoveries: [] });
+    expect(await restoreUpstreamCheckpoint(f.context, f.body)).toMatchObject({ recovered: true });
+    expect(f.record.completedHostRecoveries).toEqual([]);
+  });
+
+  it("archives exact successful consumed receipts and restores the WS5-shaped g1 checkpoint", async () => {
+    const f = consumedFixture(), before = structuredClone(f.record), bytes = readFileSync(f.file);
+    const dry = await restoreUpstreamCheckpoint(f.context, { ...f.body, dryRun: true });
+    expect(dry).toMatchObject({ eligible: true, receiptCount: 1, receiptsSha256: f.apply.receiptsSha256 });
+    expect(f.record).toEqual(before);
+    expect(await reason(restoreUpstreamCheckpoint(f.context, f.body))).toBe("receipt_digest_required");
+    expect(await restoreUpstreamCheckpoint(f.context, f.apply)).toMatchObject({ recovered: true, nativeGeneration: 1 });
+    expect(f.record.hostCompletionReceipts).toEqual([]);
+    expect(f.record.pendingHostRecovery).toBeUndefined();
+    expect(f.record.completedHostRecoveries).toEqual([]);
+    expect(f.record.upstreamCheckpointRecoveries?.[0]).toMatchObject({ receiptsSha256: f.apply.receiptsSha256,
+      before: { hostCompletionReceipts: [f.receipt] } });
+    expect(f.record.retainedCheckpoint?.settledToolResults).toEqual([{ toolUseId: f.receipt.toolUseId,
+      resultSha256: hostResultDigest(f.receipt.content, false) }]);
+    expect(readFileSync(f.file)).toEqual(bytes);
+    expect(await restoreUpstreamCheckpoint(f.context, f.apply)).toMatchObject({ alreadyRecovered: true });
+    expect(await reason(restoreUpstreamCheckpoint(f.context, { ...f.apply, receiptsSha256: "0".repeat(64) }))).toBe("operation_identity_mismatch");
+  });
+
+  it.each(["input", "name", "result", "extra-block", "error", "terminal", "duplicate", "missing-result", "unowned-result", "digest"])(
+    "refuses %s consumed receipt evidence without retiring any queue entry", async kind => {
+      const f = consumedFixture();
+      if (kind === "input") f.receipt.input = { script: "different" };
+      if (kind === "name") f.receipt.toolName = "Write";
+      if (kind === "result") f.receipt.content = "changed";
+      if (kind === "extra-block") f.nativeResult.content.push({ type: "text", text: "unproven trailer" });
+      if (kind === "error") f.receipt.isError = true;
+      if (kind === "terminal") f.receipt.terminal = true;
+      if (kind === "duplicate") f.record.hostCompletionReceipts!.push(structuredClone(f.receipt));
+      if (kind === "missing-result") f.rows.pop();
+      if (kind === "unowned-result") f.nativeResult.tool_use_id = "other-id";
+      writeFileSync(f.file, f.rows.map(row => JSON.stringify(row)).join("\n") + "\n");
+      const before = structuredClone(f.record);
+      const result = await reason(restoreUpstreamCheckpoint(f.context, { ...f.body, checkpointSha256: undefined,
+        evidenceSha256: undefined, dryRun: true, ...(kind === "digest" ? { receiptsSha256: "0".repeat(64) } : {}) }));
+      expect(result).not.toBe("accepted");
+      expect(f.record).toEqual(before);
+    });
+
+  it("refuses consumed receipt or explicit cancellation changes during lease inspection", async () => {
+    for (const change of ["receipt", "cancel"] as const) {
+      const f = consumedFixture();
+      f.context.inspect = async () => {
+        if (change === "receipt") f.record.hostCompletionReceipts![0]!.content = "changed while inspecting";
+        else f.record.cancelRequested = true;
+        return [f.lease];
+      };
+      expect(await reason(restoreUpstreamCheckpoint(f.context, f.apply))).not.toBe("accepted");
+      expect(f.record.sdkSessionId).toBeUndefined();
+      expect(f.record.hostCompletionReceipts).toHaveLength(1);
+    }
+  });
+
+  it("rolls back a mutate-then-flush failure and permits a complete retry", async () => {
+    const f = consumedFixture(), before = structuredClone(f.record);
+    const persistence = f.store as unknown as { flush(record: SessionRecord): void };
+    vi.spyOn(persistence, "flush").mockImplementationOnce(() => { throw new Error("synthetic flush failure after mutation"); });
+    await expect(restoreUpstreamCheckpoint(f.context, f.apply)).rejects.toThrow("synthetic flush");
+    expect(f.record).toEqual(before);
+    expect(f.context.restoreCooldown).not.toHaveBeenCalled();
+    expect(await restoreUpstreamCheckpoint(f.context, f.apply)).toMatchObject({ recovered: true });
+    expect(f.record.upstreamCheckpointRecoveries).toHaveLength(1);
+    expect(f.record.upstreamCheckpointRecoveries![0]!.before.hostCompletionReceipts).toEqual([f.receipt]);
+  });
+
+  it.each(["empty", "consumed"])("exposes guarded %s-receipt dry-run and apply through the administrator HTTP route", async kind => {
+    const f = kind === "consumed" ? consumedFixture() : fixture(), base = restartConfig(f.root);
     vi.spyOn(DesktopJobsRuntime.prototype, "inspectNativeGenerations").mockResolvedValue([f.lease]);
     const config = { ...base, logDir: f.logDir, subscriptionAccounts: base.subscriptionAccounts!.map(account => ({ ...account,
       env: { ...account.env, CLAUDE_CONFIG_DIR: join(f.root, "account") } })) };
@@ -82,8 +176,8 @@ describe("operator restoration after a clean upstream retry", () => {
     const response = await post(body, "admin"), dry = await response.json() as Record<string, unknown>;
     expect({ status: response.status, ...dry }).toMatchObject({ status: 200, eligible: true, coolingUntil });
     expect(record.sdkSessionId).toBeUndefined();
-    const applied = await post({ ...body, dryRun: false, checkpointSha256: dry.checkpointSha256, evidenceSha256: dry.evidenceSha256 }, "admin");
-    expect(await applied.json()).toMatchObject({ recovered: true, nativeGeneration: 5 });
+    const applied = await post({ ...body, dryRun: false, checkpointSha256: dry.checkpointSha256, evidenceSha256: dry.evidenceSha256, receiptsSha256: dry.receiptsSha256 }, "admin");
+    expect(await applied.json()).toMatchObject({ recovered: true, nativeGeneration: f.body.nativeGeneration });
     expect(record.sdkSessionId).toBe(f.body.sdkSessionId);
   });
 
@@ -110,7 +204,6 @@ describe("operator restoration after a clean upstream retry", () => {
     [{ endedToolIds: ["unresolved"] }, "unresolved_or_ended_session"],
     [{ sdkSessionId: "already-restored" }, "not_clean_upstream_retry"],
     [{ retryableRequestKind: "admission" }, "not_clean_upstream_retry"],
-    [{ completedHostRecoveries: [] }, "checkpoint_audit_missing"],
   ] as Array<[Partial<SessionRecord>, string]>)("refuses unsupported record %j", async (patch, expected) => {
     const f = fixture(patch), before = structuredClone(f.record);
     expect(await reason(restoreUpstreamCheckpoint(f.context, f.body))).toBe(expected);
@@ -120,7 +213,7 @@ describe("operator restoration after a clean upstream retry", () => {
   it("rejects changed identity, current generation and expected version", async () => {
     const f = fixture();
     for (const [patch, expected] of [
-      [{ account: "team1" }, "account_mismatch"], [{ sdkSessionId: randomUUID() }, "checkpoint_audit_missing"],
+      [{ account: "team1" }, "account_mismatch"], [{ sdkSessionId: randomUUID() }, "upstream_failure_unproven"],
       [{ nativeGeneration: 6 }, "generation_mismatch"], [{ expectedUpdatedAt: "2000-01-01T00:00:00Z" }, "record_changed"],
       [{ checkpointSha256: "0".repeat(64) }, "checkpoint_digest_mismatch"], [{ evidenceSha256: "0".repeat(64) }, "upstream_evidence_changed"],
     ] as Array<[Record<string, unknown>, string]>) expect(await reason(restoreUpstreamCheckpoint(f.context, { ...f.body, ...patch }))).toBe(expected);

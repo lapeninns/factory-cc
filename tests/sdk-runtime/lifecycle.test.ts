@@ -9,6 +9,7 @@ import type { RuntimeApprovalRequest, RuntimePermissionDecision, RuntimeRequest 
 import type { SessionRecord } from "../../src/sessions/state.js";
 import type { ContentBlock, Message } from "../../src/types.js";
 import { BridgeError } from "../../src/types.js";
+import { hostResultDigest } from "../../src/runtime/host-recovery.js";
 import { historyMessageHashes } from "../../src/sessions/correlate.js";
 
 const runtimes: SdkRuntime[] = [];
@@ -108,6 +109,75 @@ describe("official SDK streaming-input lifecycle (injected offline SDK)", () => 
     expect(sdk.calls).toHaveLength(2);
     expect(sdk.calls[1]!.options.resume).toBe(s.sdkSessionId);
     expect(JSON.stringify(sdk.inputs.at(-1))).not.toContain("Imported conversation history");
+  });
+
+  it.each(["scalar", "factory-array"])("filters only proven consumed %s results on a fresh native retry, including repeated quota failures", async form => {
+    const sdk = new FakeSdk(async function* (_input, index) {
+      if (index < 2) throw new BridgeError(429, "rate_limit_error", "synthetic quota");
+      yield success("continued without replay");
+    });
+    const { runtime } = create(sdk);
+    const factoryOutput = [{ type: "text" as const, text: "read result" }, { type: "text" as const, text: "file content" }];
+    const receiptContent = form === "scalar" ? "read result" : JSON.stringify(factoryOutput);
+    const inputContent = form === "scalar" ? receiptContent : factoryOutput;
+    const s = session({ state: "IDLE", sdkSessionId: "native-sdk-session", claudeAccount: "personal", nativeGeneration: 1,
+      retryableRequestKind: "native-upstream", retainedCheckpoint: { sdkSessionId: "native-sdk-session", account: "personal", sourceGeneration: 0,
+        checkpointSha256: "1".repeat(64), preparedAt: "2026-11-10T12:00:00Z", origin: "operator-restored", settledToolIds: ["consumed"],
+        settledToolResults: [{ toolUseId: "consumed", resultSha256: hostResultDigest(receiptContent, false) }] } });
+    const content: ContentBlock[] = [{ type: "tool_result", tool_use_id: "consumed", content: inputContent, is_error: false },
+      { type: "text", text: "Continue after quota reset" }];
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await expect(runtime.handle(request(s, content))).rejects.toMatchObject({ status: 429, extra: { retry_from_history: true } });
+      await runtime.prepareCheckpointRetry(s.bridgeSessionId, s.sdkSessionId!);
+      s.nativeGeneration!++;
+    }
+    const turn = await runtime.handle(request(s, content));
+    expect(turn.response.content).toContainEqual({ type: "text", text: "continued without replay" });
+    expect(sdk.calls).toHaveLength(3);
+    expect(sdk.calls.every(call => call.options.resume === "native-sdk-session")).toBe(true);
+    expect(sdk.inputs.every(input => !input.message.content.some(block => block.type === "tool_result"))).toBe(true);
+  });
+
+  it("rejects an unrelated result in an earlier trailing user message before warm resume", async () => {
+    const sdk = new FakeSdk(async function* () { yield success("unexpected"); });
+    const { runtime } = create(sdk);
+    const s = session({ sdkSessionId: "native-sdk-session", claudeAccount: "personal", retryableRequestKind: "native-upstream",
+      retainedCheckpoint: { sdkSessionId: "native-sdk-session", account: "personal", sourceGeneration: 0, checkpointSha256: "1".repeat(64),
+        preparedAt: "2026-11-10T12:00:00Z", origin: "operator-restored", settledToolResults: [{ toolUseId: "consumed", resultSha256: hostResultDigest("done", false) }] } });
+    await expect(runtime.handle(request(s, "Continue", { messages: [
+      user([{ type: "tool_result", tool_use_id: "unrelated", content: "done" }]), user("Continue"),
+    ] }))).rejects.toMatchObject({ code: "unknown_tool_use_id" });
+    expect(sdk.calls).toHaveLength(0);
+  });
+
+  it("delivers a live callback result normally despite a retained historical proof", async () => {
+    let completed: unknown;
+    const sdk = new FakeSdk(async function* (_input, _index, fake) {
+      yield { type: "assistant", message: { content: [{ type: "tool_use", id: "consumed", name: "mcp__droid__TaskOutput", input: {} }] } };
+      completed = await fake.handlers.get("TaskOutput")!({}, {});
+      yield success("live call completed");
+    });
+    const { runtime } = create(sdk);
+    const s = session({ sdkSessionId: "native-sdk-session", claudeAccount: "personal", retryableRequestKind: "native-upstream",
+      retainedCheckpoint: { sdkSessionId: "native-sdk-session", account: "personal", sourceGeneration: 0, checkpointSha256: "1".repeat(64),
+        preparedAt: "2026-11-10T12:00:00Z", origin: "operator-restored", settledToolResults: [{ toolUseId: "consumed", resultSha256: hostResultDigest("done", false) }] } });
+    const first = await runtime.handle(request(s, "Start a fresh call", { tools: [tool] }));
+    expect(first.pendingToolIds).toEqual(["consumed"]);
+    const next = await runtime.handle(request(s, [{ type: "tool_result", tool_use_id: "consumed", content: "done" }], { tools: [tool] }));
+    expect(next.response.content).toContainEqual({ type: "text", text: "live call completed" });
+    expect(completed).toEqual({ content: [{ type: "text", text: "done" }], isError: false });
+  });
+
+  it.each(["changed", "unrelated", "error"])("refuses %s trailing results despite a retained checkpoint", async kind => {
+    const sdk = new FakeSdk(async function* () { yield success("unexpected"); });
+    const { runtime } = create(sdk);
+    const s = session({ state: "IDLE", sdkSessionId: "native-sdk-session", claudeAccount: "personal", retryableRequestKind: "native-upstream",
+      retainedCheckpoint: { sdkSessionId: "native-sdk-session", account: "personal", sourceGeneration: 0, checkpointSha256: "1".repeat(64),
+        preparedAt: "2026-11-10T12:00:00Z", origin: "operator-restored", settledToolResults: [{ toolUseId: "consumed", resultSha256: hostResultDigest("read result", false) }] } });
+    const content: ContentBlock[] = [{ type: "tool_result", tool_use_id: kind === "unrelated" ? "other" : "consumed",
+      content: kind === "changed" ? "altered result" : "read result", is_error: kind === "error" }, { type: "text", text: "Continue" }];
+    await expect(runtime.handle(request(s, content))).rejects.toMatchObject({ code: kind === "unrelated" ? "unknown_tool_use_id" : "conflicting_settled_result" });
+    expect(sdk.calls).toHaveLength(0);
   });
 
   it("reconciles a completed recovery action without host replay, then permits a later intentional identical call", async () => {

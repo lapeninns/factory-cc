@@ -31,6 +31,7 @@ describe("local approval CLI", () => {
   it.each([
     ["recover-completed-host", "/internal/completed-host-recovery"],
     ["restore-upstream-checkpoint", "/internal/upstream-checkpoint-recovery"],
+    ["retire-dormant-checkpoint", "/internal/dormant-checkpoint-retirement"],
   ])("sends an explicit %s file with a read-only dry-run override", async (command, path) => {
     const received: unknown[] = [];
     const url = await localServer(async (req, res) => {

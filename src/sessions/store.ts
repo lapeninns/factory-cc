@@ -101,6 +101,18 @@ export class SessionStore {
     return record;
   }
 
+  /** Keep the published record consistent when an atomic recovery append fails. */
+  updateAtomic(id: string, patch: Partial<SessionRecord>): SessionRecord {
+    const record = this.require(id);
+    const before = structuredClone(record);
+    try { return this.update(id, patch); }
+    catch (error) {
+      for (const key of Object.keys(record)) delete (record as unknown as Record<string, unknown>)[key];
+      Object.assign(record, before);
+      throw error;
+    }
+  }
+
   /** Persist a host receipt independently of admission to the next model turn. */
   recordHostCompletion(id: string, completion: RuntimeHostCompletion): "accepted" | "duplicate" {
     const record = this.require(id);

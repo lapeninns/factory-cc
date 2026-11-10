@@ -1,4 +1,5 @@
-import type { ContentBlock } from "../types.js";
+import { createHash } from "node:crypto";
+import { BridgeError, type ContentBlock } from "../types.js";
 import type { RuntimeHostCompletion } from "./types.js";
 
 export const MAX_RECOVERY_CONTEXT_BYTES = 64 * 1024;
@@ -24,4 +25,33 @@ export function historicalHostResult(receipt: RuntimeHostCompletion): ContentBlo
   const content = hostReceiptContent(receipt.content);
   return [{ type: "text", text: `Historical successful receipt for ${receipt.toolUseId}. This action already completed before the connection was lost. It was not executed again.` },
     ...(typeof content === "string" ? [{ type: "text", text: content }] : content)];
+}
+
+export function mcpResultContent(content: string | ContentBlock[]): Record<string, unknown>[] {
+  if (typeof content === "string") return [{ type: "text", text: content }];
+  return content.map((block) => {
+    if (block.type === "text") return { type: "text", text: block.text };
+    if (block.type === "image") {
+      const source = (block as { source?: unknown }).source as { type?: string; data?: string; media_type?: string; url?: string };
+      if (source?.type === "base64") return { type: "image", data: source.data, mimeType: source.media_type };
+      if (source?.type === "url") return { type: "resource_link", uri: source.url, name: "Droid image" };
+    }
+    if (["resource", "resource_link", "audio"].includes(block.type)) return { ...block };
+    throw new BridgeError(422, "unsupported_tool_result_content", `Cannot preserve tool result block ${block.type} in MCP`);
+  });
+}
+
+/** Digest the exact MCP result payload, retaining block order and every value. */
+export function nativeResultDigest(content: unknown, isError: boolean): string {
+  return createHash("sha256").update(canonical({ content, isError })).digest("hex");
+}
+
+export function hostResultDigest(content: string | ContentBlock[], isError: boolean): string {
+  return nativeResultDigest(mcpResultContent(hostReceiptContent(content)), isError);
+}
+
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (value !== null && typeof value === "object") return `{${Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`).join(",")}}`;
+  return JSON.stringify(value) ?? "undefined";
 }

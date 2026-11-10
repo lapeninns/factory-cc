@@ -5,9 +5,9 @@ import type { SubscriptionAccount } from "../config.js";
 import type { NativeGenerationEvidence, SubscriptionProfile } from "../runtime/desktop-jobs.js";
 import { StableDroidToolNames } from "../runtime/droid-mcp-catalog.js";
 import type { RuntimeHostCompletion } from "../runtime/types.js";
-import { MAX_RECOVERY_CONTEXT_BYTES, recoveredHostContext } from "../runtime/host-recovery.js";
+import { MAX_RECOVERY_CONTEXT_BYTES, hostReceiptContent, mcpResultContent, nativeResultDigest, recoveredHostContext } from "../runtime/host-recovery.js";
 import { sameToolInput } from "../sessions/compaction.js";
-import type { CompletedHostRecovery, SessionRecord } from "../sessions/state.js";
+import type { CompletedHostRecovery, SessionRecord, SettledToolResult } from "../sessions/state.js";
 import { BridgeError, type Json } from "../types.js";
 import { inspectRecoverySiblings, relatedRecoveryRecords, verifyRecoverySessionInactive, type NativeCheckpointRecoveryContext } from "./native-recovery.js";
 
@@ -68,7 +68,7 @@ export async function recoverCompletedHostCheckpoint(context: CompletedHostRecov
     bridgeSessionId: `${request.bridgeSessionId}:g${request.nativeGeneration}`, cwd: record.factoryCwd!,
     subscriptionProfile: record.claudeAccount as SubscriptionProfile, workspacePolicy: context.workspacePolicy, sdkSessionId: request.sdkSessionId });
   const leaseEndedAt = verifyCancelledLineage(evidence, request.nativeGeneration);
-  await inspectRecoverySiblings(context, request.factorySessionId, related.filter(item => item.bridgeSessionId !== request.bridgeSessionId));
+  await inspectRecoverySiblings(context, request.factorySessionId, related.filter(item => item.bridgeSessionId !== request.bridgeSessionId), request.bridgeSessionId);
   const repeated = priorRecovery(context, request);
   if (repeated) return repeated;
   const current = eligibleRecord(context, request);
@@ -161,6 +161,39 @@ export function receiptDigest(receipts: RuntimeHostCompletion[]): string {
 /** Read only the exact configured account/project/checkpoint, with no path input from the operator. */
 export function inspectCompletedHostCheckpoint(accounts: readonly SubscriptionAccount[], record: SessionRecord, receipts: RuntimeHostCompletion[],
   expectedSettledToolIds: readonly string[] = []): string {
+  return readCheckpoint(accounts, record, text => verifyCheckpointActions(text, record.sdkSessionId!, receipts, expectedSettledToolIds));
+}
+
+export interface ConsumedCheckpoint {
+  checkpointSha256: string;
+  settledToolResults: SettledToolResult[];
+}
+
+/** Successful host results already present in the native history need no replay. */
+export function inspectConsumedHostCheckpoint(accounts: readonly SubscriptionAccount[], record: SessionRecord,
+  receipts: RuntimeHostCompletion[], expectedSettledToolIds: readonly string[] = []): ConsumedCheckpoint {
+  let settledToolResults: SettledToolResult[] = [];
+  const checkpointSha256 = readCheckpoint(accounts, record, text => {
+    const { calls, results } = checkpointActions(text, record.sdkSessionId!);
+    const ids = [...new Set([...expectedSettledToolIds, ...receipts.map(receipt => receipt.toolUseId)])];
+    if (ids.length > 128 || ids.some(id => !calls.has(id) || !results.has(id))) refuse("checkpoint_completion_missing");
+    if (new Set(receipts.map(receipt => receipt.toolUseId)).size !== receipts.length) refuse("receipt_set_incomplete");
+    const names = new StableDroidToolNames();
+    for (const receipt of receipts) {
+      const call = calls.get(receipt.toolUseId), result = results.get(receipt.toolUseId);
+      if (receipt.isError || receipt.terminal || !receipt.toolName || receipt.input === undefined) refuse("receipt_not_successful");
+      if (!call || call.name !== `mcp__droid__${names.toMcp(receipt.toolName)}` || !sameToolInput(call.input, receipt.input)) refuse("checkpoint_action_mismatch");
+      if (!result || result.isError || !sameToolInput(result.content, mcpResultContent(hostReceiptContent(receipt.content)))) refuse("checkpoint_result_mismatch");
+    }
+    settledToolResults = ids.map(toolUseId => {
+      const result = results.get(toolUseId)!;
+      return { toolUseId, resultSha256: nativeResultDigest(result.content, result.isError) };
+    });
+  });
+  return { checkpointSha256, settledToolResults };
+}
+
+function readCheckpoint(accounts: readonly SubscriptionAccount[], record: SessionRecord, inspect: (text: string) => void): string {
   const account = accounts.find(item => item.profile === record.claudeAccount);
   const root = account?.env.CLAUDE_CONFIG_DIR;
   if (!root || !isAbsolute(root) || !record.factoryCwd || !record.sdkSessionId
@@ -187,7 +220,7 @@ export function inspectCompletedHostCheckpoint(accounts: readonly SubscriptionAc
     const bytes = buffer.subarray(0, length);
     const after = fstatSync(fd);
     if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs || bytes.length !== after.size) refuse("checkpoint_changed");
-    verifyCheckpointActions(bytes.toString("utf8"), record.sdkSessionId, receipts, expectedSettledToolIds);
+    inspect(bytes.toString("utf8"));
     return createHash("sha256").update(bytes).digest("hex");
   } catch (error) {
     if (error instanceof BridgeError) throw error;
@@ -196,6 +229,21 @@ export function inspectCompletedHostCheckpoint(accounts: readonly SubscriptionAc
 }
 
 function verifyCheckpointActions(text: string, sdkSessionId: string, receipts: RuntimeHostCompletion[], expectedSettledToolIds: readonly string[]): void {
+  const { calls, results } = checkpointActions(text, sdkSessionId);
+  if (expectedSettledToolIds.some(id => !calls.has(id) || !results.has(id))) refuse("checkpoint_completion_missing");
+  const recoveredIds = new Set(receipts.map(receipt => receipt.toolUseId));
+  const orderedIds = [...calls.keys()];
+  const firstRecovered = orderedIds.findIndex(id => recoveredIds.has(id));
+  if (firstRecovered >= 0 && orderedIds.slice(firstRecovered).some(id => !recoveredIds.has(id))) refuse("checkpoint_has_later_tools");
+  const names = new StableDroidToolNames();
+  for (const receipt of receipts) {
+    const call = calls.get(receipt.toolUseId);
+    if (!call || call.name !== `mcp__droid__${names.toMcp(receipt.toolName)}` || !sameToolInput(call.input, receipt.input)) refuse("checkpoint_action_mismatch");
+    if (results.get(receipt.toolUseId)?.isError !== true) refuse("checkpoint_cancellation_unproven");
+  }
+}
+
+function checkpointActions(text: string, sdkSessionId: string) {
   const calls = new Map<string, { name: string; input: unknown }>();
   const results = new Map<string, { isError: boolean; content: unknown }>();
   for (const line of text.split("\n")) {
@@ -221,17 +269,7 @@ function verifyCheckpointActions(text: string, sdkSessionId: string, receipts: R
   }
   if ([...calls.keys()].some(id => !results.has(id))) refuse("checkpoint_has_pending_tools");
   if ([...results.keys()].some(id => !calls.has(id))) refuse("checkpoint_has_unmatched_results");
-  if (expectedSettledToolIds.some(id => !calls.has(id) || !results.has(id))) refuse("checkpoint_completion_missing");
-  const recoveredIds = new Set(receipts.map(receipt => receipt.toolUseId));
-  const orderedIds = [...calls.keys()];
-  const firstRecovered = orderedIds.findIndex(id => recoveredIds.has(id));
-  if (firstRecovered >= 0 && orderedIds.slice(firstRecovered).some(id => !recoveredIds.has(id))) refuse("checkpoint_has_later_tools");
-  const names = new StableDroidToolNames();
-  for (const receipt of receipts) {
-    const call = calls.get(receipt.toolUseId);
-    if (!call || call.name !== `mcp__droid__${names.toMcp(receipt.toolName)}` || !sameToolInput(call.input, receipt.input)) refuse("checkpoint_action_mismatch");
-    if (results.get(receipt.toolUseId)?.isError !== true) refuse("checkpoint_cancellation_unproven");
-  }
+  return { calls, results };
 }
 
 function canonical(value: unknown): string {

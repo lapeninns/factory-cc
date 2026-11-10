@@ -1,3 +1,4 @@
+import { retireDormantCheckpoint } from "../control/dormant-checkpoint-retirement.js";
 import { nativeAccountCandidates, nativeAssignedAccount } from "../runtime/native-account-admission.js";
 import { resolveRequestCwd } from "../workspace.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -32,7 +33,7 @@ import { configuredModels, providerFromModelId, resolveRequestModel, type Bridge
 import { ClaudePool, PERSONAL_ACCOUNT, POOL_PROFILE } from "../upstream/claude-pool.js";
 import { DesktopJobsRuntime, SUBSCRIPTION_WORKER_SLOTS, type DesktopJobBinding, type DesktopWorkspacePolicy } from "../runtime/desktop-jobs.js";
 import { recoverNativeCheckpoint } from "../control/native-recovery.js";
-import { inspectCompletedHostCheckpoint, recoverCompletedHostCheckpoint } from "../control/completed-host-recovery.js";
+import { inspectConsumedHostCheckpoint, inspectCompletedHostCheckpoint, recoverCompletedHostCheckpoint } from "../control/completed-host-recovery.js";
 import { extendCooldowns, persistedCooldowns, readUpstreamFailureEvidence, restoreUpstreamCheckpoint, verifyRetainedHostCheckpoint, type UpstreamRecoveryContext } from "../control/upstream-recovery.js";
 import type { RuntimeRequest } from "../runtime/types.js";
 
@@ -179,6 +180,8 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       busy: id => activeRequests.has(id) || control.hasApprovals(id),
       inspect: request => desktopJobs.inspectNativeGenerations(request),
       checkpoint: record => inspectCompletedHostCheckpoint(config.subscriptionAccounts ?? [], record, []),
+      retiredCheckpoint: record => inspectCompletedHostCheckpoint(config.subscriptionAccounts ?? [], record, []),
+      consumedCheckpoint: (record, receipts) => inspectConsumedHostCheckpoint(config.subscriptionAccounts ?? [], record, receipts),
       evidence: (record, sdk, generation) => readUpstreamFailureEvidence(config.logDir, record, sdk, generation, store.list()),
       restoreCooldown: (account, until) => claudePool.restoreCooldown(account, until) };
   }
@@ -467,6 +470,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       }
       try {
         const context = { store, runtime, workspacePolicy,
+          retiredCheckpoint: (record: import("../sessions/state.js").SessionRecord) => inspectCompletedHostCheckpoint(config.subscriptionAccounts ?? [], record, []),
           accounts: (config.subscriptionAccounts ?? []).map(account => account.profile),
           busy: (id: string) => activeRequests.has(id) || control.hasApprovals(id),
           inspect: (request: import("../runtime/desktop-jobs.js").NativeGenerationInspection) => desktopJobs.inspectNativeGenerations(request) };
@@ -482,6 +486,15 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         if (error instanceof BridgeError) logger.warn("native_checkpoint_recovery_refused", { code: error.code, reason: error.extra.reason });
         throw error;
       }
+      return;
+    }
+    if (req.method === "POST" && path === "/internal/dormant-checkpoint-retirement") {
+      requireAdminToken(req.headers, config.adminToken);
+      const context = upstreamRecoveryContext();
+      if (!context?.retiredCheckpoint) throw new BridgeError(409, "native_recovery_unavailable", "Dormant retirement requires the supervised subscription controller pool.");
+      const result = await retireDormantCheckpoint({ ...context, retiredCheckpoint: context.retiredCheckpoint }, await readJson(req, config.maxBodyBytes));
+      logger.info("dormant_checkpoint_retirement", { sessionId: result.bridgeSessionId, retired: result.retired, eligible: result.eligible === true });
+      json(res, 200, result);
       return;
     }
     if (req.method === "POST" && path === "/internal/upstream-checkpoint-recovery") {
@@ -606,10 +619,19 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     }
     if (config.controllerPool && resolved.match?.retryableRequestKind === "native-upstream") {
       const retained = resolved.match.retainedCheckpoint;
-      if (!retained || retained.sdkSessionId !== resolved.match.sdkSessionId || retained.account !== resolved.match.claudeAccount
-          || inspectCompletedHostCheckpoint(config.subscriptionAccounts ?? [], resolved.match, []) !== retained.checkpointSha256) {
+      if (!retained || retained.sdkSessionId !== resolved.match.sdkSessionId || retained.account !== resolved.match.claudeAccount) {
         throw new BridgeError(409, "native_checkpoint_proof_changed", "The retained checkpoint changed before retry. No native prompt was sent.");
       }
+      const settledIds = [...new Set([...(retained.settledToolIds ?? []), ...(retained.settledToolResults ?? []).map(result => result.toolUseId)])];
+      const inspected = inspectConsumedHostCheckpoint(config.subscriptionAccounts ?? [], resolved.match, [], settledIds);
+      if (inspected.checkpointSha256 !== retained.checkpointSha256
+          || retained.settledToolResults?.some(prior => !inspected.settledToolResults.some(result => result.toolUseId === prior.toolUseId && result.resultSha256 === prior.resultSha256))) {
+        throw new BridgeError(409, "native_checkpoint_proof_changed", "The retained checkpoint changed before retry. No native prompt was sent.");
+      }
+      // Older retained proofs stored only the settled IDs. Derive their result
+      // hashes from the same verified immutable checkpoint before resuming.
+      if (settledIds.length && !retained.settledToolResults) store.update(resolved.match.bridgeSessionId,
+        { retainedCheckpoint: { ...retained, settledToolResults: inspected.settledToolResults } });
     }
     if (claudeAccount) logger.info("claude_account_assigned", { model: request.model, account: claudeAccount });
     const session = resolved.match
@@ -881,6 +903,8 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         const sdkSessionId = current.sdkSessionId;
         const sourceGeneration = current.nativeGeneration;
         const owningAccount = current.claudeAccount;
+        const priorSettled = current.retainedCheckpoint?.settledToolResults ?? [];
+        const priorSettledIds = current.retainedCheckpoint?.settledToolIds ?? [];
         store.update(sessionId, { retainedCheckpoint: undefined });
         try {
           if (!runtime.prepareCheckpointRetry || sourceGeneration === undefined || sourceGeneration >= 1_000_000 || !owningAccount) {
@@ -890,15 +914,18 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
           if (current.cancelRequested || current.hostEnded !== undefined || activeRequests.get(sessionId) !== owner
               || current.sdkSessionId !== sdkSessionId || current.claudeAccount !== owningAccount || current.nativeGeneration !== sourceGeneration
               || !["GENERATING", "RESUMING"].includes(current.state)) throw new Error("The session changed during checkpoint retirement");
-          const settledToolIds = [...new Set([...current.pendingToolIds, ...(current.hostCompletionReceipts ?? []).map(receipt => receipt.toolUseId)])];
-          const checkpointSha256 = inspectCompletedHostCheckpoint(config.subscriptionAccounts ?? [], current, [], settledToolIds);
+          const settledToolIds = [...new Set([...priorSettledIds, ...priorSettled.map(result => result.toolUseId), ...current.pendingToolIds, ...(current.hostCompletionReceipts ?? []).map(receipt => receipt.toolUseId)])];
+          const { checkpointSha256, settledToolResults } = inspectConsumedHostCheckpoint(config.subscriptionAccounts ?? [], current, [], settledToolIds);
+          if (priorSettled.some(prior => !settledToolResults.some(result => result.toolUseId === prior.toolUseId && result.resultSha256 === prior.resultSha256))) {
+            throw new Error("Previously settled native results changed");
+          }
           const coolingUntil = claudePool?.status().find(account => account.id === owningAccount)?.coolingUntil;
           store.update(sessionId, { state: "IDLE", nativeGeneration: sourceGeneration + 1,
             checkpointRetryBlocked: undefined,
             pendingToolIds: [], hostCompletionReceipts: [],
             retryableRequestHash: requestFingerprint, retryableRequestKind: "native-upstream",
             retainedCheckpoint: { sdkSessionId, account: owningAccount, checkpointSha256, sourceGeneration,
-              preparedAt: new Date().toISOString(), coolingUntil, origin: "clean-upstream", settledToolIds } });
+              preparedAt: new Date().toISOString(), coolingUntil, origin: "clean-upstream", settledToolIds, settledToolResults } });
           error = new BridgeError((error as BridgeError).status, (error as BridgeError).code,
             "The native checkpoint is retained on its owning account. Retry the continuation after the reported delay.",
             { ...(error as BridgeError).extra, retry_from_history: false, checkpoint_retained: true, retry_mode: "native_checkpoint" });
