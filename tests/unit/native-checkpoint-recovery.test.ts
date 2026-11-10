@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ControlBroker } from "../../src/control/broker.js";
 import { recoverNativeCheckpoint, type NativeCheckpointRecoveryContext } from "../../src/control/native-recovery.js";
 import type { BridgeApp } from "../../src/http/app.js";
-import type { NativeGenerationEvidence } from "../../src/runtime/desktop-jobs.js";
+import { inspectDesktopJobGenerations, type NativeGenerationEvidence, type NativeGenerationInspection } from "../../src/runtime/desktop-jobs.js";
 import type { BridgeRuntime } from "../../src/runtime/types.js";
 import type { SessionRecord } from "../../src/sessions/state.js";
 import { SessionStore } from "../../src/sessions/store.js";
@@ -30,10 +30,11 @@ function firstController(root: string): { bridgeSessionId: string; token: string
   { cwd: process.cwd(), encoding: "utf8", timeout: 60_000, stdio: ["ignore", "pipe", "ignore"] });
   return JSON.parse(output.trim().split("\n").at(-1)!);
 }
-function failedImport(root: string, account: "team2" | "team3", state: "failed" | "unknown" = "failed"): string {
+function failedImport(root: string, account: "team2" | "team3", state: "failed" | "unknown" = "failed",
+  workspacePolicy: "factory-native" | "controller-host" = "factory-native"): string {
   const helper = pathToFileURL(join(process.cwd(), "tests/helpers/native-restart.ts")).href;
   const output = execFileSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e",
-    `const m = await import(${JSON.stringify(helper)}); process.stdout.write("\\n" + JSON.stringify(await m.runFailedImport(process.argv[1], process.argv[2], process.argv[3])) + "\\n");`, root, account, state],
+    `const m = await import(${JSON.stringify(helper)}); process.stdout.write("\\n" + JSON.stringify(await m.runFailedImport(process.argv[1], process.argv[2], process.argv[3], process.argv[4])) + "\\n");`, root, account, state, workspacePolicy],
   { cwd: process.cwd(), encoding: "utf8", timeout: 60_000, stdio: ["ignore", "pipe", "ignore"] });
   return JSON.parse(output.trim().split("\n").at(-1)!);
 }
@@ -97,14 +98,17 @@ describe("native Workstream continuation after an orderly controller restart", (
     expect(runtime.turns).toEqual([expect.objectContaining({ sdkSessionId: CHECKPOINT, nativeGeneration: 2, recovery: undefined })]);
   }, 60_000);
 
-  it("recovers the already-failed pre-prompt continuation once, through the operator operation", async () => {
+  it.each(["factory-native", "controller-host"] as const)("recovers the checkpoint beside a settled %s sibling", async workspacePolicy => {
     const root = directory();
     const first = firstController(root);
     // The pre-fix controller: the inherited g0 was refused, the record failed,
     // and a cold import created a sibling that never completed a turn.
     const failedStore = new SessionStore(join(root, "bridge", "data", "sessions"), true, 16);
     failedStore.setState(first.bridgeSessionId, "FAILED");
-    const siblingId = failedImport(root, first.account === "team2" ? "team3" : "team2");
+    const siblingId = failedImport(root, first.account === "team2" ? "team3" : "team2", "failed", workspacePolicy);
+    // Historical session metadata need not describe the actual leased policy.
+    const siblingStore = new SessionStore(join(root, "bridge", "data", "sessions"), true, 16);
+    siblingStore.update(siblingId, { controllerWorkspacePolicy: "controller-readonly" });
     const { app, runtime } = await secondController(root);
     const token = await hostStart(app, root);
     const failed = structuredClone(app.store.require(first.bridgeSessionId));
@@ -136,6 +140,9 @@ describe("native Workstream continuation after an orderly controller restart", (
     expect(app.store.require(first.bridgeSessionId)).toEqual(later);
     expect(leases(root).filter(lease => String(lease.bridgeSessionId).startsWith(first.bridgeSessionId))
       .map(lease => [String(lease.bridgeSessionId).split(":").at(-1), lease.state])).toEqual([["g0", "cancelled"], ["g1", "idle"]]);
+    expect(leases(root).filter(lease => String(lease.bridgeSessionId).startsWith(first.bridgeSessionId))
+      .every(lease => lease.workspacePolicy === "factory-native")).toBe(true);
+    expect(leases(root).find(lease => String(lease.bridgeSessionId).startsWith(siblingId))?.workspacePolicy).toBe(workspacePolicy);
   }, 60_000);
 
   it("refuses recovery while a failed import on another account has an uncertain durable lease", async () => {
@@ -155,6 +162,27 @@ describe("native Workstream continuation after an orderly controller restart", (
     expect(app.store.require(first.bridgeSessionId)).toEqual(before);
     expect(app.store.require(siblingId).state).toBe("FAILED");
     expect(app.store.require(siblingId).historyMessageHashes).toBeUndefined();
+    expect(runtime.turns).toEqual([]);
+  }, 60_000);
+
+  it("keeps the target checkpoint bound to the current workspace policy", async () => {
+    const root = directory();
+    const first = firstController(root);
+    const failedStore = new SessionStore(join(root, "bridge", "data", "sessions"), true, 16);
+    failedStore.setState(first.bridgeSessionId, "FAILED");
+    const leasePath = join(root, "leases", "jobs", readdirSync(join(root, "leases", "jobs"))[0]!);
+    const oldLease = JSON.parse(readFileSync(leasePath, "utf8"));
+    writeFileSync(leasePath, JSON.stringify({ ...oldLease, workspacePolicy: "controller-host" }));
+    const leaseBefore = readFileSync(leasePath, "utf8");
+    const { app, runtime } = await secondController(root);
+    await hostStart(app, root);
+    const before = structuredClone(app.store.require(first.bridgeSessionId));
+
+    expect(await recover(app, { bridgeSessionId: first.bridgeSessionId, factorySessionId: FACTORY_SESSION,
+      sdkSessionId: CHECKPOINT, nativeGeneration: 0 })).toMatchObject({ status: 409,
+      json: { error: { type: "native_recovery_refused", reason: "lease_evidence_missing" } } });
+    expect(app.store.require(first.bridgeSessionId)).toEqual(before);
+    expect(readFileSync(leasePath, "utf8")).toBe(leaseBefore);
     expect(runtime.turns).toEqual([]);
   }, 60_000);
 });
@@ -283,6 +311,18 @@ describe("operator native checkpoint recovery predicates", () => {
     expect(await refusal(recoverNativeCheckpoint(f.ctx, { ...f.body, factorySessionId: randomUUID() }))).toBe("factory_session_mismatch");
   });
 
+  it("rejects conflicting historical-policy inspection arguments before starting a helper", async () => {
+    const root = directory();
+    const options = { pythonExecutable: "/usr/bin/python3", runtimePackagePath: join(process.cwd(), "native-runtime"), stateRoot: join(root, "leases") };
+    const request: NativeGenerationInspection = { factorySessionId: FACTORY_SESSION, bridgeSessionId: "bridge:g0",
+      cwd: root, subscriptionProfile: "team1", sdkSessionId: CHECKPOINT };
+    for (const patch of [{}, { useRecordedWorkspacePolicy: true, workspacePolicy: "factory-native" },
+      { useRecordedWorkspacePolicy: true, workspacePolicy: null }, { useRecordedWorkspacePolicy: "true" }]) {
+      await expect(inspectDesktopJobGenerations(options, { ...request, ...patch } as NativeGenerationInspection))
+        .rejects.toMatchObject({ code: "desktop_job_binding" });
+    }
+  });
+
   it.each([
     [{ state: "IDLE" }, "not_failed"],
     [{ state: "CANCELLED" }, "not_failed"],
@@ -364,7 +404,7 @@ describe("operator native checkpoint recovery predicates", () => {
 
     expect(await recoverNativeCheckpoint(f.ctx, f.body)).toMatchObject({ recovered: true });
     expect(f.inspect).toHaveBeenNthCalledWith(2, { factorySessionId: FACTORY_SESSION,
-      bridgeSessionId: `${imported.bridgeSessionId}:g0`, cwd: f.cwd, subscriptionProfile: "team1", workspacePolicy: "factory-native" });
+      bridgeSessionId: `${imported.bridgeSessionId}:g0`, cwd: f.cwd, subscriptionProfile: "team1", useRecordedWorkspacePolicy: true });
     expect(imported.state).toBe("FAILED");
     expect(imported.sdkSessionId).toBe(sdkSessionId);
   });

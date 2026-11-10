@@ -372,11 +372,24 @@ def update(config, request):
         return job
 
 
+def _inspection_binding(job, factory, profile, cwd, policy):
+    if policy not in ("controller-readonly", "controller-host", "factory-native"):
+        return False
+    try:
+        workspace = validate_worktree(cwd, policy)
+    except ProtocolError:
+        return False
+    return (job.get("factorySessionId") == factory and job.get("worktree") == workspace["worktree"]
+            and job.get("workspacePolicy") == policy and job.get("subscriptionProfile") == profile
+            and job.get("profile") == profile and job.get("authMode") == "subscription")
+
+
 def inspect(config, request):
     """Read-only lineage evidence for an operator recovery; never changes a lease."""
     if not isinstance(request, dict) or request.get("op") != "inspect":
         raise ProtocolError("invalid_operation")
-    if set(request) - {"op", "factorySessionId", "bridgeSessionId", "cwd", "subscriptionProfile", "workspacePolicy", "sdkSessionId"}:
+    if set(request) - {"op", "factorySessionId", "bridgeSessionId", "cwd", "subscriptionProfile", "workspacePolicy",
+                       "sdkSessionId", "useRecordedWorkspacePolicy"}:
         raise ProtocolError("unexpected_fields")
     factory = _identifier(request.get("factorySessionId"))
     bridge = _identifier(request.get("bridgeSessionId"))
@@ -384,17 +397,26 @@ def inspect(config, request):
     lineage = _lineage(bridge)
     profile = request.get("subscriptionProfile")
     policy = request.get("workspacePolicy")
+    recorded_policy = request.get("useRecordedWorkspacePolicy", False)
     if not lineage:
         raise ProtocolError("invalid_identifier")
     if not isinstance(profile, str) or profile not in SUBSCRIPTION_PROFILES:
         raise ProtocolError("invalid_subscription_profile")
-    if policy not in ("controller-readonly", "controller-host", "factory-native"):
+    if (not isinstance(recorded_policy, bool) or (recorded_policy and "workspacePolicy" in request)
+            or (not recorded_policy and policy not in ("controller-readonly", "controller-host", "factory-native"))):
         raise ProtocolError("invalid_workspace_policy")
-    workspace = validate_worktree(request.get("cwd"), policy)
+    # Validate the supplied path before reading lease data. Historical policy
+    # and binding fields come from one locked lease snapshot.
+    validate_worktree(request.get("cwd"), "factory-native" if recorded_policy else policy)
     with state_lock(config):
         jobs = _generations(_all_jobs(config), lineage[0])
-    if len(jobs) > MAX_INSPECTED_GENERATIONS:
-        raise ProtocolError("lineage_too_large")
+        if len(jobs) > MAX_INSPECTED_GENERATIONS:
+            raise ProtocolError("lineage_too_large")
+    # Each policy and its binding come from that one lease snapshot. Filesystem
+    # validation can run after releasing the shared admission lock.
+    inspected = [(number, job, _inspection_binding(job, factory, profile, request.get("cwd"),
+                                                   job.get("workspacePolicy") if recorded_policy else policy))
+                 for number, job in jobs]
     table = process_table()
     generations = [{
         "generation": number, "state": str(job.get("state")),
@@ -404,14 +426,12 @@ def inspect(config, request):
         "supervisorAlive": matches(job.get("supervisorIdentity"), table),
         "cleanupVerified": job.get("reportedCleanupVerified") is True,
         "checkpointMatches": (job.get("sessionId") == checkpoint) if checkpoint is not None and job.get("sessionId") else None,
-        "bindingMatches": (job.get("factorySessionId") == factory and job.get("worktree") == workspace["worktree"]
-                           and job.get("workspacePolicy") == policy and job.get("subscriptionProfile") == profile
-                           and job.get("profile") == profile and job.get("authMode") == "subscription"),
+        "bindingMatches": binding_matches,
         "endedAt": job.get("endedAt") if isinstance(job.get("endedAt"), str) else None,
         # A session update is refused while a helper owns an admitted phase.
         "endedBy": {"bridge_confirmed_session_end": "session_update",
                     "bridge_confirmed_phase_end": "phase_release"}.get(job.get("reason"), "other"),
-    } for number, job in sorted(jobs, key=lambda item: (item[0], str(item[1].get("id"))))]
+    } for number, job, binding_matches in sorted(inspected, key=lambda item: (item[0], str(item[1].get("id"))))]
     job_id = "factory-" + hashlib.sha256((factory + "\0" + bridge).encode()).hexdigest()[:32]
     return job_id, generations
 

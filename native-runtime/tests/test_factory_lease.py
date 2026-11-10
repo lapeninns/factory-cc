@@ -1027,6 +1027,65 @@ class FactoryLeaseTests(unittest.TestCase):
             with self.subTest(extra=extra):
                 self.assertFalse(self.refused({**request, **extra})['ok'])
         self.assertEqual(self.jobs_snapshot(), before)
+
+    def test_historical_inspection_validates_each_recorded_policy_without_changing_leases(self):
+        policies = ('factory-native', 'controller-host', 'controller-readonly')
+        job_ids = []
+        for generation, policy in enumerate(policies):
+            request = self.lineage(generation, cwd=str(self.repo), workspacePolicy=policy)
+            child, job_id = self.admitted(**{key: value for key, value in request.items() if key != 'op'})
+            self.release(child, 'failed', sdkSessionId='checkpoint-a', cleanupVerified=True)
+            job_ids.append(job_id)
+        exact = {key: value for key, value in self.lineage(2, op='inspect', cwd=str(self.repo),
+                 sdkSessionId='checkpoint-a').items() if key != 'role'}
+        historical = {key: value for key, value in exact.items() if key != 'workspacePolicy'}
+        historical['useRecordedWorkspacePolicy'] = True
+
+        def inspect_unchanged(request):
+            before = self.jobs_snapshot()
+            child = self.start()
+            self.send(child, request)
+            result = self.receive(child)
+            self.assertEqual(child.wait(timeout=3), 0)
+            self.assertEqual(self.jobs_snapshot(), before)
+            return result['generations']
+
+        self.assertEqual([item['bindingMatches'] for item in inspect_unchanged(exact)], [True, False, False])
+        observed = inspect_unchanged(historical)
+        self.assertTrue(all(item['bindingMatches'] and item['checkpointMatches'] for item in observed))
+        for patch in ({'factorySessionId': 'other-factory'}, {'subscriptionProfile': 'team2'},
+                      {'cwd': str(self.worktree)}):
+            with self.subTest(patch=patch):
+                self.assertFalse(any(item['bindingMatches'] for item in inspect_unchanged({**historical, **patch})))
+        self.assertFalse(any(item['checkpointMatches'] for item in inspect_unchanged({**historical, 'sdkSessionId': 'other-checkpoint'})))
+
+        original = read_job(self.config, job_ids[1])
+        for policy in (None, 'unknown-policy'):
+            with self.subTest(policy=policy):
+                changed = dict(original)
+                if policy is None:
+                    changed.pop('workspacePolicy')
+                else:
+                    changed['workspacePolicy'] = policy
+                with state_lock(self.config):
+                    write_job(self.config, changed)
+                observed = inspect_unchanged(historical)
+                self.assertEqual([item['bindingMatches'] for item in observed], [True, False, True])
+        with state_lock(self.config):
+            write_job(self.config, original)
+
+        before = self.jobs_snapshot()
+        for patch in ({'workspacePolicy': 'factory-native'}, {'workspacePolicy': None},
+                      {'useRecordedWorkspacePolicy': 'true'}):
+            with self.subTest(conflict=patch):
+                self.assertFalse(self.refused({**historical, **patch})['ok'])
+        for operation in ('acquire', 'update'):
+            request = self.lineage(2, op=operation, cwd=str(self.repo), useRecordedWorkspacePolicy=True)
+            if operation == 'update':
+                request.update(state='cancelled', cleanupVerified=True)
+            self.assertFalse(self.refused(request)['ok'])
+        self.assertEqual(self.jobs_snapshot(), before)
+
     def test_update_requires_the_original_parent_identity(self):
         child, job_id = self.admitted()
         self.release(child)

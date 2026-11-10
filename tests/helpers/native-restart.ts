@@ -95,14 +95,15 @@ export async function runFirstController(root: string): Promise<{ bridgeSessionI
 }
 
 /** A failed import with a real lease whose owning process exits before recovery. */
-export async function runFailedImport(root: string, profile: "team2" | "team3", state: "failed" | "unknown"): Promise<string> {
+export async function runFailedImport(root: string, profile: "team2" | "team3", state: "failed" | "unknown",
+  workspacePolicy: "factory-native" | "controller-host" = "factory-native"): Promise<string> {
   const store = new SessionStore(join(root, "bridge", "data", "sessions"), true, 16);
   const record = store.create({ role: "orchestrator", model: "opus", claudeAccount: profile, nativeGeneration: 0, toolNames: ["Read"] });
   store.update(record.bridgeSessionId, { factorySessionId: FACTORY_SESSION, factoryCwd: join(root, "workspace") });
   const lease = await acquireDesktopJobLease({ pythonExecutable: "/usr/bin/python3", runtimePackagePath: resolve("native-runtime"),
     stateRoot: join(root, "leases"), maxRunning: 8 }, { factorySessionId: FACTORY_SESSION,
     bridgeSessionId: `${record.bridgeSessionId}:g0`, cwd: join(root, "workspace"), role: "orchestrator",
-    subscriptionProfile: profile, workspacePolicy: "factory-native" }, new AbortController().signal);
+    subscriptionProfile: profile, workspacePolicy }, new AbortController().signal);
   await lease.release({ state, cleanupVerified: state === "failed" });
   store.setState(record.bridgeSessionId, "FAILED");
   return record.bridgeSessionId;

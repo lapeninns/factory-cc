@@ -50,7 +50,11 @@ export interface NativeGenerationEvidence {
   /** How the lease reached its current state: a session-level update, an admitted phase's release, or another path. */
   endedBy: "session_update" | "phase_release" | "other";
 }
-export type NativeGenerationInspection = Omit<DesktopJobAcquire, "role" | "resumeSessionId"> & { sdkSessionId?: string };
+export type NativeGenerationInspection = Omit<DesktopJobAcquire, "role" | "resumeSessionId"> & {
+  sdkSessionId?: string;
+  /** Read-only sibling settlement may validate each lease's recorded, known policy. */
+  useRecordedWorkspacePolicy?: boolean;
+};
 export const NATIVE_GENERATION_REFUSALS = ["lease_binding_mismatch", "terminal_session_cannot_reacquire", "stale_native_generation",
   "native_predecessor_unresolved", "native_checkpoint_mismatch"] as const;
 export interface DesktopJobLease { jobId: string; release(result: DesktopJobRelease): Promise<void> }
@@ -658,12 +662,17 @@ export async function updateDesktopJobRecord(options: DesktopLeaseOptions, reque
 /** Read-only lease lineage for one bridge conversation. */
 export async function inspectDesktopJobGenerations(options: DesktopLeaseOptions, request: NativeGenerationInspection): Promise<NativeGenerationEvidence[]> {
   validateSubscriptionProfile(request.subscriptionProfile);
-  if (!request.subscriptionProfile || !request.workspacePolicy || !/:g(?:0|[1-9]\d{0,6})$/.test(request.bridgeSessionId)) {
+  const recordedPolicy = request.useRecordedWorkspacePolicy === true;
+  if (!request.subscriptionProfile || !/:g(?:0|[1-9]\d{0,6})$/.test(request.bridgeSessionId)
+      || (request.useRecordedWorkspacePolicy !== undefined && typeof request.useRecordedWorkspacePolicy !== "boolean")
+      || (recordedPolicy ? request.workspacePolicy !== undefined : !request.workspacePolicy)) {
     throw new BridgeError(400, "desktop_job_binding", "Lease inspection requires a subscription generation identity.");
   }
+  if (!recordedPolicy) validateWorkspacePolicy(request.workspacePolicy, request.subscriptionProfile);
   const channel = new LeaseChannel({ ...options, admissionTimeoutMs: options.releaseTimeoutMs ?? DEFAULT_RELEASE_TIMEOUT_MS }, { op: "inspect",
     factorySessionId: request.factorySessionId, bridgeSessionId: request.bridgeSessionId, cwd: request.cwd,
-    subscriptionProfile: request.subscriptionProfile, workspacePolicy: request.workspacePolicy,
+    subscriptionProfile: request.subscriptionProfile,
+    ...(recordedPolicy ? { useRecordedWorkspacePolicy: true } : { workspacePolicy: request.workspacePolicy }),
     ...(request.sdkSessionId === undefined ? {} : { sdkSessionId: request.sdkSessionId }) });
   await channel.exited;
   const value = channel.inspection;

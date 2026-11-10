@@ -76,7 +76,7 @@ export async function recoverNativeCheckpoint(context: NativeCheckpointRecoveryC
     }
     const siblingEvidence = await context.inspect({ factorySessionId: request.factorySessionId,
       bridgeSessionId: `${sibling.bridgeSessionId}:g${generation}`, cwd: sibling.factoryCwd,
-      subscriptionProfile: sibling.claudeAccount as SubscriptionProfile, workspacePolicy: context.workspacePolicy,
+      subscriptionProfile: sibling.claudeAccount as SubscriptionProfile, useRecordedWorkspacePolicy: true,
       ...(sibling.sdkSessionId == null ? {} : { sdkSessionId: sibling.sdkSessionId }) });
     verifySiblingLineage(siblingEvidence, generation, sibling.sdkSessionId != null);
   }
