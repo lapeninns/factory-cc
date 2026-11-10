@@ -745,6 +745,9 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         usage: { ...turn.response.usage, estimated: turn.response.usage.estimated ?? false },
         ...(session.pendingHostRecovery ? { pendingHostRecovery: turn.pendingToolIds.length
           ? { ...session.pendingHostRecovery, notified: true } : undefined } : {}),
+        ...(turn.reconciledHostOperationId && turn.reconciledHostOperationId === session.pendingHostRecovery?.operationId
+          ? { completedHostRecoveries: session.completedHostRecoveries?.map(recovery => recovery.operationId === turn.reconciledHostOperationId
+            ? { ...recovery, reconciledAt: new Date().toISOString() } : recovery) } : {}),
       });
       store.setState(sessionId, turn.pendingToolIds.length ? "WAITING_DROID_TOOL" : "IDLE");
       if (turn.pendingToolIds.length) scheduleWorkerEnd(sessionId, turn.pendingToolIds);
@@ -758,7 +761,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         sdkBillingUsage: turn.sdkBillingUsage,
         compactMetadata: turn.compactMetadata,
         // Handoff and Task batch events carry only IDs and tool names: how pending tools finished and which calls went to Droid together.
-        events: (turn.events ?? []).filter((event) => /usage|compact|cancelled_turn|steering_turn|task_batch|recovered_host_receipt/i.test(event.type)),
+        events: (turn.events ?? []).filter((event) => /usage|compact|cancelled_turn|steering_turn|task_batch|recovered_host_receipt|recovery_action_denied/i.test(event.type)),
       })));
       completed = true;
       if (writer) writer.finish(turn.response);

@@ -25,6 +25,8 @@ export interface RuntimeTurn {
   sdkBillingUsage?: Record<string, unknown>;
   events?: RuntimeEvent[];
   notes?: string[];
+  /** The reconciliation-only native turn ended without dispatching new host work. */
+  reconciledHostOperationId?: string;
 }
 
 export interface StreamSink {

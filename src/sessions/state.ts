@@ -75,13 +75,15 @@ export interface CompletedHostRecovery {
   sdkSessionId: string;
   fromGeneration: number;
   toGeneration: number;
-  cancelledAt: string;
+  recordUpdatedAt: string;
+  cancelledAt?: string;
   cancellationSource: "client-disconnect" | "unknown-operator-attested";
   checkpointSha256: string;
   receiptsSha256: string;
   leaseEndedAt: string;
-  original: { cancelRequested: boolean; hostEnded?: SessionRecord["hostEnded"]; endedToolIds: string[]; notes: string[] };
+  original: { cancelRequested: boolean; cancellation?: SessionRecord["cancellation"]; hostEnded?: SessionRecord["hostEnded"]; endedToolIds: string[]; notes: string[] };
   receipts: RuntimeHostCompletion[];
+  reconciledAt?: string;
 }
 
 /** A session in this condition can never resume or complete another tool round trip. */

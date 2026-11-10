@@ -97,6 +97,8 @@ interface ActivePhase {
   unresolvedHostIds?: Set<string>;
   /** This phase introduced the process's identity for the session. */
   claimedIdentity?: boolean;
+  /** A release or its ownership-checked fallback update was acknowledged. */
+  settlementVerified?: boolean;
 }
 
 interface HeldHostPhase {
@@ -198,13 +200,13 @@ export class DesktopJobsRuntime implements BridgeRuntime {
       let resumable = false;
       try {
         resumable = await inner.interrupt!(sessionId, reason);
-        if (phase.cleanup !== cleanup || phase.outcome) return false;
+        if (phase.cleanup !== cleanup || phase.outcome) resumable = false;
         if (resumable) phase.outcome = "idle";
-        return resumable;
       } finally {
         settle(resumable);
         if (resumable) await phase.done?.catch(() => undefined);
       }
+      return resumable && phase.outcome === "idle" && phase.cleanup === cleanup && phase.settlementVerified === true;
     };
     if (inner.pendingHostCalls) this.pendingHostCalls = (id) => inner.pendingHostCalls!(id);
     if (inner.validateHostToolCompletion) this.validateHostToolCompletion = (...args) => inner.validateHostToolCompletion!(...args);
@@ -331,16 +333,19 @@ export class DesktopJobsRuntime implements BridgeRuntime {
           this.heldHost.set(id, held);
           await phase.lease.release({ state: "waiting_host", usage: held.usage,
             sdkSessionId: held.sdkSessionId, cleanupVerified: false, hostActionReservation: true });
+          phase.settlementVerified = true;
           held.parked = true;
           return turn;
         }
         this.heldHost.delete(id);
         await phase.lease.release({ state: turn.pendingToolIds.length ? "waiting_host" : "idle",
           usage: held.usage, sdkSessionId: held.sdkSessionId, cleanupVerified: false });
+        phase.settlementVerified = true;
         return turn;
       }
       await phase.lease.release({ state: cancelledCleanly === false ? "unknown" : phase.outcome ?? (turn.pendingToolIds.length ? "waiting_host" : "idle"),
         usage: turn.response.usage, sdkSessionId: turn.sdkSessionId, cleanupVerified: cancelledCleanly === true });
+      phase.settlementVerified = true;
       return turn;
     } catch (error) {
       // A refused lineage wrote no lease for this process. Later cleanup must
@@ -365,11 +370,17 @@ export class DesktopJobsRuntime implements BridgeRuntime {
           else { await this.inner.cancel(id, "desktop-job-phase-failed"); cleanupVerified = true; }
         }
         catch { this.faults.push("native_cleanup_failed"); }
-        try { await phase.lease.release({ state: cleanupVerified ? (phase.outcome ?? "failed") : "unknown", cleanupVerified }); }
+        try {
+          await phase.lease.release({ state: cleanupVerified ? (phase.outcome ?? "failed") : "unknown", cleanupVerified });
+          phase.settlementVerified = true;
+        }
         catch {
           this.faults.push("lease_cleanup_failed");
           if (cleanupVerified) {
-            try { await this.update(id, { state: phase.outcome ?? "failed", cleanupVerified: true }); }
+            try {
+              await this.update(id, { state: phase.outcome ?? "failed", cleanupVerified: true });
+              phase.settlementVerified = true;
+            }
             catch { this.faults.push("lease_recovery_failed"); }
           }
         }

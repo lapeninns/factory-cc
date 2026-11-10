@@ -66,6 +66,22 @@ describe("Factory model-phase supervision", () => {
     await expect(fixture.runtime.handle(request())).resolves.toMatchObject({ pendingToolIds: [] });
   });
 
+  it.each([true, false])("requires acknowledged native lease settlement after interrupt, fallback succeeds=%s", async fallbackSucceeds => {
+    const fixture = setup(), running = deferred<RuntimeTurn>();
+    fixture.inner.handle.mockImplementationOnce(() => running.promise);
+    fixture.releases.mockRejectedValue(new Error("release did not persist"));
+    if (!fallbackSucceeds) fixture.update.mockRejectedValue(new Error("fallback did not persist"));
+    fixture.inner.interrupt.mockImplementationOnce(async () => {
+      running.reject(new Error("clean native interruption"));
+      return true;
+    });
+    const pending = fixture.runtime.handle(request()).catch(() => undefined);
+    await vi.waitFor(() => expect(fixture.inner.handle).toHaveBeenCalled());
+    expect(await fixture.runtime.interrupt!("bridge-1", "client-disconnect")).toBe(fallbackSucceeds);
+    await pending;
+    expect(fixture.update).toHaveBeenCalledWith(expect.any(Object), { state: "idle", cleanupVerified: true });
+  });
+
   it("refuses missing trusted identity and a main checkout before model execution", async () => {
     const fixture = setup();
     fixture.options.getBinding = () => undefined;

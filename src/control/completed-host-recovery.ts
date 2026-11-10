@@ -5,6 +5,7 @@ import type { SubscriptionAccount } from "../config.js";
 import type { NativeGenerationEvidence, SubscriptionProfile } from "../runtime/desktop-jobs.js";
 import { StableDroidToolNames } from "../runtime/droid-mcp-catalog.js";
 import type { RuntimeHostCompletion } from "../runtime/types.js";
+import { MAX_RECOVERY_CONTEXT_BYTES, recoveredHostContext } from "../runtime/host-recovery.js";
 import { sameToolInput } from "../sessions/compaction.js";
 import type { CompletedHostRecovery, SessionRecord } from "../sessions/state.js";
 import { BridgeError, type Json } from "../types.js";
@@ -78,9 +79,11 @@ export async function recoverCompletedHostCheckpoint(context: CompletedHostRecov
     bridgeSessionId: request.bridgeSessionId, nextGeneration, checkpointSha256, receiptsSha256, receiptCount: receipts.length };
   const at = (context.now?.() ?? new Date()).toISOString();
   const recovery: CompletedHostRecovery = { operationId: request.operationId, at, sdkSessionId: request.sdkSessionId,
-    fromGeneration: request.nativeGeneration, toGeneration: nextGeneration, cancelledAt: request.expectedUpdatedAt,
+    fromGeneration: request.nativeGeneration, toGeneration: nextGeneration, recordUpdatedAt: request.expectedUpdatedAt,
+    ...(current.cancellation ? { cancelledAt: current.cancellation.at } : {}),
     cancellationSource: current.cancellation ? "client-disconnect" : "unknown-operator-attested", checkpointSha256, receiptsSha256, leaseEndedAt,
-    original: { cancelRequested: current.cancelRequested, hostEnded: current.hostEnded, endedToolIds: [...current.endedToolIds!], notes: [...current.notes] }, receipts };
+    original: { cancelRequested: current.cancelRequested, cancellation: current.cancellation ? structuredClone(current.cancellation) : undefined,
+      hostEnded: current.hostEnded, endedToolIds: [...current.endedToolIds!], notes: [...current.notes] }, receipts };
   context.store.update(request.bridgeSessionId, { state: "IDLE", nativeGeneration: nextGeneration,
     cancelRequested: false, hostEnded: undefined, endedToolIds: [], hostCompletionReceipts: [], cancellation: undefined,
     retryableRequestHash: undefined, retryableRequestKind: undefined,
@@ -94,7 +97,7 @@ function priorRecovery(context: CompletedHostRecoveryContext, request: Completed
   const prior = record?.completedHostRecoveries?.find(item => item.operationId === request.operationId);
   if (!record || !prior) return undefined;
   if (record.factorySessionId !== request.factorySessionId || prior.sdkSessionId !== request.sdkSessionId
-      || prior.fromGeneration !== request.nativeGeneration || prior.cancelledAt !== request.expectedUpdatedAt
+      || prior.fromGeneration !== request.nativeGeneration || prior.recordUpdatedAt !== request.expectedUpdatedAt
       || (request.checkpointSha256 !== undefined && prior.checkpointSha256 !== request.checkpointSha256)
       || (request.receiptsSha256 !== undefined && prior.receiptsSha256 !== request.receiptsSha256)) refuse("operation_identity_mismatch");
   if (record.state === "CANCELLED" || record.state === "FAILED" || record.cancelRequested || record.hostEnded === "terminal" || record.hostEnded === "interrupted") refuse("recovery_no_longer_active");
@@ -127,11 +130,13 @@ function eligibleRecord(context: CompletedHostRecoveryContext, request: Complete
     if (matches.length !== 1) refuse("receipt_set_incomplete");
     const receipt = matches[0]!;
     if (receipt.isError || receipt.terminal || !receipt.toolName || receipt.input === undefined
-        || !(typeof receipt.content === "string" || Array.isArray(receipt.content))) refuse("receipt_not_successful");
+        || !(typeof receipt.content === "string" || Array.isArray(receipt.content)
+          && receipt.content.every(block => block !== null && typeof block === "object" && typeof block.type === "string"))) refuse("receipt_not_successful");
     const signature = canonical({ toolName: receipt.toolName, input: receipt.input });
     if (signatures.has(signature)) refuse("receipt_action_ambiguous");
     signatures.add(signature);
   }
+  if (Buffer.byteLength(recoveredHostContext(receipts)) > MAX_RECOVERY_CONTEXT_BYTES) refuse("recovery_context_too_large");
   verifyRecoverySessionInactive(context, record);
   return record;
 }
@@ -214,6 +219,7 @@ function verifyCheckpointActions(text: string, sdkSessionId: string, receipts: R
     }
   }
   if ([...calls.keys()].some(id => !results.has(id))) refuse("checkpoint_has_pending_tools");
+  if ([...results.keys()].some(id => !calls.has(id))) refuse("checkpoint_has_unmatched_results");
   const recoveredIds = new Set(receipts.map(receipt => receipt.toolUseId));
   const orderedIds = [...calls.keys()];
   const firstRecovered = orderedIds.findIndex(id => recoveredIds.has(id));

@@ -11,7 +11,8 @@ import type { BridgeRuntime, RuntimeHostCompletion } from "../../src/runtime/typ
 import type { SessionRecord } from "../../src/sessions/state.js";
 import { SessionStore } from "../../src/sessions/store.js";
 import { createBridgeApp, listen, type BridgeApp } from "../../src/http/app.js";
-import { recordingRuntime, restartConfig } from "../helpers/native-restart.js";
+import { continuation, hostStart, recordingRuntime, restartConfig } from "../helpers/native-restart.js";
+import { postMessages } from "../helpers/server.js";
 
 const roots: string[] = [];
 const apps: BridgeApp[] = [];
@@ -68,12 +69,14 @@ describe("completed host checkpoint recovery", () => {
     const output = execFileSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e",
       `const m = await import(${JSON.stringify(helper)}); process.stdout.write("\\n" + JSON.stringify(await m.runFirstController(process.argv[1])) + "\\n");`, root],
     { cwd: process.cwd(), encoding: "utf8", timeout: 60_000, stdio: ["ignore", "pipe", "ignore"] });
-    const first = JSON.parse(output.trim().split("\n").at(-1)!) as { bridgeSessionId: string; account: string };
+    const first = JSON.parse(output.trim().split("\n").at(-1)!) as { bridgeSessionId: string; account: string; token: string };
     const base = restartConfig(root);
     const configDir = join(root, "configured-account");
     const config = { ...base, subscriptionAccounts: base.subscriptionAccounts!.map(account => ({ ...account,
       env: { ...account.env, CLAUDE_CONFIG_DIR: configDir } })) };
-    const app = createBridgeApp(config, { info() {}, warn() {}, error() {} }, "", recordingRuntime());
+    const runtime = recordingRuntime(), handle = runtime.handle;
+    runtime.handle = async input => ({ ...await handle(input), reconciledHostOperationId: input.session.pendingHostRecovery?.operationId });
+    const app = createBridgeApp(config, { info() {}, warn() {}, error() {} }, "", runtime);
     apps.push(app);
     await listen(app, config);
     const record = app.store.require(first.bridgeSessionId);
@@ -100,6 +103,11 @@ describe("completed host checkpoint recovery", () => {
     const applied = await post({ ...body, dryRun: false, checkpointSha256: dry.checkpointSha256, receiptsSha256: dry.receiptsSha256 }, "admin");
     expect(await applied.json()).toMatchObject({ recovered: true, nativeGeneration: 1 });
     expect(record.state).toBe("IDLE");
+    const token = await hostStart(app, root);
+    const resumed = await postMessages(app.url, "client", continuation(first.token, token, "Reconcile the completed action"));
+    expect(resumed.status).toBe(200);
+    expect(record.pendingHostRecovery).toBeUndefined();
+    expect(record.completedHostRecoveries?.[0]?.reconciledAt).toEqual(expect.any(String));
   }, 60_000);
 
   it("provides evidence hashes in a read-only dry run and retains cancellation history on apply", async () => {
@@ -114,6 +122,7 @@ describe("completed host checkpoint recovery", () => {
       pendingHostRecovery: { operationId: f.body.operationId }, completedHostRecoveries: [{ cancellationSource: "unknown-operator-attested",
         original: { cancelRequested: true, endedToolIds: [f.receipt.toolUseId], notes: ["original history"] }, receipts: [f.receipt] }] });
     expect(readFileSync(f.checkpointFile)).toEqual(bytes);
+    expect(f.record.completedHostRecoveries?.[0]).not.toHaveProperty("cancelledAt");
     expect(f.ctx.runtime.handle).not.toHaveBeenCalled();
     expect(f.ctx.runtime.cancel).not.toHaveBeenCalled();
     expect(await recoverCompletedHostCheckpoint(f.ctx, f.body)).toMatchObject({ alreadyRecovered: true });
@@ -131,6 +140,8 @@ describe("completed host checkpoint recovery", () => {
     const known = fixture({ cancellation: { at: "2026-11-10T02:19:52Z", source: "client-disconnect" } });
     expect(await recoverCompletedHostCheckpoint(known.ctx, { ...known.body, acknowledgeHistoricalDisconnect: false })).toMatchObject({ recovered: true });
     expect(known.record.completedHostRecoveries?.[0]?.cancellationSource).toBe("client-disconnect");
+    expect(known.record.completedHostRecoveries?.[0]).toMatchObject({ recordUpdatedAt: known.body.expectedUpdatedAt,
+      cancelledAt: "2026-11-10T02:19:52Z", original: { cancellation: { at: "2026-11-10T02:19:52Z", source: "client-disconnect" } } });
   });
 
   it.each([
@@ -155,11 +166,25 @@ describe("completed host checkpoint recovery", () => {
     expect(await reason(recoverCompletedHostCheckpoint(f.ctx, f.body))).toBe("receipt_not_successful");
   });
 
+  it("refuses malformed receipt blocks before preparing recovery context", async () => {
+    const f = fixture();
+    f.record.hostCompletionReceipts![0]!.content = [null] as unknown as RuntimeHostCompletion["content"];
+    expect(await reason(recoverCompletedHostCheckpoint(f.ctx, f.body))).toBe("receipt_not_successful");
+  });
+
   it("does not collapse multiple original actions with identical names and arguments", async () => {
     const f = fixture();
     f.record.endedToolIds!.push("other-write");
     f.record.hostCompletionReceipts!.push({ ...f.receipt, toolUseId: "other-write" });
     expect(await reason(recoverCompletedHostCheckpoint(f.ctx, f.body))).toBe("receipt_action_ambiguous");
+  });
+
+  it("refuses an oversized restoration context before changing the cancelled record", async () => {
+    const f = fixture();
+    f.record.hostCompletionReceipts![0]!.content = "large receipt".repeat(10_000);
+    const before = structuredClone(f.record);
+    expect(await reason(recoverCompletedHostCheckpoint(f.ctx, f.body))).toBe("recovery_context_too_large");
+    expect(f.record).toEqual(before);
   });
 
   it("checks every explicit identity and both evidence hashes", async () => {
@@ -239,6 +264,14 @@ describe("completed host checkpoint recovery", () => {
     ].map(row => JSON.stringify(row)).join("\n") + "\n");
     const { checkpointSha256: _hash, ...body } = f.body;
     expect(await reason(recoverCompletedHostCheckpoint(f.ctx, { ...body, dryRun: true }))).toBe("checkpoint_has_later_tools");
+  });
+
+  it("refuses tool results that have no matching native tool call", async () => {
+    const f = fixture();
+    appendFileSync(f.checkpointFile, JSON.stringify({ sessionId: f.body.sdkSessionId, message: { role: "user", content: [{
+      type: "tool_result", tool_use_id: "unknown-call", content: "unmatched" }] } }) + "\n");
+    const { checkpointSha256: _hash, ...body } = f.body;
+    expect(await reason(recoverCompletedHostCheckpoint(f.ctx, { ...body, dryRun: true }))).toBe("checkpoint_has_unmatched_results");
   });
 
   it.each(["wrong-input", "wrong-tool", "unsettled", "wrong-session", "malformed"])("refuses unproven native checkpoint contents: %s", async kind => {
