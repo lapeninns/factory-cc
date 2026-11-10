@@ -166,6 +166,8 @@ export interface DormantCheckpointRetirement {
   targetBridgeSessionId: string;
   targetCreatedAt: string;
   targetRecordUpdatedAt: string;
+  targetAccount: string;
+  targetNativeGeneration: number;
   checkpointSha256: string;
   evidenceSha256: string;
   evidence: NativeGenerationEvidence[];

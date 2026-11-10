@@ -91,26 +91,33 @@ export class SessionStore {
   }
 
   update(id: string, patch: Partial<SessionRecord>): SessionRecord {
+    return this.applyUpdate(id, patch);
+  }
+
+  /** Roll back only changes that have not reached the authoritative journal. */
+  updateAtomic(id: string, patch: Partial<SessionRecord>): SessionRecord {
+    const record = this.require(id);
+    const before = structuredClone(record);
+    let committed = false;
+    try { return this.applyUpdate(id, patch, () => { committed = true; }); }
+    catch (error) {
+      if (!committed) {
+        for (const key of Object.keys(record)) delete (record as unknown as Record<string, unknown>)[key];
+        Object.assign(record, before);
+      }
+      throw error;
+    }
+  }
+
+  private applyUpdate(id: string, patch: Partial<SessionRecord>, committed?: () => void): SessionRecord {
     const record = this.require(id);
     if (patch.state && !isActive(record.state) && isActive(patch.state)) this.requireCapacity();
     Object.assign(record, patch, { updatedAt: new Date().toISOString() });
     // A host ending (hostEnded) ends the session just as a terminal state does.
     retirePendingTools(record);
     this.sessions.set(id, record);
-    this.flush(record);
+    this.flush(record, committed);
     return record;
-  }
-
-  /** Keep the published record consistent when an atomic recovery append fails. */
-  updateAtomic(id: string, patch: Partial<SessionRecord>): SessionRecord {
-    const record = this.require(id);
-    const before = structuredClone(record);
-    try { return this.update(id, patch); }
-    catch (error) {
-      for (const key of Object.keys(record)) delete (record as unknown as Record<string, unknown>)[key];
-      Object.assign(record, before);
-      throw error;
-    }
   }
 
   /** Persist a host receipt independently of admission to the next model turn. */
@@ -188,11 +195,18 @@ export class SessionStore {
     return removed;
   }
 
-  private flush(record: SessionRecord): void {
+  private flush(record: SessionRecord, committed?: () => void): void {
     record.notes = record.notes.slice(-128);
-    if (!this.persist) return;
+    if (!this.persist) { committed?.(); return; }
     this.terminateLastLine();
     appendFileSync(this.file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    // Readers now observe this complete record. A later durability or derived
+    // snapshot failure must not revert only the in-memory copy.
+    committed?.();
+    if (committed) {
+      const fd = openSync(this.file, "r");
+      try { fsyncSync(fd); } finally { closeSync(fd); }
+    }
     this.writes++;
     if (this.writes >= 256 || statSync(this.file).size >= this.retention.journalMaxBytes) this.compact();
     else this.snapshot();

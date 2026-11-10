@@ -23,7 +23,7 @@ afterEach(async () => {
 const failedAt = "2026-11-10T10:39:14.903Z", coolingAt = "2026-11-10T10:39:15.045Z", updatedAt = "2026-11-10T10:39:15.320Z";
 const coolingUntil = "2026-11-10T13:10:01.045Z";
 
-function fixture(patch: Partial<SessionRecord> = {}) {
+function fixture(patch: Partial<SessionRecord> = {}, persist = false) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "upstream-recovery-")));
   roots.push(root);
   const cwd = join(root, "workspace"), configDir = join(root, "account"), logDir = join(root, "logs");
@@ -32,7 +32,7 @@ function fixture(patch: Partial<SessionRecord> = {}) {
   const project = join(configDir, "projects", cwd.replace(/[^A-Za-z0-9]/g, "-")); mkdirSync(project, { recursive: true });
   const file = join(project, sdkSessionId + ".jsonl");
   writeFileSync(file, JSON.stringify({ sessionId: sdkSessionId, message: { role: "user", content: [{ type: "text", text: "Earlier completed work" }] } }) + "\n");
-  const store = new SessionStore(join(root, "state"), false, 16);
+  const store = new SessionStore(join(root, "state"), persist, 16);
   const record = store.create({ role: "orchestrator", model: "opus", toolNames: ["Script"], nativeGeneration: 5, claudeAccount: "team5" });
   store.update(record.bridgeSessionId, { state: "IDLE", factorySessionId, factoryCwd: cwd, historyMessageHashes: ["one", "two"],
     retryableRequestKind: "upstream", retryableRequestHash: "1".repeat(64), completedHostRecoveries: [{ operationId: "prior-recovery", at: "2026-11-10T08:00:00Z",
@@ -57,6 +57,7 @@ function fixture(patch: Partial<SessionRecord> = {}) {
   const body = { operationId: randomUUID(), bridgeSessionId: record.bridgeSessionId, factorySessionId, account: "team5", sdkSessionId,
     nativeGeneration: 5, expectedUpdatedAt: updatedAt, checkpointSha256: createHash("sha256").update(readFileSync(file)).digest("hex"),
     evidenceSha256: context.evidence(record, sdkSessionId, 4).sha256 };
+  if (persist) (store as unknown as { flush(record: SessionRecord): void }).flush(record);
   return { root, record, store, context, body, lease, file, logFile, logDir, failure, cooling, account };
 }
 
@@ -66,8 +67,8 @@ async function reason(promise: Promise<unknown>): Promise<string> {
 }
 
 describe("operator restoration after a clean upstream retry", () => {
-  function consumedFixture() {
-    const f = fixture({ completedHostRecoveries: [], nativeGeneration: 1 });
+  function consumedFixture(persist = false) {
+    const f = fixture({ completedHostRecoveries: [], nativeGeneration: 1 }, persist);
     f.body.nativeGeneration = 1;
     f.lease.generation = 0;
     f.failure.data.nativeGeneration = 0;
@@ -84,6 +85,7 @@ describe("operator restoration after a clean upstream retry", () => {
     writeFileSync(f.file, rows.map(row => JSON.stringify(row)).join("\n") + "\n");
     f.body.checkpointSha256 = createHash("sha256").update(readFileSync(f.file)).digest("hex");
     f.body.evidenceSha256 = f.context.evidence(f.record, f.body.sdkSessionId, 0).sha256;
+    if (persist) (f.store as unknown as { flush(record: SessionRecord): void }).flush(f.record);
     return { ...f, receipt, rows, nativeResult, factoryContent, apply: { ...f.body, receiptsSha256: receiptDigest([receipt]) } };
   }
 
@@ -147,7 +149,7 @@ describe("operator restoration after a clean upstream retry", () => {
   });
 
   it("rolls back a mutate-then-flush failure and permits a complete retry", async () => {
-    const f = consumedFixture(), before = structuredClone(f.record);
+    const f = consumedFixture(true), before = structuredClone(f.record);
     const persistence = f.store as unknown as { flush(record: SessionRecord): void };
     vi.spyOn(persistence, "flush").mockImplementationOnce(() => { throw new Error("synthetic flush failure after mutation"); });
     await expect(restoreUpstreamCheckpoint(f.context, f.apply)).rejects.toThrow("synthetic flush");
@@ -156,6 +158,25 @@ describe("operator restoration after a clean upstream retry", () => {
     expect(await restoreUpstreamCheckpoint(f.context, f.apply)).toMatchObject({ recovered: true });
     expect(f.record.upstreamCheckpointRecoveries).toHaveLength(1);
     expect(f.record.upstreamCheckpointRecoveries![0]!.before.hostCompletionReceipts).toEqual([f.receipt]);
+  });
+
+  it.each(["snapshot", "compact"])("keeps a committed receipt restoration after %s fails and retries idempotently", async phase => {
+    const f = consumedFixture(true);
+    if (phase === "compact") {
+      const internals = f.store as unknown as { writes: number; compact(): void };
+      internals.writes = 255;
+      vi.spyOn(internals, "compact").mockImplementationOnce(() => { throw new Error("post-append compact failure"); });
+    } else vi.spyOn(f.store, "snapshot").mockImplementationOnce(() => { throw new Error("post-append snapshot failure"); });
+    await expect(restoreUpstreamCheckpoint(f.context, f.apply)).rejects.toThrow("post-append");
+    expect(f.record.hostCompletionReceipts).toEqual([]);
+    expect(f.record.upstreamCheckpointRecoveries).toHaveLength(1);
+    const loaded = new SessionStore(join(f.root, "state"), true, 16);
+    expect(loaded.require(f.record.bridgeSessionId)).toEqual(f.record);
+    f.context.store = loaded;
+    expect(await restoreUpstreamCheckpoint(f.context, f.apply)).toMatchObject({ alreadyRecovered: true });
+    expect(loaded.require(f.record.bridgeSessionId).upstreamCheckpointRecoveries).toHaveLength(1);
+    expect(loaded.require(f.record.bridgeSessionId).upstreamCheckpointRecoveries![0]!.before.hostCompletionReceipts).toEqual([f.receipt]);
+    expect(f.context.restoreCooldown).toHaveBeenCalledWith("team5", coolingUntil);
   });
 
   it.each(["empty", "consumed"])("exposes guarded %s-receipt dry-run and apply through the administrator HTTP route", async kind => {

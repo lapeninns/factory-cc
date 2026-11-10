@@ -113,6 +113,7 @@ function priorRecovery(context: UpstreamRecoveryContext, request: RecoveryReques
       || request.receiptsSha256 !== undefined && request.receiptsSha256 !== audit.receiptsSha256) refuse("operation_identity_mismatch");
   if (record.sdkSessionId !== request.sdkSessionId || record.cancelRequested || record.state === "FAILED" || record.state === "CANCELLED"
       || record.hostEnded === "terminal" || record.hostEnded === "interrupted") refuse("recovery_no_longer_active");
+  if (audit.proof.coolingUntil) context.restoreCooldown(request.account, audit.proof.coolingUntil);
   return { ok: true, alreadyRecovered: true, recovered: false, operationId: request.operationId,
     bridgeSessionId: request.bridgeSessionId, nativeGeneration: record.nativeGeneration ?? null };
 }

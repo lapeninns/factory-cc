@@ -74,6 +74,7 @@ export async function retireDormantCheckpoint(context: DormantRetirementContext,
   const at = (context.now?.() ?? new Date()).toISOString();
   const audit: DormantCheckpointRetirement = { operationId: request.operationId, at, before,
     targetBridgeSessionId: request.targetBridgeSessionId, targetCreatedAt: target.createdAt, targetRecordUpdatedAt: request.targetExpectedUpdatedAt,
+    targetAccount: target.claudeAccount!, targetNativeGeneration: target.nativeGeneration!,
     checkpointSha256, evidenceSha256, evidence };
   if (Buffer.byteLength(JSON.stringify(audit)) > 16 * 1024 * 1024) refuse("retirement_audit_full");
   context.store.updateAtomic(request.bridgeSessionId, { ...terminalPatch(audit), dormantCheckpointRetirement: audit });
@@ -100,6 +101,7 @@ function eligibleRecord(context: DormantRetirementContext, request: RetirementRe
       || record.pendingToolIds.length || record.endedToolIds?.length || record.hostCompletionReceipts?.length || record.pendingHostRecovery
       || record.dormantCheckpointRetirement || !record.historyMessageHashes?.length) refuse("not_dormant");
   if (target.state !== "IDLE" || target.sdkSessionId !== undefined || target.retryableRequestKind !== "upstream"
+      || !target.claudeAccount || !context.accounts.includes(target.claudeAccount) || !Number.isSafeInteger(target.nativeGeneration) || target.nativeGeneration! < 0
       || !target.historyMessageHashes?.length || target.cancelRequested || target.cancellation || target.hostEnded !== undefined
       || target.pendingToolIds.length || target.endedToolIds?.length || target.pendingHostRecovery
       || !Number.isFinite(Date.parse(record.createdAt)) || !Number.isFinite(Date.parse(target.createdAt))
@@ -114,6 +116,7 @@ export async function inspectRetiredSibling(context: NativeCheckpointRecoveryCon
   const target = targetBridgeSessionId && context.store.get(targetBridgeSessionId);
   if (!audit || !target || !context.retiredCheckpoint || target.bridgeSessionId !== audit.targetBridgeSessionId
       || target.createdAt !== audit.targetCreatedAt || target.factorySessionId !== record.factorySessionId || target.factoryCwd !== record.factoryCwd
+      || !targetMatchesRetirement(target, audit)
       || record.bridgeSessionId !== audit.before.bridgeSessionId || record.factorySessionId !== audit.before.factorySessionId
       || !Number.isFinite(Date.parse(audit.at)) || !sameToolInput(context.store.get(record.bridgeSessionId), record)
       || recoverySessionActive(context, record.bridgeSessionId)) refuse("retirement_proof_unavailable");
@@ -122,11 +125,25 @@ export async function inspectRetiredSibling(context: NativeCheckpointRecoveryCon
   if (!sameToolInput(current, { ...original, ...terminalPatch(audit) }) || !HASH.test(audit.checkpointSha256)
       || digest(audit.evidence) !== audit.evidenceSha256) refuse("retirement_record_changed");
   const observed = JSON.stringify(record);
-  const targetIdentity = JSON.stringify([target.bridgeSessionId, target.createdAt, target.factorySessionId, target.factoryCwd]);
+  const targetIdentity = JSON.stringify(target);
   const evidence = await inspectLineage(context, record);
   if (!sameToolInput(evidence, audit.evidence) || context.retiredCheckpoint(record) !== audit.checkpointSha256
       || JSON.stringify(context.store.get(record.bridgeSessionId)) !== observed || recoverySessionActive(context, record.bridgeSessionId)
-      || JSON.stringify([target.bridgeSessionId, target.createdAt, target.factorySessionId, target.factoryCwd]) !== targetIdentity) refuse("retirement_proof_changed");
+      || JSON.stringify(context.store.get(target.bridgeSessionId)) !== targetIdentity) refuse("retirement_proof_changed");
+}
+
+function targetMatchesRetirement(target: SessionRecord, audit: DormantCheckpointRetirement): boolean {
+  if (!audit.targetAccount || !Number.isSafeInteger(audit.targetNativeGeneration) || audit.targetNativeGeneration < 0) return false;
+  const anchors = target.upstreamCheckpointRecoveries?.filter(item => item.recordUpdatedAt === audit.targetRecordUpdatedAt) ?? [];
+  if (!anchors.length) return target.updatedAt === audit.targetRecordUpdatedAt && target.sdkSessionId === undefined
+    && target.claudeAccount === audit.targetAccount && target.nativeGeneration === audit.targetNativeGeneration;
+  if (anchors.length !== 1) return false;
+  const anchor = anchors[0]!;
+  return anchor.nativeGeneration === audit.targetNativeGeneration && anchor.proof.origin === "operator-restored"
+    && anchor.before.sdkSessionId === undefined && anchor.before.retryableRequestKind === "upstream"
+    && anchor.proof.account === audit.targetAccount && target.claudeAccount === anchor.proof.account
+    && target.sdkSessionId === anchor.proof.sdkSessionId && Number.isSafeInteger(target.nativeGeneration)
+    && target.nativeGeneration! >= anchor.nativeGeneration;
 }
 
 function sameRequest(audit: DormantCheckpointRetirement, request: RetirementRequest): boolean {
