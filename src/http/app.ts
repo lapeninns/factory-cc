@@ -635,7 +635,10 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       routingRecords = routingRecords.filter(record => !excluded.has(record.bridgeSessionId));
     };
     if (selectedOwner) await verifyLineageOwner(selectedOwner);
-    const selectedReconciliation = selectedOwner?.pendingLineageReconciliation && (!explicit || explicit === selectedOwner.bridgeSessionId)
+    const historicalReconciliation = selectedOwner?.pendingLineageReconciliation
+      && selectedOwner.nativeLineageSelection?.sources.length === 0;
+    const selectedReconciliation = selectedOwner?.pendingLineageReconciliation && !historicalReconciliation
+      && (!explicit || explicit === selectedOwner.bridgeSessionId)
       && selectedOwner.contextHash === contextHash && selectedOwner.state === "IDLE" && !selectedOwner.cancelRequested;
     const retries = routingRecords.filter((session) => (session.state === "IDLE" && !session.pendingToolIds.length
       || session.state === "WAITING_DROID_TOOL" && session.retryableRequestKind === "admission") && session.hostEnded === undefined
@@ -650,6 +653,9 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         // Droid desktop has no conversation ID header or hooks to disambiguate.
         continueIdenticalTranscripts: config.desktopProfile, auxiliaryRetry: retry,
       });
+    if (historicalReconciliation && (resolved.match !== selectedOwner || resolved.reason !== "authenticated-retained-checkpoint-tail")) {
+      throw new BridgeError(409, "native_lineage_retained_tail_required", "Continue historical reconciliation with the exact authenticated retained history.");
+    }
     if (resolved.match?.nativeLineageSelection && resolved.match !== selectedOwner) await verifyLineageOwner(resolved.match);
     if (config.controllerPool && factorySession) {
       const retainedLineages = routingRecords.filter(session => session.factorySessionId === factorySession.sessionId

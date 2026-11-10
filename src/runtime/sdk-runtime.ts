@@ -498,7 +498,8 @@ export class SdkRuntime implements BridgeRuntime {
         if (rawResults.some(block => !("tool_use_id" in block) || typeof block.tool_use_id !== "string" || !block.tool_use_id)
             || new Set(results.map(result => result.tool_use_id)).size !== results.length
             || rawResults.length !== results.length) throw new BridgeError(409, "conflicting_settled_result", "Cross-lineage result identities are incomplete or ambiguous.");
-        const settled = lineage.sources.flatMap(source => source.checkpoint.settledToolResults);
+        const settled = lineage.sources.length ? lineage.sources.flatMap(source => source.checkpoint.settledToolResults)
+          : retainedResume ? retained?.settledToolResults ?? [] : [];
         results = results.filter(result => {
           if (!matchesSettledHostResult(result, settled)) throw new BridgeError(409, "conflicting_settled_result", "A cross-lineage result is not proven by the selection audit.");
           return false;

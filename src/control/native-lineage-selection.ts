@@ -5,7 +5,7 @@ import type { NativeGenerationEvidence, SubscriptionProfile } from "../runtime/d
 import { lineageReconciliationContext, MAX_LINEAGE_CONTEXT_BYTES } from "../runtime/host-recovery.js";
 import { sameToolInput } from "../sessions/compaction.js";
 import { isEnded, nativePurpose, type LineageCancellation, type NativeLineageHistoricalDisposition, type NativeLineageBranchProof, type NativeLineageCheckpoint, type NativeLineageSelection, type SessionRecord } from "../sessions/state.js";
-import { recoverySessionActive, type NativeCheckpointRecoveryContext } from "./native-recovery.js";
+import { inspectRecoverySiblings, recoverySessionActive, type NativeCheckpointRecoveryContext } from "./native-recovery.js";
 
 interface Identity { bridgeSessionId: string; sdkSessionId: string; account: string; nativeGeneration: number; expectedUpdatedAt: string }
 interface SelectionRequest {
@@ -51,6 +51,11 @@ export async function selectNativeLineage(context: NativeLineageSelectionContext
   const inventory = scopeInventory(context.store.list(), selected);
   if (inventory.length > 64) refuse("scope_too_large");
   const snapshot = JSON.stringify(inventory);
+  const retained = request.sources.length ? undefined : historicalRetainedProof(selected);
+  if (retained) {
+    await inspectRecoverySiblings(context, request.factorySessionId,
+      scope.filter(record => record !== selected), selected.bridgeSessionId, selected);
+  }
   const historical: NativeLineageSelection["historical"] = [];
   const inactive: NativeLineageSelection["inactive"] = [];
   for (const record of context.store.list().filter(record => inventory.some(item => item.bridgeSessionId === record.bridgeSessionId) && !record.sdkSessionId)) {
@@ -58,14 +63,23 @@ export async function selectNativeLineage(context: NativeLineageSelectionContext
   }
   const proofs: NativeLineageBranchProof[] = [];
   const selectedCheckpoint = context.lineageCheckpoint(selected);
+  if (retained && (selectedCheckpoint.checkpointSha256 !== retained.checkpointSha256
+      || retained.settledToolResults?.some(result => !selectedCheckpoint.settledToolResults.some(known => sameToolInput(known, result))))) {
+    refuse("historical_retained_checkpoint_changed");
+  }
   const requiredDispositions: Array<Omit<NativeLineageHistoricalDisposition, "approvalReference" | "approvedAt">> = [];
   for (const record of scope) {
     const checkpoint = context.lineageCheckpoint(record);
-    const evidence = await inspect(context, record);
+    const evidence = await inspect(context, record, false, record === selected ? retained?.sourceGeneration : undefined);
+    if (record === selected && retained) {
+      const source = evidence.find(item => item.generation === retained.sourceGeneration);
+      if (source?.state !== "failed" || source.endedBy !== "session_update"
+          || Date.parse(source.endedAt!) > Date.parse(retained.preparedAt)) refuse("historical_retained_lease_changed");
+    }
     if (isHistorical(record, selected)) {
       if (evidence.some(item => Date.parse(item.endedAt!) >= Date.parse(selected.createdAt))) refuse("historical_lease_after_baseline");
       const outcomesSha256 = lineageDigest(checkpoint.outcomes);
-      const requiresDisposition = checkpoint.outcomes.some(outcome => !selectedCheckpoint.outcomes.some(known => sameToolInput(known, outcome)));
+      const requiresDisposition = Boolean(retained) || checkpoint.outcomes.some(outcome => !selectedCheckpoint.outcomes.some(known => sameToolInput(known, outcome)));
       const expected = { bridgeSessionId: record.bridgeSessionId, sdkSessionId: record.sdkSessionId!, checkpointSha256: checkpoint.checkpointSha256,
         outcomesSha256, selected: request.selected, disposition: "archive-superseded" as const };
       if (requiresDisposition) requiredDispositions.push(expected);
@@ -88,7 +102,8 @@ export async function selectNativeLineage(context: NativeLineageSelectionContext
   if (Buffer.byteLength(lineageReconciliationContext(audit)) > MAX_LINEAGE_CONTEXT_BYTES
       || Buffer.byteLength(JSON.stringify(audit)) > 16 * 1024 * 1024) refuse("reconciliation_context_too_large");
   for (const proof of proofs) {
-    if (!sameToolInput(await inspect(context, proof.record), proof.evidence)
+    if (!sameToolInput(await inspect(context, proof.record, false,
+      proof === chosen ? retained?.sourceGeneration : undefined), proof.evidence)
         || !sameToolInput(context.lineageCheckpoint(proof.record), proof.checkpoint)) refuse("proof_changed");
   }
   for (const proof of historical) {
@@ -164,9 +179,17 @@ export async function verifySelectedLineage(context: NativeLineageSelectionConte
     if (!sameToolInput(await inspect(context, proof.record, true), proof.evidence)) refuse("source_proof_changed");
   }
   if (owner.pendingLineageReconciliation) {
-    const proof = owner.nativeLineageSelection!.selected.checkpoint;
+    const selection = owner.nativeLineageSelection!;
+    const proof = selection.selected.checkpoint;
     const checkpoint = context.lineageCheckpoint(owner);
     const retained = owner.retainedCheckpoint;
+    if (!selection.sources.length) {
+      if (!retained || !sameToolInput(retained, selection.selected.record.retainedCheckpoint)
+          || !sameToolInput(checkpoint, proof)) refuse("selected_checkpoint_changed");
+      if (!sameToolInput(await inspect(context, owner, false, retained.sourceGeneration), selection.selected.evidence)) {
+        refuse("selected_checkpoint_lease_changed");
+      }
+    }
     if (retained) {
       if (retained.sdkSessionId !== owner.sdkSessionId || retained.account !== owner.claudeAccount
           || retained.checkpointSha256 !== checkpoint.checkpointSha256) refuse("selected_checkpoint_changed");
@@ -188,6 +211,21 @@ function selectionScope(records: SessionRecord[], owner: SessionRecord): Session
   return records.filter(record => record.factorySessionId === owner.factorySessionId && record.factoryCwd === owner.factoryCwd
     && record.sdkSessionId && nativePurpose(record) !== "auxiliary").sort((a, b) => a.bridgeSessionId.localeCompare(b.bridgeSessionId));
 }
+/** An empty source set may only archive older branches for a proven restored owner. */
+function historicalRetainedProof(owner: SessionRecord) {
+  const proof = owner.retainedCheckpoint;
+  const audit = owner.upstreamCheckpointRecoveries?.filter(item => sameToolInput(item.proof, proof)) ?? [];
+  if (owner.retryableRequestKind !== "native-upstream" || proof?.origin !== "operator-restored"
+      || proof.sdkSessionId !== owner.sdkSessionId || proof.account !== owner.claudeAccount
+      || !HASH.test(proof.checkpointSha256) || !Number.isFinite(Date.parse(proof.preparedAt))
+      || !Number.isSafeInteger(proof.sourceGeneration) || proof.sourceGeneration < 0
+      || audit.length !== 1 || audit[0]!.before.sdkSessionId !== undefined || audit[0]!.before.retryableRequestKind !== "upstream"
+      || !Number.isSafeInteger(audit[0]!.nativeGeneration)
+      || audit[0]!.nativeGeneration <= proof.sourceGeneration || audit[0]!.nativeGeneration > owner.nativeGeneration!
+      || !sameToolInput([...(proof.settledToolIds ?? [])].sort(), (proof.settledToolResults ?? []).map(result => result.toolUseId).sort())
+      || new Set(proof.settledToolIds ?? []).size !== (proof.settledToolIds?.length ?? 0)) refuse("historical_selection_proof_required");
+  return proof;
+}
 function eligible(context: NativeLineageSelectionContext, request: SelectionRequest): SessionRecord {
   const owner = context.store.require(request.selected.bridgeSessionId);
   if (owner.factorySessionId !== request.factorySessionId || owner.factoryCwd !== request.factoryCwd
@@ -207,7 +245,13 @@ function eligible(context: NativeLineageSelectionContext, request: SelectionRequ
       || !Number.isFinite(Date.parse(record.createdAt)) || recoverySessionActive(context, record.bridgeSessionId))) refuse("record_identity_or_activity_changed");
   const scope = nativeScope.filter(record => !isHistorical(record, owner));
   const identities = [request.selected, ...request.sources];
-  if (!request.sources.length || identities.length !== scope.length || new Set(identities.map(item => item.bridgeSessionId)).size !== identities.length) refuse("source_set_incomplete");
+  if ((!request.sources.length && nativeScope.length === scope.length) || identities.length !== scope.length
+      || new Set(identities.map(item => item.bridgeSessionId)).size !== identities.length) refuse("source_set_incomplete");
+  if (!request.sources.length) {
+    historicalRetainedProof(owner);
+    if (nativeScope.some(record => record.claudeAccount !== owner.claudeAccount)
+        || new Set(nativeScope.map(record => record.sdkSessionId)).size !== nativeScope.length) refuse("historical_lineage_identity_changed");
+  }
   for (const record of scope) {
     const identity = identities.find(item => item.bridgeSessionId === record.bridgeSessionId);
     if (!identity || record.sdkSessionId !== identity.sdkSessionId || record.claudeAccount !== identity.account
@@ -229,14 +273,15 @@ function eligible(context: NativeLineageSelectionContext, request: SelectionRequ
   }
   return owner;
 }
-async function inspect(context: NativeLineageSelectionContext, record: SessionRecord, checkpointOptional = false): Promise<NativeGenerationEvidence[]> {
-  const generation = record.nativeGeneration!;
+async function inspect(context: NativeLineageSelectionContext, record: SessionRecord, checkpointOptional = false,
+  exactGeneration?: number): Promise<NativeGenerationEvidence[]> {
+  const generation = exactGeneration ?? record.nativeGeneration!;
   const evidence = await context.inspect({ factorySessionId: record.factorySessionId!, bridgeSessionId: `${record.bridgeSessionId}:g${generation}`,
     cwd: record.factoryCwd!, subscriptionProfile: record.claudeAccount as SubscriptionProfile, useRecordedWorkspacePolicy: true, sdkSessionId: record.sdkSessionId! });
   const latest = evidence.filter(item => item.generation === Math.max(...evidence.map(item => item.generation)));
   if (!evidence.length || evidence.length > 128 || new Set(evidence.map(item => item.generation)).size !== evidence.length
       || evidence.some(item => !item.bindingMatches || !Number.isSafeInteger(item.generation) || item.generation > generation || item.generation < 0)
-      || latest.length !== 1 || !checkpointOptional && !latest[0]!.checkpointMatches || latest[0]!.generation < generation - 1
+      || latest.length !== 1 || !checkpointOptional && !latest[0]!.checkpointMatches || latest[0]!.generation < (exactGeneration ?? generation - 1)
       || evidence.some(item => !TERMINAL.includes(item.state) || !item.cleanupVerified || item.externalCleanupRequired
         || item.hostActionReservation || item.ownerAlive || item.supervisorAlive || !Number.isFinite(Date.parse(item.endedAt ?? "")))) refuse("lease_unsettled");
   if (recoverySessionActive(context, record.bridgeSessionId)) refuse("record_identity_or_activity_changed");

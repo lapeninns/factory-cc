@@ -353,6 +353,181 @@ describe("healthy native continuity after compaction", () => {
   });
 });
 
+async function historicalSelectionFixture() {
+  const f = await fixture([], true, true);
+  const proof = { ...f.record.retainedCheckpoint!, sourceGeneration: 0, preparedAt: "2026-11-10T13:01:00Z" };
+  f.app.store.update(f.record.bridgeSessionId, { nativeGeneration: 4, createdAt: "2026-11-10T12:00:00Z", retainedCheckpoint: proof,
+    upstreamCheckpointRecoveries: [{ operationId: "restore-earlier-checkpoint", at: proof.preparedAt, recordUpdatedAt: "2026-11-10T13:00:00Z",
+      nativeGeneration: 1, proof: structuredClone(proof), evidenceSha256: "b".repeat(64), before: { retryableRequestKind: "upstream" } }] });
+  const histories = ["CANCELLED", "IDLE"].map((state, index) => {
+    const sdkSessionId = randomUUID();
+    const old = f.app.store.create({ role: f.record.role, model: f.record.model, claudeAccount: "team5", nativeGeneration: 0, toolNames: ["Script"] });
+    const file = join(f.root, "team5", "projects", f.record.factoryCwd!.replace(/[^A-Za-z0-9]/g, "-"), sdkSessionId + ".jsonl");
+    writeFileSync(file, [
+      { sessionId: sdkSessionId, message: { role: "assistant", content: [{ type: "tool_use", id: `historical-${index}`, name: "mcp__droid__Script", input: {} }] } },
+      { sessionId: sdkSessionId, message: { role: "user", content: [{ type: "tool_result", tool_use_id: `historical-${index}`, content: `old effect ${index}` }] } },
+    ].map(row => JSON.stringify(row)).join("\n"));
+    f.app.store.update(old.bridgeSessionId, { state: state as "CANCELLED" | "IDLE", sdkSessionId,
+      hostEnded: state === "IDLE" ? "interrupted" : undefined, factorySessionId: f.record.factorySessionId, factoryCwd: f.record.factoryCwd,
+      contextHash: f.record.contextHash, createdAt: "2026-11-08T12:00:00Z", historyMessageHashes: ["older"] });
+    return { old, file };
+  });
+  const leases = vi.mocked(DesktopJobsRuntime.prototype.inspectNativeGenerations);
+  const defaultInspect = leases.getMockImplementation()!;
+  leases.mockImplementation(async request => (await defaultInspect(request)).map(row => ({
+    ...row, endedAt: request.sdkSessionId === f.sdkId ? "2026-11-10T13:00:00Z" : "2026-11-09T12:00:00Z",
+  })));
+  const identity = { bridgeSessionId: f.record.bridgeSessionId, sdkSessionId: f.sdkId, account: "team5",
+    nativeGeneration: 4, expectedUpdatedAt: f.record.updatedAt };
+  const body = { operationId: randomUUID(), factorySessionId: f.record.factorySessionId, factoryCwd: f.record.factoryCwd,
+    selected: identity, sources: [] };
+  const approval = { reference: "test-only-historical-selection", approvedAt: proof.preparedAt, selectedBridgeSessionId: f.record.bridgeSessionId,
+    selectedSdkSessionId: f.sdkId, sourceBridgeSessionIds: [] };
+  const send = async (data: unknown) => fetch(`${f.app.url}/internal/select-native-lineage`, { method: "POST",
+    headers: { authorization: "Bearer admin", "content-type": "application/json" }, body: JSON.stringify(data) });
+  const vendor = vendorRequest(f);
+  vendor.messages.push({ role: "user", content: `[factory-cc-session:${f.token}] Confirm the restored checkpoint` });
+  const request: MessagesRequest = { ...vendor, messages: [
+    ...Array.from({ length: 18 }, (): Message => ({ role: "user", content: `[factory-cc-session:${f.token}]` })),
+    ...Array.from({ length: 700 - vendor.messages.length }, (_, index): Message => ({
+      role: index % 2 ? "assistant" : "user", content: `Older transcript message ${index}`,
+    })), ...vendor.messages,
+  ] };
+  const preview = async () => {
+    const response = await send({ ...body, dryRun: true });
+    expect(response.status).toBe(200);
+    return await response.json() as { proofSha256: string; eligible: boolean; requiredHistoricalDispositions: Array<Record<string, unknown>> };
+  };
+  const approved = async () => {
+    const pending = await preview();
+    return { ...body, approval, proofSha256: pending.proofSha256,
+      historicalDispositions: pending.requiredHistoricalDispositions.map((item, index) => ({
+        ...item, approvalReference: `test-only-historical-${index}`, approvedAt: proof.preparedAt,
+      })) };
+  };
+  return { ...f, histories, request, leases, proof, body, approval, send, preview, approved };
+}
+
+describe("explicit historical-only selection for a restored native checkpoint", () => {
+  it("holds the 718-message Factory shape until both archives are approved, then continues twice on the same SDK", async () => {
+    const f = await historicalSelectionFixture();
+    expect(f.request.messages).toHaveLength(718);
+    expect((await postMessages(f.app.url, "client", f.request, f.headers)).json.error).toMatchObject({ type: "native_checkpoint_selection_required" });
+    expect(f.sdk.inputs).toHaveLength(0);
+    const request = await f.approved();
+    expect(request.historicalDispositions).toHaveLength(2);
+    expect((await f.send({ ...request, historicalDispositions: request.historicalDispositions.slice(0, 1) })).status).toBe(409);
+    expect(f.record.nativeLineageSelection).toBeUndefined();
+    const old = f.histories.map(item => structuredClone(item.old));
+    expect((await f.send(request)).status).toBe(200);
+    expect((await (await f.send(request)).json())).toMatchObject({ alreadySelected: true });
+    expect(f.record.nativeGeneration).toBe(5);
+    f.sdk.attemptTools = true; f.sdk.hostActionOnInput = 1;
+    const first = await postMessages(f.app.url, "client", f.request, f.headers);
+    expect(first.status, JSON.stringify(first.json)).toBe(200);
+    expect(first.session).toBe(f.record.bridgeSessionId);
+    expect(f.record.requestMessageHashes).toHaveLength(700);
+    expect(f.sdk.options[0]?.resume).toBe(f.sdkId);
+    expect(f.sdk.inputs[0]!.message.content.some(block => block.type === "tool_result")).toBe(false);
+    expect(f.sdk.denials).toHaveLength(2);
+    expect(f.sdk.denials.every(result => (result as { behavior: string }).behavior === "deny")).toBe(true);
+    expect(f.record.pendingLineageReconciliation).toBeUndefined();
+    expect(f.record.retainedCheckpoint).toBeUndefined();
+    expect(f.record.nativeLineageSelection?.reconciledAt).toBeDefined();
+    f.sdk.attemptTools = false; f.sdk.hostActionOnInput = 0;
+    const second = { ...f.request, messages: [
+      { role: "user", content: `[factory-cc-session:${f.token}] Rewritten history` } as Message,
+      f.request.messages.at(-1)!, { role: "assistant", content: first.json.content as ContentBlock[] } as Message,
+      { role: "user", content: "Ordinary next turn" } as Message,
+    ] };
+    const next = await postMessages(f.app.url, "client", second, f.headers);
+    expect(next.status, JSON.stringify(next.json)).toBe(200);
+    expect(next.session).toBe(f.record.bridgeSessionId);
+    expect(f.sdk.inputs).toHaveLength(2); expect(f.sdk.options).toHaveLength(1);
+    expect(f.app.store.list()).toHaveLength(3); expect(f.histories.map(item => item.old)).toEqual(old);
+    expect(f.coldRetry).not.toHaveBeenCalled();
+  });
+
+  it.each(["wrong-tail", "unknown-result", "changed-result", "unbound"])("blocks %s before sending any native reconciliation input", async kind => {
+    const f = await historicalSelectionFixture();
+    expect((await f.send(await f.approved())).status).toBe(200);
+    const request = structuredClone(f.request);
+    if (kind === "wrong-tail") request.messages[request.messages.length - 2] = { role: "assistant", content: "Unexpected assistant work" };
+    if (kind === "unbound") {
+      request.messages = request.messages.slice(18).map(message => ({ ...message, content: typeof message.content === "string"
+        ? message.content.replaceAll(`[factory-cc-session:${f.token}]`, "")
+        : message.content.map(block => block.type === "text" && typeof block.text === "string"
+          ? { ...block, text: block.text.replaceAll(`[factory-cc-session:${f.token}]`, "") } : block) }));
+    }
+    if (kind === "unknown-result" || kind === "changed-result") {
+      const result = (request.messages.at(-5)!.content as ContentBlock[])[0]!;
+      if (result.type !== "tool_result") throw new Error("fixture_result_missing");
+      if (kind === "unknown-result") result.tool_use_id = "unknown";
+      else result.content = "Changed result";
+    }
+    expect((await postMessages(f.app.url, "client", request, f.headers)).status).toBe(kind === "unbound" ? 400 : 409);
+    expect(f.record.pendingLineageReconciliation).toBeDefined();
+    expect(f.sdk.options).toHaveLength(0);
+  });
+
+  it("refuses a sibling introduced during the first historical lease check", async () => {
+    const f = await historicalSelectionFixture();
+    const inspect = f.leases.getMockImplementation()!;
+    let added = false;
+    f.leases.mockImplementation(async request => {
+      if (!added) {
+        added = true;
+        const existing = f.histories[0]!.old;
+        const extra = f.app.store.create({ role: existing.role, model: existing.model, claudeAccount: "team5", nativeGeneration: 0, toolNames: ["Script"] });
+        f.app.store.update(extra.bridgeSessionId, { state: "CANCELLED", sdkSessionId: randomUUID(), factorySessionId: existing.factorySessionId,
+          factoryCwd: existing.factoryCwd, contextHash: existing.contextHash, createdAt: "2026-11-07T12:00:00Z" });
+      }
+      return inspect(request);
+    });
+    const response = await f.send({ ...f.body, dryRun: true });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: { reason: "scope_changed" } });
+    expect(f.record.nativeLineageSelection).toBeUndefined();
+  });
+
+  it("refuses a new owner lease after the historical audit was selected", async () => {
+    const f = await historicalSelectionFixture();
+    expect((await f.send(await f.approved())).status).toBe(200);
+    const inspect = f.leases.getMockImplementation()!;
+    f.leases.mockImplementation(async request => (await inspect(request)).map(row =>
+      request.sdkSessionId === f.sdkId ? { ...row, ownerAlive: true } : row));
+    expect((await postMessages(f.app.url, "client", f.request, f.headers)).status).toBe(409);
+    expect(f.record.pendingLineageReconciliation).toBeDefined();
+    expect(f.sdk.options).toHaveLength(0);
+  });
+
+  it.each(["unconsumed", "unknown", "live", "newer", "wrong-account", "wrong-sdk", "unproven-owner", "ambiguous-owner", "new-owner-lease"])(
+    "refuses historical-only selection with %s evidence", async kind => {
+      const f = await historicalSelectionFixture();
+      const history = f.histories[0]!.old;
+      if (kind === "unconsumed") f.app.store.update(history.bridgeSessionId, { endedToolIds: ["not-settled"] });
+      if (kind === "newer") f.app.store.update(history.bridgeSessionId, { createdAt: "2026-11-11T00:00:00Z" });
+      if (kind === "wrong-account") f.app.store.update(history.bridgeSessionId, { claudeAccount: "team8" });
+      if (kind === "wrong-sdk") f.app.store.update(history.bridgeSessionId, { sdkSessionId: f.sdkId });
+      if (kind === "unproven-owner") f.app.store.update(f.record.bridgeSessionId, { upstreamCheckpointRecoveries: [] });
+      if (kind === "ambiguous-owner") f.app.store.update(f.record.bridgeSessionId, {
+        upstreamCheckpointRecoveries: [...f.record.upstreamCheckpointRecoveries!, ...f.record.upstreamCheckpointRecoveries!],
+      });
+      if (["unknown", "live", "new-owner-lease"].includes(kind)) {
+        const inspect = f.leases.getMockImplementation()!;
+        f.leases.mockImplementation(async request => (await inspect(request)).map(row => {
+          if (kind === "new-owner-lease" && request.sdkSessionId === f.sdkId) return { ...row, generation: 1 };
+          if (request.sdkSessionId !== history.sdkSessionId) return row;
+          return kind === "unknown" ? { ...row, state: "unknown" } : { ...row, ownerAlive: true };
+        }));
+      }
+      const response = await f.send({ ...f.body, dryRun: true });
+      expect(response.status).toBe(409);
+      expect(f.record.nativeLineageSelection).toBeUndefined();
+      expect(f.sdk.inputs).toHaveLength(0);
+    });
+});
+
 async function selectionFixture(failures: number[] = []) {
   const f = await fixture(failures, false, true);
   healthyRequest(f);
