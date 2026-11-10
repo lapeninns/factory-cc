@@ -7,7 +7,8 @@ const usage = `Usage: npm run control -- <command>
   sessions                        List bridge sessions
   approve <id> [--input <file>]    Allow once; optionally supply an updated JSON input object
   deny <id> [--message <text>]     Deny a pending request
-  cancel <sessionId>              Cancel a bridge session
+  cancel <sessionId> [--preserve-lineage]
+                                  Cancel through its owning runtime; optionally archive pre-cancel evidence.
   recover-checkpoint <bridgeSessionId> --factory-session <id> --sdk-session <id> --generation <n> [--dry-run]
                                   Return one failed pre-prompt continuation to its retained native
                                   checkpoint under a new lease generation. Every identity is required.
@@ -20,6 +21,9 @@ const usage = `Usage: npm run control -- <command>
                                   exact checkpoint, durable failure, cooldown and lease evidence.
                                   Apply includes returned hashes, including receiptsSha256 when receipts exist.
 
+  select-native-lineage --input <file> [--dry-run]
+                                  Choose one proven native baseline with explicit scoped approval.
+                                  Preview returns exact source identities and required historical dispositions.
   retire-dormant-checkpoint --input <file> [--dry-run]
                                   Permanently retire one proven unused successor for an exact target.
                                   Requires explicit confirmation and full identity, version and proof hashes.
@@ -63,7 +67,7 @@ export async function runControl(args: string[], env: NodeJS.ProcessEnv = proces
   } else if (command === "recover-checkpoint") {
     path = "/internal/native-checkpoint-recovery";
     body = recoveryBody(args.slice(1));
-  } else if (command === "recover-completed-host" || command === "restore-upstream-checkpoint" || command === "retire-dormant-checkpoint") {
+  } else if (command === "recover-completed-host" || command === "restore-upstream-checkpoint" || command === "retire-dormant-checkpoint" || command === "select-native-lineage") {
     if (id !== "--input" || !flag || (value !== undefined && value !== "--dry-run") || rest.length) {
       throw new Error(`${command} requires --input <file> and optional --dry-run. Use --help.`);
     }
@@ -73,11 +77,12 @@ export async function runControl(args: string[], env: NodeJS.ProcessEnv = proces
     if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("Recovery --input must contain a JSON object.");
     body = { ...input as Record<string, unknown>, ...(value ? { dryRun: true } : {}) };
     path = command === "recover-completed-host" ? "/internal/completed-host-recovery"
+      : command === "select-native-lineage" ? "/internal/select-native-lineage"
       : command === "retire-dormant-checkpoint" ? "/internal/dormant-checkpoint-retirement" : "/internal/upstream-checkpoint-recovery";
   } else if (command === "cancel") {
-    if (!id || id.startsWith("-") || args.length !== 2) throw new Error("cancel requires exactly one session ID. Use --help.");
+    if (!id || id.startsWith("-") || args.length > 3 || flag !== undefined && flag !== "--preserve-lineage") throw new Error("cancel requires exactly one session ID and optional --preserve-lineage. Use --help.");
     path = "/internal/cancel";
-    body = { sessionId: id };
+    body = { sessionId: id, ...(flag === "--preserve-lineage" ? { preserveForLineageSelection: true } : {}) };
   } else {
     throw new Error("Unknown control command. Use --help.");
   }
@@ -99,7 +104,7 @@ export async function runControl(args: string[], env: NodeJS.ProcessEnv = proces
     // A failed response may follow a successful mutation: no implicit retries.
     throw new Error("Could not reach the local bridge. Check the URL and server, then list requests before retrying a decision.");
   }
-  if (!response.ok && ["recover-checkpoint", "recover-completed-host", "restore-upstream-checkpoint", "retire-dormant-checkpoint"].includes(command) && response.status !== 401 && response.status !== 403) {
+  if (!response.ok && ["recover-checkpoint", "recover-completed-host", "restore-upstream-checkpoint", "retire-dormant-checkpoint", "select-native-lineage"].includes(command) && response.status !== 401 && response.status !== 403) {
     let refusal: { type?: unknown; reason?: unknown } | undefined;
     try { refusal = ((await response.json()) as { error?: { type?: unknown; reason?: unknown } }).error; }
     catch { /* fall through to the generic message */ }

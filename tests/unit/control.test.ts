@@ -32,6 +32,7 @@ describe("local approval CLI", () => {
     ["recover-completed-host", "/internal/completed-host-recovery"],
     ["restore-upstream-checkpoint", "/internal/upstream-checkpoint-recovery"],
     ["retire-dormant-checkpoint", "/internal/dormant-checkpoint-retirement"],
+    ["select-native-lineage", "/internal/select-native-lineage"],
   ])("sends an explicit %s file with a read-only dry-run override", async (command, path) => {
     const received: unknown[] = [];
     const url = await localServer(async (req, res) => {
@@ -48,6 +49,18 @@ describe("local approval CLI", () => {
     expect(received).toEqual([{ path, authorization: "Bearer secret",
       body: { operationId: "fixture", bridgeSessionId: "sess_fixture", expectedUpdatedAt: "2026-11-10T02:19:52Z", dryRun: true } }]);
     await expect(runControl([command, "--input", file, "--unsafe"], {})).rejects.toThrow("optional --dry-run");
+  });
+
+  it("archives cancellation evidence only with the explicit lineage flag", async () => {
+    const received: unknown[] = [];
+    const url = await localServer(async (req, res) => {
+      let raw = "";
+      for await (const chunk of req) raw += chunk;
+      received.push({ path: req.url, body: JSON.parse(raw) });
+      res.end('{"ok":true}');
+    });
+    await runControl(["cancel", "session-id", "--preserve-lineage"], { BRIDGE_ADMIN_TOKEN: "secret", BRIDGE_CONTROL_URL: url });
+    expect(received).toEqual([{ path: "/internal/cancel", body: { sessionId: "session-id", preserveForLineageSelection: true } }]);
   });
 
   it("sends one authenticated decision with the user's exact edited input", async () => {

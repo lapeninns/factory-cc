@@ -158,7 +158,7 @@ export async function verifyRetainedHostCheckpoint(context: UpstreamRecoveryCont
     subscriptionProfile: proof.account as SubscriptionProfile, workspacePolicy: context.workspacePolicy, sdkSessionId: proof.sdkSessionId });
   verifySettledSource(leases, proof.sourceGeneration, false, undefined, proof.preparedAt);
   await inspectRecoverySiblings(context, record.factorySessionId,
-    relatedRecoveryRecords(context.store, record.factorySessionId).filter(item => item.bridgeSessionId !== record.bridgeSessionId).map(item => structuredClone(item)), record.bridgeSessionId);
+    relatedRecoveryRecords(context.store, record.factorySessionId).filter(item => item.bridgeSessionId !== record.bridgeSessionId).map(item => structuredClone(item)), record.bridgeSessionId, record);
   const checkedAgain = await context.inspect({ factorySessionId: record.factorySessionId,
     bridgeSessionId: `${record.bridgeSessionId}:g${proof.sourceGeneration}`, cwd: record.factoryCwd,
     subscriptionProfile: proof.account as SubscriptionProfile, workspacePolicy: context.workspacePolicy, sdkSessionId: proof.sdkSessionId });

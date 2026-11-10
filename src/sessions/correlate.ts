@@ -202,6 +202,21 @@ export function resolveSession(
   const separator = sameToolInput(request.messages[lastAssistant]?.content, [{ type: "text", text: "---" }]);
   const separatorResult = request.messages[lastAssistant - 1];
   const separatorResultBlocks = separatorResult ? asBlocks(separatorResult.content) : [];
+  const hasHealthyCheckpointTail = (session: SessionRecord): boolean => {
+    const completed = session.historyMessageHashes;
+    return Boolean(sameExecutionScope(session) && hostAllowsAnyTools(request)
+      && session.model === request.model && session.contextHash === contextHash
+      && session.state === "IDLE" && session.sdkSessionId && session.claudeAccount
+      && !session.cancelRequested && !session.cancellation && !session.checkpointRetryBlocked
+      && (session.hostEnded === undefined || session.hostEnded === "resumable")
+      && !session.pendingToolIds.length && !session.endedToolIds?.length && !session.hostCompletionReceipts?.length
+      && !session.pendingHostRecovery && !session.retainedCheckpoint
+      && completed && completed.length >= 2 && session.requestMessageHashes?.at(-1) === completed.at(-2)
+      && lastAssistant >= 1 && request.messages[lastAssistant - 1]?.role === "user"
+      && completed.at(-2) === incoming[lastAssistant - 1] && completed.at(-1) === incoming[lastAssistant]
+      && userSuffix.length && userSuffix.every(message => message.role === "user"
+        && asBlocks(message.content).length > 0 && asBlocks(message.content).every(block => block.type === "text")));
+  };
   const hasRetainedCheckpointTail = (session: SessionRecord): boolean => {
     const proof = session.retainedCheckpoint, completed = session.historyMessageHashes;
     return Boolean(sameExecutionScope(session) && hostAllowsAnyTools(request) && session.model === request.model && session.contextHash === contextHash
@@ -269,12 +284,12 @@ export function resolveSession(
   // Reuse native history only with both authenticated host ownership and an
   // exact user/assistant tail, followed by exactly one new user message. Neither
   // a summary-looking prompt nor a host ID alone can establish continuity.
-  // A retained checkpoint can also follow several queued user/context messages.
-  // Its completed pair stays authoritative when a failed request overwrote the
-  // request fingerprints. The independent native file proof is checked before admission.
+  // Healthy native checkpoints also accept queued text-only context after that
+  // exact pair. Retained checkpoints use their validated native proof when a
+  // failed request overwrote the last successful request fingerprint.
   // Tool-free auxiliary requests remain independent, even if they copy context.
   const authenticatedTail = sessions.filter((session) => {
-      return (hasAuthenticatedTail(session) || hasRetainedCheckpointTail(session)) && historyContextMatches(session)
+      return (hasAuthenticatedTail(session) || hasRetainedCheckpointTail(session) || hasHealthyCheckpointTail(session)) && historyContextMatches(session)
         // Identify a genuine model-switch continuation before rejecting busy
         // state; filtering it out would silently fork the native conversation.
         && (switchingModel(session) || canChangeReasoningLevel(session) || (session.state === "IDLE" && !session.cancelRequested && session.pendingToolIds.length === 0))
@@ -284,7 +299,8 @@ export function resolveSession(
   if (authenticatedTail[0]) {
     assertSelectedContext(authenticatedTail[0], canChangeHostThinking(authenticatedTail[0]) || canChangeReasoningLevel(authenticatedTail[0]));
     return { match: authenticatedTail[0], reason: hasRetainedCheckpointTail(authenticatedTail[0])
-      ? "authenticated-retained-checkpoint-tail" : "authenticated-history-tail" };
+      ? "authenticated-retained-checkpoint-tail" : hasHealthyCheckpointTail(authenticatedTail[0])
+        ? "authenticated-healthy-checkpoint-tail" : "authenticated-history-tail" };
   }
 
   const activeDuplicates = sessions.filter((session) => {

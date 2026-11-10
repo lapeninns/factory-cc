@@ -33,7 +33,7 @@ import { OwnedProcesses } from "./owned-processes.js";
 import { hostActionNeedsWorkspaceReservation } from "./desktop-jobs.js";
 import { upstreamError } from "./upstream-error.js";
 import { redactValue } from "../security/redact.js";
-import { historicalHostResult, hostReceiptContent, matchesSettledHostResult, mcpResultContent as mcpContent, RECOVERY_ONLY_DENIAL, recoveredHostContext } from "./host-recovery.js";
+import { historicalHostResult, hostReceiptContent, matchesSettledHostResult, mcpResultContent as mcpContent, RECOVERY_ONLY_DENIAL, recoveredHostContext, lineageReconciliationContext } from "./host-recovery.js";
 
 type ModelRoute = ReturnType<typeof resolveRequestModel>;
 
@@ -487,6 +487,23 @@ export class SdkRuntime implements BridgeRuntime {
         && retained.sdkSessionId === input.session.sdkSessionId && retained.account === input.session.claudeAccount
         && live.sdkSessionId === retained.sdkSessionId && !live.query && !live.active && !live.pending.size && !live.sentUserTurns);
       let results = [...earlier, ...latestToolResults(input, live.active || live.pending.size > 0 || retainedResume)];
+      const lineage = input.session.pendingLineageReconciliation ? input.session.nativeLineageSelection : undefined;
+      if (input.session.pendingLineageReconciliation && (!lineage || lineage.operationId !== input.session.pendingLineageReconciliation)) {
+        throw new BridgeError(409, "lineage_reconciliation_missing", "The selected lineage outcomes are unavailable.");
+      }
+      if (lineage) {
+        if (live.active || live.pending.size) throw new BridgeError(409, "lineage_reconciliation_busy", "Native work must settle before lineage reconciliation.");
+        live.recoveryReceipts = [];
+        const rawResults = trailing.flatMap(message => asBlocks(message.content)).filter(block => block.type === "tool_result");
+        if (rawResults.some(block => !("tool_use_id" in block) || typeof block.tool_use_id !== "string" || !block.tool_use_id)
+            || new Set(results.map(result => result.tool_use_id)).size !== results.length
+            || rawResults.length !== results.length) throw new BridgeError(409, "conflicting_settled_result", "Cross-lineage result identities are incomplete or ambiguous.");
+        const settled = lineage.sources.flatMap(source => source.checkpoint.settledToolResults);
+        results = results.filter(result => {
+          if (!matchesSettledHostResult(result, settled)) throw new BridgeError(409, "conflicting_settled_result", "A cross-lineage result is not proven by the selection audit.");
+          return false;
+        });
+      }
       const recovery = input.session.pendingHostRecovery;
       const recovered = recovery && input.session.completedHostRecoveries?.find(item => item.operationId === recovery.operationId);
       if (recovery && !recovered) throw new BridgeError(409, "recovery_receipt_missing", "The recovered host actions are unavailable; do not replay them.");
@@ -586,6 +603,7 @@ export class SdkRuntime implements BridgeRuntime {
         const content = coldImport
           ? buildInitialUserContent(input, cwd, this.config.factoryNative)
           : buildDynamicUserContent(input, cwd, { includeContext: live.lastHostContext !== context, factoryNative: this.config.factoryNative });
+        if (lineage) content.push({ type: "text", text: lineageReconciliationContext(lineage) });
         if (recovered && !recovery.notified) content.push({ type: "text", text: recoveredHostContext(recovered.receipts) });
         if (live.importStats) live.importStats.contentBytes = Buffer.byteLength(JSON.stringify(content));
         live.phase = "prompted";
@@ -601,6 +619,7 @@ export class SdkRuntime implements BridgeRuntime {
       const reply = await waiting;
       if (!reply.pendingToolIds.length) {
         if (recovered) reply.reconciledHostOperationId = recovered.operationId;
+        if (lineage && reply.response.stop_reason === "end_turn") reply.reconciledLineageOperationId = lineage.operationId;
         live.recoveryReceipts = undefined;
       }
       live.lastRequestKey = requestKey;

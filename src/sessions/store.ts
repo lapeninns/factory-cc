@@ -182,7 +182,9 @@ export class SessionStore {
 
   /** Never prune active work, callbacks, or a session pinned by the HTTP/control layer. */
   prune(protectedIds: ReadonlySet<string> = new Set(), now = Date.now()): string[] {
-    const eligible = this.list().filter((record) => !protectedIds.has(record.bridgeSessionId) && !isActive(record.state) && !record.pendingToolIds.length
+    const lineageReferences = new Set(this.list().flatMap(record => record.nativeLineageSelection
+      ? [record.bridgeSessionId, ...record.nativeLineageSelection.scopeInventory.map(item => item.bridgeSessionId)] : []));
+    const eligible = this.list().filter((record) => !protectedIds.has(record.bridgeSessionId) && !lineageReferences.has(record.bridgeSessionId) && !isActive(record.state) && !record.pendingToolIds.length
       && !Object.values(record.accountCooldowns ?? {}).some(until => Date.parse(until) > now))
       .sort((a, b) => Date.parse(a.updatedAt) - Date.parse(b.updatedAt));
     const removed: string[] = [];

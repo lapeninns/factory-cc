@@ -21,6 +21,9 @@ export interface SessionRecord {
   checkpointRetryBlocked?: boolean;
   upstreamCheckpointRecoveries?: UpstreamCheckpointRecovery[];
   dormantCheckpointRetirement?: DormantCheckpointRetirement;
+  lineageCancellation?: LineageCancellation;
+  nativeLineageSelection?: NativeLineageSelection;
+  pendingLineageReconciliation?: string;
   /** Authenticated host receipts retained until an admitted turn consumes them. */
   hostCompletionReceipts?: RuntimeHostCompletion[];
   /** Runtime that owns sdkSessionId. Absent on Claude sessions created before Cursor coexisted. */
@@ -171,4 +174,52 @@ export interface DormantCheckpointRetirement {
   checkpointSha256: string;
   evidenceSha256: string;
   evidence: NativeGenerationEvidence[];
+}
+
+
+export interface NativeLineageOutcome {
+  toolUseId: string;
+  toolName: string;
+  input: unknown;
+  content: unknown;
+  isError: boolean;
+}
+export interface NativeLineageCheckpoint {
+  checkpointSha256: string;
+  outcomes: NativeLineageOutcome[];
+  settledToolResults: SettledToolResult[];
+}
+export interface LineageCancellation {
+  before: Pick<SessionRecord, "bridgeSessionId" | "factorySessionId" | "factoryCwd" | "sdkSessionId" | "claudeAccount" | "nativeGeneration" | "provider" | "controllerWorkspacePolicy" | "contextHash" | "state" | "cancelRequested" | "cancellation" | "hostEnded" | "pendingToolIds" | "endedToolIds" | "hostCompletionReceipts" | "updatedAt">;
+  historySha256: string;
+}
+export interface NativeLineageBranchProof {
+  record: SessionRecord;
+  checkpoint: NativeLineageCheckpoint;
+  evidence: NativeGenerationEvidence[];
+}
+export interface NativeLineageSelection {
+  operationId: string;
+  at: string;
+  requestSha256: string;
+  proofSha256: string;
+  approval: { reference: string; approvedAt: string; selectedBridgeSessionId: string; selectedSdkSessionId: string; sourceBridgeSessionIds: string[] };
+  selected: NativeLineageBranchProof;
+  sources: NativeLineageBranchProof[];
+  historical: Array<{ record: SessionRecord; checkpointSha256: string; outcomesSha256: string; evidence: NativeGenerationEvidence[];
+    disposition?: NativeLineageHistoricalDisposition }>;
+  scopeInventory: Array<{ bridgeSessionId: string; sha256: string }>;
+  inactive: Array<{ record: SessionRecord; evidence: NativeGenerationEvidence[] }>;
+  reconciledAt?: string;
+}
+
+export interface NativeLineageHistoricalDisposition {
+  bridgeSessionId: string;
+  sdkSessionId: string;
+  checkpointSha256: string;
+  outcomesSha256: string;
+  selected: { bridgeSessionId: string; sdkSessionId: string; account: string; nativeGeneration: number; expectedUpdatedAt: string };
+  disposition: "archive-superseded";
+  approvalReference: string;
+  approvedAt: string;
 }

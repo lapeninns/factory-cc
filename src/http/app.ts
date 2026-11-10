@@ -1,3 +1,4 @@
+import { selectNativeLineage, selectedLineageSources, verifySelectedLineage, lineageCancellationSnapshot } from "../control/native-lineage-selection.js";
 import { retireDormantCheckpoint } from "../control/dormant-checkpoint-retirement.js";
 import { nativeAccountCandidates, nativeAssignedAccount } from "../runtime/native-account-admission.js";
 import { resolveRequestCwd } from "../workspace.js";
@@ -33,7 +34,7 @@ import { configuredModels, providerFromModelId, resolveRequestModel, type Bridge
 import { ClaudePool, PERSONAL_ACCOUNT, POOL_PROFILE } from "../upstream/claude-pool.js";
 import { DesktopJobsRuntime, SUBSCRIPTION_WORKER_SLOTS, type DesktopJobBinding, type DesktopWorkspacePolicy } from "../runtime/desktop-jobs.js";
 import { recoverNativeCheckpoint } from "../control/native-recovery.js";
-import { inspectConsumedHostCheckpoint, inspectCompletedHostCheckpoint, recoverCompletedHostCheckpoint } from "../control/completed-host-recovery.js";
+import { inspectConsumedHostCheckpoint, inspectCompletedHostCheckpoint, inspectLineageCheckpoint, recoverCompletedHostCheckpoint } from "../control/completed-host-recovery.js";
 import { extendCooldowns, persistedCooldowns, readUpstreamFailureEvidence, restoreUpstreamCheckpoint, verifyRetainedHostCheckpoint, type UpstreamRecoveryContext } from "../control/upstream-recovery.js";
 import type { RuntimeRequest } from "../runtime/types.js";
 
@@ -173,6 +174,10 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
   const requestLog = join(config.logDir, "requests.jsonl");
   const turnLog = join(config.logDir, "turns.jsonl");
   const activeRequests = new Map<string, symbol>();
+  function lineageSelectionContext() {
+    const context = upstreamRecoveryContext();
+    return context && { ...context, lineageCheckpoint: (record: SessionRecord) => inspectLineageCheckpoint(config.subscriptionAccounts ?? [], record) };
+  }
   function upstreamRecoveryContext(): UpstreamRecoveryContext | undefined {
     const workspacePolicy = controllerWorkspacePolicy(config);
     if (!desktopJobs || !config.controllerPool || !workspacePolicy || !claudePool) return;
@@ -182,6 +187,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       checkpoint: record => inspectCompletedHostCheckpoint(config.subscriptionAccounts ?? [], record, []),
       retiredCheckpoint: record => inspectCompletedHostCheckpoint(config.subscriptionAccounts ?? [], record, []),
       consumedCheckpoint: (record, receipts) => inspectConsumedHostCheckpoint(config.subscriptionAccounts ?? [], record, receipts),
+      lineageCheckpoint: record => inspectLineageCheckpoint(config.subscriptionAccounts ?? [], record),
       evidence: (record, sdk, generation) => readUpstreamFailureEvidence(config.logDir, record, sdk, generation, store.list()),
       restoreCooldown: (account, until) => claudePool.restoreCooldown(account, until) };
   }
@@ -488,6 +494,15 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       }
       return;
     }
+    if (req.method === "POST" && path === "/internal/select-native-lineage") {
+      requireAdminToken(req.headers, config.adminToken);
+      const context = lineageSelectionContext();
+      if (!context) throw new BridgeError(409, "native_recovery_unavailable", "Native lineage selection requires the supervised controller pool.");
+      const result = await selectNativeLineage(context, await readJson(req, config.maxBodyBytes));
+      logger.info("native_lineage_selection", { sessionId: result.bridgeSessionId, selected: result.selected, eligible: result.eligible === true });
+      json(res, 200, result);
+      return;
+    }
     if (req.method === "POST" && path === "/internal/dormant-checkpoint-retirement") {
       requireAdminToken(req.headers, config.adminToken);
       const context = upstreamRecoveryContext();
@@ -509,12 +524,28 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     }
     if (req.method === "POST" && path === "/internal/cancel") {
       requireAdminToken(req.headers, config.adminToken);
-      const body = (await readJson(req, config.maxBodyBytes)) as { sessionId?: string };
+      const body = (await readJson(req, config.maxBodyBytes)) as { sessionId?: string; preserveForLineageSelection?: boolean };
       if (!body.sessionId) throw new BridgeError(400, "invalid_request_error", "sessionId required");
       control.cancelApprovals(body.sessionId);
-      store.update(body.sessionId, { cancelRequested: true, cancellation: { at: new Date().toISOString(), source: "admin" }, pendingHostRecovery: undefined });
-      store.setState(body.sessionId, "CANCELLED");
+      if (body.preserveForLineageSelection !== undefined && typeof body.preserveForLineageSelection !== "boolean") {
+        throw new BridgeError(400, "invalid_request_error", "preserveForLineageSelection must be boolean");
+      }
+      let persistenceError: unknown;
+      const record = store.require(body.sessionId);
+      try {
+        if (body.preserveForLineageSelection && !record.lineageCancellation) {
+          const snapshot = lineageCancellationSnapshot(record);
+          if (Buffer.byteLength(JSON.stringify(snapshot)) > 1024 * 1024) throw new BridgeError(409, "lineage_snapshot_too_large", "The pre-cancellation evidence exceeds its bound.");
+          store.updateAtomic(body.sessionId, { lineageCancellation: snapshot });
+        }
+      } catch (error) { persistenceError = error; }
+      // Failure to archive evidence must not weaken an explicit cancellation.
+      try {
+        store.update(body.sessionId, { state: "CANCELLED", cancelRequested: true,
+          cancellation: { at: new Date().toISOString(), source: "admin" }, pendingHostRecovery: undefined });
+      } catch (error) { persistenceError ??= error; }
       await runtime.cancel(body.sessionId, "admin-cancel");
+      if (persistenceError) throw persistenceError;
       json(res, 200, { cancelled: body.sessionId });
       return;
     }
@@ -584,20 +615,35 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         && session.checkpointRetryBlocked && session.sdkSessionId)) {
       throw new BridgeError(409, "native_checkpoint_retry_unavailable", "This Workstream retains a native checkpoint whose retry proof needs operator recovery. A cold import was refused.");
     }
-    const retries = store.list().filter((session) => (session.state === "IDLE" && !session.pendingToolIds.length
+    let routingRecords = store.list();
+    const selectedOwners = config.controllerPool && factorySession && hostAllowsAnyTools(request)
+      ? routingRecords.filter(record => record.factorySessionId === factorySession.sessionId && record.factoryCwd === cwd && record.nativeLineageSelection) : [];
+    if (selectedOwners.length > 1) throw new BridgeError(409, "ambiguous_session", "Multiple native lineage selections exist.");
+    const selectedOwner = selectedOwners[0];
+    if (selectedOwner) {
+      const excluded = selectedLineageSources(routingRecords, selectedOwner);
+      const context = lineageSelectionContext();
+      if (!context) throw new BridgeError(409, "native_recovery_unavailable", "Native lineage proof validation is unavailable.");
+      await verifySelectedLineage(context, selectedOwner);
+      routingRecords = routingRecords.filter(record => !excluded.has(record.bridgeSessionId));
+    }
+    const selectedReconciliation = selectedOwner?.pendingLineageReconciliation && (!explicit || explicit === selectedOwner.bridgeSessionId)
+      && selectedOwner.contextHash === contextHash && selectedOwner.state === "IDLE" && !selectedOwner.cancelRequested;
+    const retries = routingRecords.filter((session) => (session.state === "IDLE" && !session.pendingToolIds.length
       || session.state === "WAITING_DROID_TOOL" && session.retryableRequestKind === "admission") && session.hostEnded === undefined
       && session.retryableRequestHash === requestFingerprint && (!explicit || session.bridgeSessionId === explicit || session.droidSessionId === explicit));
     if (retries.length > 1) throw new BridgeError(409, "ambiguous_session", "Multiple failed requests match; supply X-Bridge-Session");
-    const resolved = retries[0] ? { match: retries[0], reason: retries[0].retryableRequestKind === "admission" ? "admission-retry"
-      : retries[0].retryableRequestKind === "native-upstream" ? "native-upstream-retry" : "upstream-retry" } : resolveSession(store.list(), headers, request, {
+    const resolved = selectedReconciliation ? { match: selectedOwner, reason: "selected-lineage-reconciliation" } : retries[0] ? { match: retries[0], reason: retries[0].retryableRequestKind === "admission" ? "admission-retry"
+      : retries[0].retryableRequestKind === "native-upstream" ? "native-upstream-retry" : "upstream-retry" } : resolveSession(routingRecords, headers, request, {
       cwd, hostSessionId: control.hostSessionId(prepared.binding), allowModelSwitch: config.models !== undefined, provider, claudeProfile: listed?.claudeProfile,
       // Droid desktop has no conversation ID header or hooks to disambiguate.
       continueIdenticalTranscripts: config.desktopProfile,
     });
     if (config.controllerPool && factorySession) {
-      const retainedLineages = store.list().filter(session => session.factorySessionId === factorySession.sessionId
+      const retainedLineages = routingRecords.filter(session => session.factorySessionId === factorySession.sessionId
         && session.factoryCwd === factorySession.cwd
-        && (session.retainedCheckpoint || session.retryableRequestKind === "native-upstream"
+        && (hostAllowsAnyTools(request) && session.sdkSessionId && (!isEnded(session) || session.hostCompletionReceipts?.length)
+          || session.retainedCheckpoint || session.retryableRequestKind === "native-upstream"
           || session.retryableRequestKind === "upstream" && !session.sdkSessionId && session.historyMessageHashes?.length));
       if (retainedLineages.some(session => session.bridgeSessionId !== resolved.match?.bridgeSessionId)) {
         throw new BridgeError(409, "native_checkpoint_selection_required", "This Factory session has an unresolved retained checkpoint. Continue its exact native lineage or restore it before starting another request.",
@@ -617,6 +663,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       throw new BridgeError(429, "rate_limit_error", "The native checkpoint is retained for its owning account. Retry after its observed cooldown.",
         { retry_after: Math.max(1, Math.ceil((Date.parse(until ?? "") - Date.now()) / 1000)), checkpoint_retained: true, retry_mode: "native_checkpoint" });
     }
+    const healthyTailVerified = resolved.reason === "authenticated-healthy-checkpoint-tail" || resolved.reason === "selected-lineage-reconciliation";
     let retainedCheckpointVerified = false;
     if (config.controllerPool && resolved.match?.retryableRequestKind === "native-upstream") {
       const retained = resolved.match.retainedCheckpoint;
@@ -830,6 +877,8 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         retainedCheckpoint: undefined,
         retryableRequestKind: undefined,
         checkpointRetryBlocked: undefined,
+        ...(turn.reconciledLineageOperationId && turn.reconciledLineageOperationId === session.pendingLineageReconciliation
+          ? { pendingLineageReconciliation: undefined, nativeLineageSelection: { ...session.nativeLineageSelection!, reconciledAt: new Date().toISOString() } } : {}),
         ...(session.pendingHostRecovery ? { pendingHostRecovery: turn.pendingToolIds.length
           ? { ...session.pendingHostRecovery, notified: true } : undefined } : {}),
         ...(turn.reconciledHostOperationId && turn.reconciledHostOperationId === session.pendingHostRecovery?.operationId
@@ -873,7 +922,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       const retryableUpstream = error instanceof BridgeError && ([429, 529].includes(error.status) || error.code === "sdk_start_timeout") && error.extra.retry_from_history === true
         && !cancellationRequested && current && !current.cancelRequested && current.hostEnded === undefined
         && (current.state === "GENERATING" || current.state === "RESUMING")
-        && (retainedCheckpointVerified || (previous.historyMessageHashes ?? []).every((hash, index) => incomingHashes[index] === hash));
+        && (retainedCheckpointVerified || healthyTailVerified || (previous.historyMessageHashes ?? []).every((hash, index) => incomingHashes[index] === hash));
       // A limited account sits out its cooldown; the conversation continues on another account.
       const limitedAccount = claudePool && error instanceof BridgeError && error.code === "rate_limit_error" && current && provider !== "cursor"
         ? current.claudeAccount ?? listed?.claudeProfile ?? PERSONAL_ACCOUNT : undefined;

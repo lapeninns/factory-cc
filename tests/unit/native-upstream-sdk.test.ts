@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createBridgeApp, listen, type BridgeApp } from "../../src/http/app.js";
 import { SdkRuntime, type SdkHandle, type SdkUserInput } from "../../src/runtime/sdk-runtime.js";
+import { DesktopJobsRuntime } from "../../src/runtime/desktop-jobs.js";
 import { historyMessageHashes, sessionContextHash } from "../../src/sessions/correlate.js";
 import { hostResultDigest, mcpResultContent } from "../../src/runtime/host-recovery.js";
 import { BridgeError, type ContentBlock, type Message, type MessagesRequest } from "../../src/types.js";
@@ -18,6 +19,9 @@ class ProviderAdapter implements SdkHandle {
   readonly handlers = new Map<string, (args: Record<string, unknown>, extra?: unknown) => Promise<unknown>>();
   closes = 0;
   toolInvocations = 0;
+  attemptTools = false;
+  hostActionOnInput = 0;
+  denials: unknown[] = [];
   constructor(readonly sdkSessionId: string, readonly failures: number[]) {}
   tool(name: string, _description: string, _schema: unknown, handler: (args: Record<string, unknown>, extra?: unknown) => Promise<unknown>): unknown {
     this.handlers.set(name, handler);
@@ -45,6 +49,17 @@ class ProviderAdapter implements SdkHandle {
           const status = adapter.failures[adapter.inputs.length];
           adapter.inputs.push(input);
           yield { type: "system", subtype: "init", session_id: adapter.sdkSessionId };
+          if (adapter.attemptTools) {
+            const permit = args.options.canUseTool as (name: string, input: unknown, options: unknown) => Promise<unknown>;
+            for (const name of ["Bash", "mcp__droid__Script"]) adapter.denials.push(await permit(name, { command: "changed command" },
+              { signal: new AbortController().signal, toolUseID: `attempt-${name}` }));
+          }
+          if (adapter.hostActionOnInput === adapter.inputs.length) {
+            const id = `new-host-${adapter.inputs.length}`;
+            yield { type: "assistant", session_id: adapter.sdkSessionId,
+              message: { role: "assistant", content: [{ type: "tool_use", id, name: "mcp__droid__Script", input: { command: "intentional-new" } }] } };
+            await adapter.handlers.get("Script")!({ command: "intentional-new" }, { toolUseId: id });
+          }
           if (status) throw new BridgeError(status, status === 429 ? "rate_limit_error" : "overloaded_error", "synthetic provider failure", { retry_after: 60 });
           yield { type: "result", subtype: "success", is_error: false, result: "Continued exactly once", session_id: adapter.sdkSessionId };
         }
@@ -60,14 +75,23 @@ afterEach(async () => {
   vi.restoreAllMocks(); vi.useRealTimers();
 });
 
-async function fixture(failures: number[] = [], resultOnly = false) {
+async function fixture(failures: number[] = [], resultOnly = false, supervised = false) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "retained-http-sdk-"))); roots.push(root);
   const cwd = join(root, "workspace"); mkdirSync(cwd);
   const base = restartConfig(root), sdkId = randomUUID();
-  const config = { ...base, desktopJobs: false, subscriptionAccounts: base.subscriptionAccounts!.map(account => ({ ...account,
+  const config = { ...base, desktopJobs: supervised, subscriptionAccounts: base.subscriptionAccounts!.map(account => ({ ...account,
     env: { ...account.env, CLAUDE_CONFIG_DIR: join(root, account.profile) } })) };
   const sdk = new ProviderAdapter(sdkId, failures), logger = { info() {}, warn() {}, error() {} };
   const runtime = new SdkRuntime(config, logger, sdk);
+  if (supervised) {
+    vi.spyOn(DesktopJobsRuntime.prototype, "handle").mockImplementation((input, sink) => runtime.handle(input, sink));
+    vi.spyOn(DesktopJobsRuntime.prototype, "inspectNativeGenerations").mockImplementation(async request => [{
+      generation: Number(request.bridgeSessionId.match(/:g(\d+)$/)![1]), state: request.sdkSessionId === sdkId ? "failed" : "cancelled", bindingMatches: true, checkpointMatches: true,
+      cleanupVerified: true, ownerAlive: false, supervisorAlive: false, hostActionReservation: false, externalCleanupRequired: false,
+      endedAt: "2026-11-10T13:00:00Z", endedBy: "session_update",
+    }]);
+    vi.spyOn(DesktopJobsRuntime.prototype, "prepareCheckpointRetry").mockImplementation((id, sdkId) => runtime.prepareCheckpointRetry(id, sdkId));
+  }
   const coldRetry = vi.spyOn(runtime, "prepareColdRetry"), checkpointRetry = vi.spyOn(runtime, "prepareCheckpointRetry");
   const app = createBridgeApp(config, logger, "", runtime); apps.push(app); await listen(app, config);
   const token = await hostStart(app, root);
@@ -97,7 +121,7 @@ async function fixture(failures: number[] = [], resultOnly = false) {
     retainedCheckpoint: { sdkSessionId: sdkId, account: "team5", sourceGeneration: 4, preparedAt: new Date().toISOString(), origin: "operator-restored",
       checkpointSha256: createHash("sha256").update(readFileSync(file)).digest("hex"), settledToolIds: [resultId],
       settledToolResults: [{ toolUseId: resultId, resultSha256: hostResultDigest(JSON.stringify(resultContent), false) }] } });
-  return { app, runtime, sdk, sdkId, record, request, headers, coldRetry, checkpointRetry, token };
+  return { app, runtime, sdk, sdkId, record, request, headers, coldRetry, checkpointRetry, token, root, config, file };
 }
 
 /** Mirrors Factory Wz before the outbound role/content-only projection. */
@@ -211,5 +235,188 @@ describe("retained checkpoint HTTP to SDK delivery", () => {
     expect(f.sdk.options.map(options => options.resume)).toEqual([f.sdkId, f.sdkId]);
     expect(f.app.store.list()).toHaveLength(1);
     expect(f.coldRetry).not.toHaveBeenCalled();
+  });
+});
+
+
+function healthyRequest(f: Awaited<ReturnType<typeof fixture>>, count = 4): MessagesRequest {
+  const completed: Message[] = [{ role: "user", content: "Completed work" }, { role: "assistant", content: "Acknowledged" }];
+  f.app.store.update(f.record.bridgeSessionId, { retainedCheckpoint: undefined, retryableRequestKind: undefined,
+    historyMessageHashes: historyMessageHashes(completed), requestMessageHashes: historyMessageHashes(completed.slice(0, 1)) });
+  return { ...f.request, messages: [{ role: "user", content: "Compacted prefix" }, ...completed,
+    ...Array.from({ length: count }, (_, index): Message => ({ role: "user", content: `[factory-cc-session:${f.token}] context ${index}` }))] };
+}
+describe("healthy native continuity after compaction", () => {
+  it.each([4, 7])("retains one native owner across two successive compacted tails with %s user messages", async count => {
+    const f = await fixture(), request = healthyRequest(f, count);
+    const first = await postMessages(f.app.url, "client", request, f.headers);
+    expect(first.status).toBe(200); expect(first.session).toBe(f.record.bridgeSessionId);
+    const next: MessagesRequest = { ...request, messages: [{ role: "user", content: "Another compacted prefix" },
+      request.messages.at(-1)!, { role: "assistant", content: first.json.content as ContentBlock[] },
+      { role: "user", content: "More context" }, { role: "user", content: `[factory-cc-session:${f.token}] Continue again` }] };
+    const second = await postMessages(f.app.url, "client", next, f.headers);
+    expect(second.status).toBe(200); expect(second.session).toBe(f.record.bridgeSessionId);
+    expect(f.sdk.options[0]?.resume).toBe(f.sdkId); expect(f.sdk.options).toHaveLength(1);
+    expect(f.sdk.inputs).toHaveLength(2); expect(f.app.store.list()).toHaveLength(1);
+  });
+  it.each([429, 529])("preserves healthy rewritten-tail checkpoint after %s", async status => {
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(new Date("2026-11-10T14:00:00Z"));
+    const f = await fixture([status]), request = healthyRequest(f);
+    expect((await postMessages(f.app.url, "client", request, f.headers)).status).toBe(status);
+    expect(f.record).toMatchObject({ state: "IDLE", sdkSessionId: f.sdkId, retryableRequestKind: "native-upstream" });
+    vi.setSystemTime(new Date("2026-11-10T14:02:00Z"));
+    expect((await postMessages(f.app.url, "client", request, f.headers)).status).toBe(200);
+    expect(f.sdk.options.map(option => option.resume)).toEqual([f.sdkId, f.sdkId]);
+    expect(f.app.store.list()).toHaveLength(1);
+  });
+  it.each(["missing-anchor", "assistant-work", "unproven-result"])("refuses healthy %s before allocating a cold branch", async kind => {
+    const f = await fixture(), request = healthyRequest(f), before = structuredClone(f.record);
+    if (kind === "missing-anchor") request.messages.splice(1, 2);
+    if (kind === "assistant-work") request.messages.push({ role: "assistant", content: "Other work" }, { role: "user", content: "Continue" });
+    if (kind === "unproven-result") request.messages.push({ role: "user", content: [{ type: "tool_result", tool_use_id: "unknown", content: "done" }] });
+    expect((await postMessages(f.app.url, "client", request, f.headers)).status).toBe(409);
+    expect(f.sdk.options).toHaveLength(0); expect(f.record).toEqual(before); expect(f.app.store.list()).toHaveLength(1);
+  });
+});
+
+async function selectionFixture(failures: number[] = []) {
+  const f = await fixture(failures, false, true);
+  healthyRequest(f);
+  const source = f.app.store.create({ role: f.record.role, model: f.record.model, claudeAccount: "team5", nativeGeneration: 0, toolNames: ["Script"] });
+  const sourceSdk = randomUUID(), sourceFile = join(f.root, "team5", "projects", f.record.factoryCwd!.replace(/[^A-Za-z0-9]/g, "-"), sourceSdk + ".jsonl");
+  writeFileSync(sourceFile, [
+    { sessionId: sourceSdk, message: { role: "assistant", content: [{ type: "tool_use", id: "foreign-done", name: "mcp__droid__Script", input: {} }] } },
+    { sessionId: sourceSdk, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "foreign-done", content: [{ type: "text", text: "foreign output" }] }] } },
+  ].map(row => JSON.stringify(row)).join("\n"));
+  f.app.store.update(source.bridgeSessionId, { state: "FAILED", sdkSessionId: sourceSdk, contextHash: f.record.contextHash,
+    factorySessionId: f.record.factorySessionId, factoryCwd: f.record.factoryCwd, historyMessageHashes: ["foreign-history"],
+    endedToolIds: ["foreign-done"], hostCompletionReceipts: [{ toolUseId: "foreign-done", toolName: "Script", input: {}, content: "foreign output", isError: false }] });
+  const cancel = await fetch(`${f.app.url}/internal/cancel`, { method: "POST", headers: { authorization: "Bearer admin", "content-type": "application/json" },
+    body: JSON.stringify({ sessionId: source.bridgeSessionId, preserveForLineageSelection: true }) });
+  expect(cancel.status).toBe(200);
+  const identity = (record: typeof f.record) => ({ bridgeSessionId: record.bridgeSessionId, sdkSessionId: record.sdkSessionId, account: record.claudeAccount,
+    nativeGeneration: record.nativeGeneration, expectedUpdatedAt: record.updatedAt });
+  const body = { operationId: randomUUID(), factorySessionId: f.record.factorySessionId, factoryCwd: f.record.factoryCwd,
+    selected: identity(f.record), sources: [identity(source)] };
+  const send = async (data: unknown) => fetch(`${f.app.url}/internal/select-native-lineage`, { method: "POST",
+    headers: { authorization: "Bearer admin", "content-type": "application/json" }, body: JSON.stringify(data) });
+  const preview = await send({ ...body, dryRun: true }); expect(preview.status).toBe(200);
+  const proof = await preview.json() as { proofSha256: string };
+  const selected = await send({ ...body, proofSha256: proof.proofSha256, approval: { reference: "test-only-explicit-approval", approvedAt: new Date().toISOString(),
+    selectedBridgeSessionId: f.record.bridgeSessionId, selectedSdkSessionId: f.sdkId, sourceBridgeSessionIds: [source.bridgeSessionId] } });
+  expect(selected.status).toBe(200);
+  const request: MessagesRequest = { ...f.request, messages: [{ role: "user", content: `[factory-cc-session:${f.token}] Compacted foreign work` },
+    { role: "assistant", content: [{ type: "tool_use", id: "foreign-done", name: "Script", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "foreign-done", content: "foreign output" },
+      { type: "text", text: `[factory-cc-session:${f.token}] Reconcile the branches` }] }] };
+  return { ...f, source, request };
+}
+describe("selected native lineage HTTP to SDK reconciliation", () => {
+  it("denies new host and native actions, then permits the next normal compacted continuation on the original SDK", async () => {
+    const f = await selectionFixture(); f.sdk.attemptTools = true; f.sdk.hostActionOnInput = 1;
+    const response = await postMessages(f.app.url, "client", f.request, f.headers);
+    expect(response.status, JSON.stringify(response.json)).toBe(200); expect(response.session).toBe(f.record.bridgeSessionId);
+    expect(f.sdk.denials).toHaveLength(2);
+    expect(f.sdk.denials.every(result => (result as { behavior: string }).behavior === "deny")).toBe(true);
+    expect(f.sdk.inputs[0]!.message.content).toEqual(expect.arrayContaining([expect.objectContaining({ type: "text", text: expect.stringContaining("foreign output") })]));
+    expect(f.record.pendingLineageReconciliation).toBeUndefined();
+    expect(f.record.nativeLineageSelection?.reconciledAt).toBeDefined();
+    f.sdk.hostActionOnInput = 2;
+    const second: MessagesRequest = { ...f.request, messages: [{ role: "user", content: `[factory-cc-session:${f.token}] Compacted again` },
+      f.request.messages.at(-1)!, { role: "assistant", content: response.json.content as ContentBlock[] },
+      { role: "user", content: "Context" }, { role: "user", content: `[factory-cc-session:${f.token}] Start next batch` }] };
+    const next = await postMessages(f.app.url, "client", second, f.headers);
+    expect(next.status).toBe(200);
+    expect(next.json.stop_reason).toBe("tool_use");
+    expect(next.json.content).toEqual(expect.arrayContaining([expect.objectContaining({ type: "tool_use", name: "Script" })]));
+    expect(f.sdk.options[0]?.resume).toBe(f.sdkId); expect(f.sdk.options).toHaveLength(1);
+    expect(f.sdk.inputs).toHaveLength(2); expect(f.app.store.list()).toHaveLength(2);
+    expect(f.source.hostCompletionReceipts).toHaveLength(1);
+  });
+  it("still latches and cleans explicit cancellation when evidence archival fails", async () => {
+    const f = await fixture([], false, true), cancel = vi.spyOn(f.runtime, "cancel");
+    vi.spyOn(f.app.store, "updateAtomic").mockImplementationOnce(() => { throw new Error("archive failed"); });
+    const response = await fetch(`${f.app.url}/internal/cancel`, { method: "POST",
+      headers: { authorization: "Bearer admin", "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: f.record.bridgeSessionId, preserveForLineageSelection: true }) });
+    expect(response.status).toBe(500);
+    expect(f.record).toMatchObject({ state: "CANCELLED", cancelRequested: true, cancellation: { source: "admin" } });
+    expect(cancel).toHaveBeenCalledWith(f.record.bridgeSessionId, "admin-cancel");
+    expect(f.record.lineageCancellation).toBeUndefined();
+  });
+
+  it("preserves the selected owner through SessionEnd, controller hydration and fresh SessionStart", async () => {
+    const f = await selectionFixture();
+    const first = await postMessages(f.app.url, "client", f.request, f.headers);
+    expect(first.status).toBe(200);
+    const ended = await fetch(`${f.app.url}/internal/host-events`, { method: "POST",
+      headers: { authorization: "Bearer hook", "content-type": "application/json" },
+      body: JSON.stringify({ eventId: randomUUID(), bindingToken: f.token,
+        event: { hook_event_name: "SessionEnd", session_id: FACTORY_SESSION, cwd: f.record.factoryCwd, reason: "exit" } }) });
+    expect(ended.status).toBe(200); expect(f.record.hostEnded).toBe("resumable");
+    await f.app.close(); apps.splice(apps.indexOf(f.app), 1);
+    const sdk = new ProviderAdapter(f.sdkId, []), runtime = new SdkRuntime(f.config, { info() {}, warn() {}, error() {} }, sdk);
+    vi.spyOn(DesktopJobsRuntime.prototype, "handle").mockImplementation((input, sink) => runtime.handle(input, sink));
+    const app = createBridgeApp(f.config, { info() {}, warn() {}, error() {} }, "", runtime); apps.push(app); await listen(app, f.config);
+    const token = await hostStart(app, f.root), owner = app.store.require(f.record.bridgeSessionId);
+    const request: MessagesRequest = { ...f.request, messages: [{ role: "user", content: `[factory-cc-session:${token}] Fresh compacted context` },
+      f.request.messages.at(-1)!, { role: "assistant", content: first.json.content as ContentBlock[] },
+      { role: "user", content: "Restart context" }, { role: "user", content: `[factory-cc-session:${token}] Continue original lineage` }] };
+    const second = await postMessages(app.url, "client", request, f.headers);
+    expect(second.status, JSON.stringify(second.json)).toBe(200); expect(second.session).toBe(owner.bridgeSessionId);
+    expect(owner.sdkSessionId).toBe(f.sdkId); expect(owner.nativeGeneration).toBe(9);
+    expect(sdk.options[0]?.resume).toBe(f.sdkId); expect(app.store.list()).toHaveLength(2);
+  });
+
+  it("retains the pending reconciliation across a quota failure followed by normal host end", async () => {
+    const f = await selectionFixture([529]);
+    expect((await postMessages(f.app.url, "client", f.request, f.headers)).status).toBe(529);
+    const ended = await fetch(`${f.app.url}/internal/host-events`, { method: "POST",
+      headers: { authorization: "Bearer hook", "content-type": "application/json" },
+      body: JSON.stringify({ eventId: randomUUID(), bindingToken: f.token,
+        event: { hook_event_name: "SessionEnd", session_id: FACTORY_SESSION, cwd: f.record.factoryCwd, reason: "exit" } }) });
+    expect(ended.status).toBe(200);
+    expect(f.record.hostEnded).toBe("resumable");
+    expect(f.record.pendingLineageReconciliation).toBeDefined();
+    expect(f.record.sdkSessionId).toBe(f.sdkId);
+  });
+
+  it("preserves reconciliation on pre-prompt deferral and refuses a terminal 502 retry", async () => {
+    const f = await selectionFixture([502]);
+    vi.spyOn(f.runtime, "handle").mockRejectedValueOnce(new BridgeError(503, "desktop_job_timeout", "deferred", { retry_safe: true, phase: "admission" }));
+    expect((await postMessages(f.app.url, "client", f.request, f.headers)).status).toBe(503);
+    expect(f.record.pendingLineageReconciliation).toBeDefined();
+    expect(f.sdk.inputs).toHaveLength(0);
+    expect((await postMessages(f.app.url, "client", f.request, f.headers)).status).toBe(502);
+    expect(f.record.state).toBe("FAILED");
+    expect(f.record.pendingLineageReconciliation).toBeDefined();
+    expect(f.checkpointRetry).not.toHaveBeenCalled();
+    expect((await postMessages(f.app.url, "client", f.request, f.headers)).status).toBe(409);
+    expect(f.sdk.inputs).toHaveLength(1);
+  });
+
+  it.each(["unknown", "changed", "duplicate", "missing"])("refuses %s cross-lineage results before a query", async kind => {
+    const f = await selectionFixture();
+    const blocks = f.request.messages.at(-1)!.content as ContentBlock[];
+    if (kind === "unknown") blocks[0] = { ...blocks[0], tool_use_id: "unknown" };
+    if (kind === "changed") blocks[0] = { ...blocks[0], content: "changed result" };
+    if (kind === "duplicate") blocks.push({ ...blocks[0] });
+    if (kind === "missing") { blocks[0] = { type: "tool_result", content: "missing identity" }; }
+    expect((await postMessages(f.app.url, "client", f.request, f.headers)).status).toBe(409);
+    expect(f.record.pendingLineageReconciliation).toBeDefined();
+    expect(f.sdk.inputs).toHaveLength(0);
+  });
+
+  it.each([429, 529])("retains the hard reconciliation barrier across %s and same-SDK retry", async status => {
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(new Date("2026-11-10T14:00:00Z"));
+    const f = await selectionFixture([status]); f.sdk.attemptTools = true;
+    expect((await postMessages(f.app.url, "client", f.request, f.headers)).status).toBe(status);
+    expect(f.record.pendingLineageReconciliation).toBeDefined();
+    expect(f.record.retainedCheckpoint?.sdkSessionId).toBe(f.sdkId);
+    vi.setSystemTime(new Date("2026-11-10T14:02:00Z"));
+    expect((await postMessages(f.app.url, "client", f.request, f.headers)).status).toBe(200);
+    expect(f.sdk.denials.every(result => (result as { behavior: string }).behavior === "deny")).toBe(true);
+    expect(f.record.pendingLineageReconciliation).toBeUndefined();
+    expect(f.sdk.options.map(option => option.resume)).toEqual([f.sdkId, f.sdkId]);
   });
 });

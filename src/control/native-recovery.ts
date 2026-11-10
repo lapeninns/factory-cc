@@ -1,7 +1,8 @@
+import { selectedLineageSources, verifySelectedLineage } from "./native-lineage-selection.js";
 import { inspectRetiredSibling } from "./dormant-checkpoint-retirement.js";
 import type { DesktopWorkspacePolicy, NativeGenerationEvidence, NativeGenerationInspection, SubscriptionProfile } from "../runtime/desktop-jobs.js";
 import type { BridgeRuntime } from "../runtime/types.js";
-import { isEnded, type SessionRecord } from "../sessions/state.js";
+import { isEnded, type SessionRecord, type NativeLineageCheckpoint } from "../sessions/state.js";
 import type { SessionStore } from "../sessions/store.js";
 import { BridgeError, type Json } from "../types.js";
 
@@ -25,6 +26,7 @@ export interface NativeCheckpointRecoveryContext {
   inspect(request: NativeGenerationInspection): Promise<NativeGenerationEvidence[]>;
   now?: () => Date;
   retiredCheckpoint?(record: SessionRecord): string;
+  lineageCheckpoint?(record: SessionRecord): NativeLineageCheckpoint;
 }
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
@@ -90,8 +92,15 @@ export async function recoverNativeCheckpoint(context: NativeCheckpointRecoveryC
   return { ok: true, recovered: true, bridgeSessionId: request.bridgeSessionId, nativeGeneration: nextGeneration };
 }
 
-export async function inspectRecoverySiblings(context: NativeCheckpointRecoveryContext, factorySessionId: string, siblings: SessionRecord[], targetBridgeSessionId?: string): Promise<void> {
+export async function inspectRecoverySiblings(context: NativeCheckpointRecoveryContext, factorySessionId: string, siblings: SessionRecord[], targetBridgeSessionId?: string, targetSnapshot?: SessionRecord): Promise<void> {
+  const target = targetSnapshot ?? (targetBridgeSessionId ? context.store.get(targetBridgeSessionId) : undefined);
+  const excluded = target?.nativeLineageSelection ? selectedLineageSources(context.store.list(), target) : new Set<string>();
+  if (excluded.size) {
+    if (!context.lineageCheckpoint) refuse("lineage_selection_proof_unavailable");
+    await verifySelectedLineage({ ...context, lineageCheckpoint: context.lineageCheckpoint }, target!);
+  }
   for (const sibling of siblings) {
+    if (excluded.has(sibling.bridgeSessionId)) continue;
     if (sibling.dormantCheckpointRetirement) {
       await inspectRetiredSibling(context, sibling, targetBridgeSessionId);
       continue;
@@ -148,7 +157,9 @@ function eligibleRecord(context: NativeCheckpointRecoveryContext, request: Nativ
 export function verifyRecoverySessionInactive(context: NativeCheckpointRecoveryContext, record: SessionRecord): void {
   const id = record.bridgeSessionId;
   if (recoverySessionActive(context, id)) refuse("session_active");
+  const excluded = record.nativeLineageSelection ? selectedLineageSources(context.store.list(), record) : new Set<string>();
   for (const sibling of context.store.list()) {
+    if (excluded.has(sibling.bridgeSessionId)) continue;
     if (sibling.bridgeSessionId === id || sibling.factorySessionId !== record.factorySessionId) continue;
     if (recoverySessionActive(context, sibling.bridgeSessionId)) refuse("sibling_active");
     // A completed turn elsewhere is either live work or newer than this

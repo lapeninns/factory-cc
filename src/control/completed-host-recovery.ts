@@ -7,7 +7,7 @@ import { StableDroidToolNames } from "../runtime/droid-mcp-catalog.js";
 import type { RuntimeHostCompletion } from "../runtime/types.js";
 import { MAX_RECOVERY_CONTEXT_BYTES, hostReceiptContent, mcpResultContent, nativeResultDigest, recoveredHostContext } from "../runtime/host-recovery.js";
 import { sameToolInput } from "../sessions/compaction.js";
-import type { CompletedHostRecovery, SessionRecord, SettledToolResult } from "../sessions/state.js";
+import type { CompletedHostRecovery, SessionRecord, SettledToolResult, NativeLineageCheckpoint } from "../sessions/state.js";
 import { BridgeError, type Json } from "../types.js";
 import { inspectRecoverySiblings, relatedRecoveryRecords, verifyRecoverySessionInactive, type NativeCheckpointRecoveryContext } from "./native-recovery.js";
 
@@ -191,6 +191,22 @@ export function inspectConsumedHostCheckpoint(accounts: readonly SubscriptionAcc
     });
   });
   return { checkpointSha256, settledToolResults };
+}
+
+/** Complete native outcomes, including built-in actions that have no host receipt. */
+export function inspectLineageCheckpoint(accounts: readonly SubscriptionAccount[], record: SessionRecord): NativeLineageCheckpoint {
+  const consumed = inspectConsumedHostCheckpoint(accounts, record, record.hostCompletionReceipts ?? []);
+  const outcomes: NativeLineageCheckpoint["outcomes"] = [];
+  const checkpointSha256 = readCheckpoint(accounts, record, text => {
+    const { calls, results } = checkpointActions(text, record.sdkSessionId!);
+    for (const [toolUseId, call] of calls) {
+      const result = results.get(toolUseId)!;
+      outcomes.push({ toolUseId, toolName: call.name, input: call.input, content: result.content, isError: result.isError });
+    }
+  });
+  if (checkpointSha256 !== consumed.checkpointSha256) refuse("checkpoint_changed");
+  return { checkpointSha256, outcomes, settledToolResults: outcomes.map(outcome => ({ toolUseId: outcome.toolUseId,
+    resultSha256: nativeResultDigest(outcome.content, outcome.isError) })) };
 }
 
 function readCheckpoint(accounts: readonly SubscriptionAccount[], record: SessionRecord, inspect: (text: string) => void): string {

@@ -27,6 +27,7 @@ export interface RuntimeTurn {
   notes?: string[];
   /** The reconciliation-only native turn ended without dispatching new host work. */
   reconciledHostOperationId?: string;
+  reconciledLineageOperationId?: string;
 }
 
 export interface StreamSink {
