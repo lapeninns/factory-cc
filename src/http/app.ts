@@ -604,50 +604,58 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     const request = prepared.request;
     const listed = configuredModels(config).find((model) => model.id === request.model);
     const provider: ModelProvider = listed?.provider ?? providerFromModelId(request.model);
-    // Before this conversation takes a slot, free the one it replaces.
-    releaseCompacted(request);
+    const permitsTools = hostAllowsAnyTools(request);
     const summarized = summarizedSession(request);
     const contextHash = sessionContextHash(headers, request, cwd, provider, listed?.claudeProfile);
     const incomingHashes = historyMessageHashes(request.messages);
     const requestFingerprint = createHash("sha256").update(JSON.stringify({ request, role, cwd, provider, contextHash, host: control.hostSessionId(prepared.binding) ?? null })).digest("hex");
     const explicit = explicitSessionId(headers, request);
+    const implicitAuxiliary = Boolean(factorySession && !explicit && !permitsTools);
     if (config.controllerPool && factorySession && store.list().some(session => session.factorySessionId === factorySession.sessionId
         && nativePurpose(session) !== "auxiliary" && session.checkpointRetryBlocked && session.sdkSessionId)) {
       throw new BridgeError(409, "native_checkpoint_retry_unavailable", "This Workstream retains a native checkpoint whose retry proof needs operator recovery. A cold import was refused.");
     }
     let routingRecords = store.list();
-    const selectedOwners = config.controllerPool && factorySession && hostAllowsAnyTools(request)
+    const selectedOwners = config.controllerPool && factorySession && permitsTools
       ? routingRecords.filter(record => record.factorySessionId === factorySession.sessionId && record.factoryCwd === cwd && record.nativeLineageSelection) : [];
     if (selectedOwners.length > 1) throw new BridgeError(409, "ambiguous_session", "Multiple native lineage selections exist.");
     const selectedOwner = selectedOwners[0];
-    if (selectedOwner) {
-      const excluded = selectedLineageSources(routingRecords, selectedOwner);
+    const verifyLineageOwner = async (owner: SessionRecord): Promise<void> => {
+      if (!factorySession || owner.factorySessionId !== factorySession.sessionId || owner.factoryCwd !== factorySession.cwd) {
+        throw new BridgeError(409, "native_lineage_binding_required", "Continue the selected native lineage from its authenticated Factory workspace.");
+      }
+      if (owner.pendingLineageReconciliation && (!permitsTools || owner.contextHash !== contextHash
+          || owner.model !== request.model || sessionProvider(owner) !== provider)) {
+        throw new BridgeError(409, "lineage_reconciliation_context_changed", "Finish lineage reconciliation with the selected execution settings and advertised tools.");
+      }
+      const excluded = selectedLineageSources(routingRecords, owner);
       const context = lineageSelectionContext();
       if (!context) throw new BridgeError(409, "native_recovery_unavailable", "Native lineage proof validation is unavailable.");
-      await verifySelectedLineage(context, selectedOwner);
+      await verifySelectedLineage(context, owner);
       routingRecords = routingRecords.filter(record => !excluded.has(record.bridgeSessionId));
-    }
-    if (selectedOwner?.pendingLineageReconciliation && (selectedOwner.contextHash !== contextHash
-        || selectedOwner.model !== request.model || sessionProvider(selectedOwner) !== provider)) {
-      throw new BridgeError(409, "lineage_reconciliation_context_changed", "Finish lineage reconciliation with the selected execution settings before changing models or reasoning.");
-    }
+    };
+    if (selectedOwner) await verifyLineageOwner(selectedOwner);
     const selectedReconciliation = selectedOwner?.pendingLineageReconciliation && (!explicit || explicit === selectedOwner.bridgeSessionId)
       && selectedOwner.contextHash === contextHash && selectedOwner.state === "IDLE" && !selectedOwner.cancelRequested;
     const retries = routingRecords.filter((session) => (session.state === "IDLE" && !session.pendingToolIds.length
       || session.state === "WAITING_DROID_TOOL" && session.retryableRequestKind === "admission") && session.hostEnded === undefined
+      && (!implicitAuxiliary || nativePurpose(session) === "auxiliary")
       && session.retryableRequestHash === requestFingerprint && (!explicit || session.bridgeSessionId === explicit || session.droidSessionId === explicit));
     if (retries.length > 1) throw new BridgeError(409, "ambiguous_session", "Multiple failed requests match; supply X-Bridge-Session");
-    const resolved = selectedReconciliation ? { match: selectedOwner, reason: "selected-lineage-reconciliation" } : retries[0] ? { match: retries[0], reason: retries[0].retryableRequestKind === "admission" ? "admission-retry"
-      : retries[0].retryableRequestKind === "native-upstream" ? "native-upstream-retry" : "upstream-retry" } : resolveSession(routingRecords, headers, request, {
-      cwd, hostSessionId: control.hostSessionId(prepared.binding), allowModelSwitch: config.models !== undefined, provider, claudeProfile: listed?.claudeProfile,
-      // Droid desktop has no conversation ID header or hooks to disambiguate.
-      continueIdenticalTranscripts: config.desktopProfile,
-    });
+    const retry = retries[0] && { match: retries[0], reason: retries[0].retryableRequestKind === "admission" ? "admission-retry"
+      : retries[0].retryableRequestKind === "native-upstream" ? "native-upstream-retry" : "upstream-retry" };
+    const resolved = selectedReconciliation ? { match: selectedOwner, reason: "selected-lineage-reconciliation" }
+      : retry && !implicitAuxiliary ? retry : resolveSession(routingRecords, headers, request, {
+        cwd, hostSessionId: factorySession?.sessionId, allowModelSwitch: config.models !== undefined, provider, claudeProfile: listed?.claudeProfile,
+        // Droid desktop has no conversation ID header or hooks to disambiguate.
+        continueIdenticalTranscripts: config.desktopProfile, auxiliaryRetry: retry,
+      });
+    if (resolved.match?.nativeLineageSelection && resolved.match !== selectedOwner) await verifyLineageOwner(resolved.match);
     if (config.controllerPool && factorySession) {
       const retainedLineages = routingRecords.filter(session => session.factorySessionId === factorySession.sessionId
         && session.factoryCwd === factorySession.cwd
         && nativePurpose(session) !== "auxiliary"
-        && (hostAllowsAnyTools(request) && session.sdkSessionId
+        && (permitsTools && session.sdkSessionId
           || session.retainedCheckpoint || session.retryableRequestKind === "native-upstream"
           || session.retryableRequestKind === "upstream" && !session.sdkSessionId && session.historyMessageHashes?.length));
       if (retainedLineages.some(session => session.bridgeSessionId !== resolved.match?.bridgeSessionId)) {
@@ -687,11 +695,13 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         { retainedCheckpoint: { ...retained, settledToolResults: inspected.settledToolResults } });
       retainedCheckpointVerified = true;
     }
+    // Release a replaced slot only after proof checks. Bound tool-free requests leave it parked.
+    if (permitsTools || !factorySession) releaseCompacted(request);
     if (claudeAccount) logger.info("claude_account_assigned", { model: request.model, account: claudeAccount });
     const session = resolved.match
       ?? withSlot(() => store.create({
         role,
-        nativePurpose: hostAllowsAnyTools(request) ? "interactive" : "auxiliary",
+        nativePurpose: permitsTools ? "interactive" : "auxiliary",
         model: request.model,
         ...(claudeAccount ? { claudeAccount } : {}),
         ...(config.controllerPool ? { nativeGeneration: 0 } : {}),
@@ -831,7 +841,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         hostEnded: undefined,
         retryableRequestHash: undefined,
         retryableRequestKind: retainedCheckpointVerified ? "native-upstream" : undefined,
-        ...(hostAllowsAnyTools(request) ? { nativePurpose: "interactive" as const } : {}),
+        ...(permitsTools ? { nativePurpose: "interactive" as const } : {}),
         ...(session.nativeLineageSelection && !session.pendingLineageReconciliation
           ? { nativeLineageContext: { model: request.model, contextHash, reasoning: droidReasoningLevel(request) } } : {}),
         role,

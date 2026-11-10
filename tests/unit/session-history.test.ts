@@ -641,6 +641,32 @@ describe("conversation continuity and isolation", () => {
       }] }).match).toBeUndefined();
     });
 
+    it("checks full interactive result ownership before an implicit auxiliary retry", () => {
+      const callId = "owned-result";
+      const request: MessagesRequest = { ...compacted, tools: [], messages: [...compacted.messages.slice(0, -1),
+        { role: "user", content: [{ type: "tool_result", tool_use_id: callId, content: "done" }] }] };
+      const owner = owned({ state: "WAITING_DROID_TOOL", pendingToolIds: [callId] });
+      const auxiliary = owned({ bridgeSessionId: "auxiliary", droidSessionId: "auxiliary-droid", nativePurpose: "auxiliary" });
+      const options = { cwd, hostSessionId: "host-a", auxiliaryRetry: { match: auxiliary, reason: "admission-retry" } };
+      expect(() => resolveSession([owner, auxiliary], headers, request, options)).toThrowError(expect.objectContaining({ code: "explicit_session_required" }));
+      expect(resolveSession([owner, auxiliary], { ...headers, "x-bridge-session": owner.bridgeSessionId }, request, options).match).toBe(owner);
+      expect(() => resolveSession([{ ...owner, state: "CANCELLED", pendingToolIds: [], endedToolIds: [callId] }, auxiliary], headers, request, options))
+        .toThrowError(expect.objectContaining({ code: "session_unavailable" }));
+    });
+
+    it("partitions active duplicates and provider replays for authenticated tool-free requests", () => {
+      const request: MessagesRequest = { ...compacted, tools: [], messages: [userMessage("Same request")] };
+      const requestMessageHashes = historyMessageHashes(request.messages);
+      const active = owned({ state: "GENERATING", requestMessageHashes, historyMessageHashes: undefined });
+      expect(resolveOwned([active], request).match).toBeUndefined();
+      expect(() => resolveOwned([{ ...active, nativePurpose: "auxiliary" }], request)).toThrowError(expect.objectContaining({ code: "ambiguous_session" }));
+      const cursor = owned({ provider: "cursor", contextHash: sessionContextHash(headers, request, cwd, "cursor"), requestMessageHashes, historyMessageHashes: undefined });
+      const options = { cwd, hostSessionId: "host-a", provider: "cursor" as const };
+      expect(resolveSession([cursor], headers, request, options).match).toBeUndefined();
+      const auxiliary = { ...cursor, nativePurpose: "auxiliary" as const };
+      expect(resolveSession([auxiliary], headers, request, options)).toMatchObject({ match: auxiliary, reason: "request-replay" });
+    });
+
     it("rejects ambiguous retained turns instead of guessing one native checkpoint", () => {
       expect(() => resolveOwned([owned(), owned({ bridgeSessionId: "bridge-b", sdkSessionId: "sdk-b" })]))
         .toThrowError(expect.objectContaining({ status: 409, code: "ambiguous_session" }));

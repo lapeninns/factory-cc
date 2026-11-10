@@ -39,6 +39,7 @@ class ProviderAdapter implements SdkHandle {
   query(args: { prompt: AsyncIterable<SdkUserInput>; options: Record<string, unknown> }) {
     this.options.push(args.options);
     const adapter = this;
+    const sdkSessionId = args.options.resume ? adapter.sdkSessionId : randomUUID();
     return {
       async interrupt() {},
       close() { adapter.closes++; },
@@ -48,7 +49,7 @@ class ProviderAdapter implements SdkHandle {
         for await (const input of args.prompt) {
           const status = adapter.failures[adapter.inputs.length];
           adapter.inputs.push(input);
-          yield { type: "system", subtype: "init", session_id: adapter.sdkSessionId };
+          yield { type: "system", subtype: "init", session_id: sdkSessionId };
           if (adapter.attemptTools) {
             const permit = args.options.canUseTool as (name: string, input: unknown, options: unknown) => Promise<unknown>;
             for (const name of ["Bash", "mcp__droid__Script"]) adapter.denials.push(await permit(name, { command: "changed command" },
@@ -56,12 +57,12 @@ class ProviderAdapter implements SdkHandle {
           }
           if (adapter.hostActionOnInput === adapter.inputs.length) {
             const id = `new-host-${adapter.inputs.length}`;
-            yield { type: "assistant", session_id: adapter.sdkSessionId,
+            yield { type: "assistant", session_id: sdkSessionId,
               message: { role: "assistant", content: [{ type: "tool_use", id, name: "mcp__droid__Script", input: { command: "intentional-new" } }] } };
             await adapter.handlers.get("Script")!({ command: "intentional-new" }, { toolUseId: id });
           }
           if (status) throw new BridgeError(status, status === 429 ? "rate_limit_error" : "overloaded_error", "synthetic provider failure", { retry_after: 60 });
-          yield { type: "result", subtype: "success", is_error: false, result: "Continued exactly once", session_id: adapter.sdkSessionId };
+          yield { type: "result", subtype: "success", is_error: false, result: "Continued exactly once", session_id: sdkSessionId };
         }
       },
     };
@@ -246,6 +247,48 @@ function healthyRequest(f: Awaited<ReturnType<typeof fixture>>, count = 4): Mess
   return { ...f.request, messages: [{ role: "user", content: "Compacted prefix" }, ...completed,
     ...Array.from({ length: count }, (_, index): Message => ({ role: "user", content: `[factory-cc-session:${f.token}] context ${index}` }))] };
 }
+function toolFree(request: MessagesRequest, mode: "empty" | "none"): MessagesRequest {
+  return mode === "empty" ? { ...request, tools: [] } : { ...request, tool_choice: { type: "none" } };
+}
+
+const auxiliaryRoutes = (["empty", "none"] as const).flatMap(mode =>
+  (["retry", "prefix", "single-tail", "multi-tail"] as const).map(route => ({ mode, route })));
+
+describe("authenticated tool-free routing on the same workspace", () => {
+  it.each(auxiliaryRoutes)("keeps $mode requests independent across $route matching", async ({ mode, route }) => {
+    const f = await fixture(); f.config.desktopProfile = false;
+    const headers = { ...f.headers, "x-bridge-cwd": f.record.factoryCwd! };
+    const request = toolFree(healthyRequest(f, route === "multi-tail" ? 2 : 1), mode);
+    if (route === "prefix") request.messages = request.messages.slice(1);
+    f.app.store.update(f.record.bridgeSessionId, { nativePurpose: "interactive" });
+    if (route === "retry") {
+      vi.spyOn(f.runtime, "handle").mockRejectedValueOnce(new BridgeError(503, "desktop_job_timeout", "deferred", { retry_safe: true, phase: "admission" }));
+      const deferred = await postMessages(f.app.url, "client", request, { ...headers, "x-bridge-session": f.record.bridgeSessionId });
+      expect(deferred.status).toBe(503); expect(f.record.retryableRequestHash).toBeDefined();
+    }
+    const before = structuredClone(f.record);
+    const response = await postMessages(f.app.url, "client", request, headers);
+    expect(response.status, JSON.stringify(response.json)).toBe(200);
+    expect(response.session).not.toBe(f.record.bridgeSessionId);
+    const auxiliary = f.app.store.require(response.session!);
+    expect(auxiliary.nativePurpose).toBe("auxiliary"); expect(auxiliary.sdkSessionId).not.toBe(f.sdkId);
+    expect(f.sdk.options[0]?.resume).toBeUndefined();
+    expect(f.record).toEqual(before); expect(f.app.store.list()).toHaveLength(2);
+  });
+
+  it("can retry an established auxiliary admission without selecting the interactive owner", async () => {
+    const f = await fixture(); f.config.desktopProfile = false;
+    const headers = { ...f.headers, "x-bridge-cwd": f.record.factoryCwd! };
+    const request = toolFree(healthyRequest(f, 1), "none"), before = structuredClone(f.record);
+    vi.spyOn(f.runtime, "handle").mockRejectedValueOnce(new BridgeError(503, "desktop_job_timeout", "deferred", { retry_safe: true, phase: "admission" }));
+    const deferred = await postMessages(f.app.url, "client", request, headers);
+    expect(deferred.status).toBe(503); expect(deferred.session).toBeDefined();
+    const response = await postMessages(f.app.url, "client", request, headers);
+    expect(response.status).toBe(200); expect(response.session).toBe(deferred.session);
+    expect(f.record).toEqual(before); expect(f.app.store.list()).toHaveLength(2);
+  });
+});
+
 describe("healthy native continuity after compaction", () => {
   it.each([4, 7])("retains one native owner across two successive compacted tails with %s user messages", async count => {
     const f = await fixture(), request = healthyRequest(f, count);
@@ -412,23 +455,51 @@ describe("selected native lineage HTTP to SDK reconciliation", () => {
     expect(f.record.sdkSessionId).toBe(f.sdkId);
   });
 
-  it("keeps an interactive owner through an explicit empty-tools turn and subsequent compaction", async () => {
+  it.each(["empty", "none"] as const)("keeps an interactive owner through an explicit tool-free %s turn and subsequent compaction", async mode => {
     const f = await selectionFixture(); f.config.desktopProfile = false;
     const headers = { ...f.headers, "x-bridge-cwd": f.record.factoryCwd! };
     const first = await postMessages(f.app.url, "client", f.request, headers);
     expect(first.status).toBe(200);
-    const noTools: MessagesRequest = { ...f.request, tools: [], messages: [...f.request.messages,
+    const noTools = toolFree({ ...f.request, messages: [...f.request.messages,
       { role: "assistant", content: first.json.content as ContentBlock[] },
-      { role: "user", content: `[factory-cc-session:${f.token}] Explain without tools` }] };
+      { role: "user", content: `[factory-cc-session:${f.token}] Explain without tools` }] }, mode);
     const second = await postMessages(f.app.url, "client", noTools, { ...headers, "x-bridge-session": f.record.bridgeSessionId });
     expect(second.status, JSON.stringify(second.json)).toBe(200);
-    expect(f.record.toolNames).toEqual([]); expect(f.record.nativePurpose).toBe("interactive");
+    expect(f.record.toolNames).toEqual(mode === "empty" ? [] : ["Script"]); expect(f.record.nativePurpose).toBe("interactive");
     const next: MessagesRequest = { ...f.request, messages: [{ role: "user", content: `[factory-cc-session:${f.token}] Rewritten summary` },
       noTools.messages.at(-1)!, { role: "assistant", content: second.json.content as ContentBlock[] },
       { role: "user", content: "Context" }, { role: "user", content: "Continue normally" }] };
     const third = await postMessages(f.app.url, "client", next, headers);
     expect(third.status, JSON.stringify(third.json)).toBe(200); expect(third.session).toBe(f.record.bridgeSessionId);
     expect(f.sdk.inputs).toHaveLength(3); expect(f.record.sdkSessionId).toBe(f.sdkId);
+  });
+
+  it.each(["stale-source", "corrupt-source"])("checks %s on an explicit tool-free continuation", async kind => {
+    const f = await selectionFixture(); f.config.desktopProfile = false;
+    const headers = { ...f.headers, "x-bridge-cwd": f.record.factoryCwd! };
+    const first = await postMessages(f.app.url, "client", f.request, headers);
+    expect(first.status).toBe(200);
+    if (kind === "stale-source") f.app.store.update(f.source.bridgeSessionId, { notes: ["changed source record"] });
+    else writeFileSync(join(f.root, "team5", "projects", f.record.factoryCwd!.replace(/[^A-Za-z0-9]/g, "-"), f.source.sdkSessionId + ".jsonl"), "corrupt");
+    const request = toolFree({ ...f.request, messages: [...f.request.messages,
+      { role: "assistant", content: first.json.content as ContentBlock[] },
+      { role: "user", content: `[factory-cc-session:${f.token}] Explain without tools` }] }, "none");
+    const before = structuredClone(f.record);
+    const response = await postMessages(f.app.url, "client", request, { ...headers, "x-bridge-session": f.record.bridgeSessionId });
+    expect(response.status).toBe(409); expect(f.sdk.inputs).toHaveLength(1); expect(f.record).toEqual(before);
+    expect(response.json.error).toMatchObject({ type: kind === "stale-source" ? "native_lineage_selection_refused" : "completed_host_recovery_refused" });
+  });
+
+  it.each((["empty", "none"] as const).flatMap(mode => ["same-model", "changed-model"].map(kind => ({ mode, kind }))))(
+    "refuses explicit pending $mode reconciliation with $kind", async ({ mode, kind }) => {
+    const f = await selectionFixture(); f.config.desktopProfile = false;
+    f.config.models!.push({ id: "other", model: "claude-sonnet-4-6", displayName: "Other" });
+    const headers = { ...f.headers, "x-bridge-cwd": f.record.factoryCwd!, "x-bridge-session": f.record.bridgeSessionId };
+    const request = toolFree({ ...f.request, model: kind === "changed-model" ? "other" : f.request.model }, mode);
+    const before = structuredClone(f.record);
+    const response = await postMessages(f.app.url, "client", request, headers);
+    expect(response.status).toBe(409); expect(f.sdk.inputs).toHaveLength(0); expect(f.record).toEqual(before);
+    expect(response.json.error).toMatchObject({ type: "lineage_reconciliation_context_changed" });
   });
 
   it.each(["model", "reasoning"])("preserves a legitimate %s change and the following selected-owner request", async change => {

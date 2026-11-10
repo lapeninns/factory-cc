@@ -80,7 +80,8 @@ export function resolveSession(
   sessions: SessionRecord[],
   headers: Headers,
   request: MessagesRequest,
-  options: { cwd?: string; hostSessionId?: string; allowModelSwitch?: boolean; continueIdenticalTranscripts?: boolean; provider?: ModelProvider; claudeProfile?: string } = {},
+  options: { cwd?: string; hostSessionId?: string; allowModelSwitch?: boolean; continueIdenticalTranscripts?: boolean;
+    provider?: ModelProvider; claudeProfile?: string; auxiliaryRetry?: { match: SessionRecord; reason: string } } = {},
 ): { match?: SessionRecord; reason: string } {
   const explicit = explicitSessionId(headers, request);
   const requestProvider = options.provider ?? providerFromModelId(request.model);
@@ -259,14 +260,22 @@ export function resolveSession(
     return { reason: "new-explicit-session" };
   }
 
+  const auxiliaryOnly = Boolean(options.hostSessionId) && !hostAllowsAnyTools(request);
+  const implicitSessions = auxiliaryOnly ? sessions.filter(session => nativePurpose(session) === "auxiliary") : sessions;
   if (owners.length > 1) throw ambiguous("tool results belong to multiple sessions");
   if (owners[0]) {
+    if (auxiliaryOnly && nativePurpose(owners[0]) !== "auxiliary") {
+      throw new BridgeError(409, "explicit_session_required", "Supply the owning session ID to return an interactive tool result without advertising tools.");
+    }
     assertHostScope(owners[0]);
     assertSelectedContext(owners[0]);
     return { match: owners[0], reason: "tool-use-id" };
   }
 
-  const candidates = sessions.filter((session) => {
+  // Ownership checks above also protect retries of tool-free requests.
+  if (auxiliaryOnly && options.auxiliaryRetry && implicitSessions.includes(options.auxiliaryRetry.match)) return options.auxiliaryRetry;
+
+  const candidates = implicitSessions.filter((session) => {
     if (!inHostScope(session)) return false;
     if (isEnded(session)) return false;
     if (!historyContextMatches(session)) return false;
@@ -288,13 +297,13 @@ export function resolveSession(
   // exact pair. Retained checkpoints use their validated native proof when a
   // failed request overwrote the last successful request fingerprint.
   // Tool-free auxiliary requests remain independent, even if they copy context.
-  const authenticatedTail = sessions.filter((session) => {
+  const authenticatedTail = hostAllowsAnyTools(request) ? implicitSessions.filter((session) => {
       return (hasAuthenticatedTail(session) || hasRetainedCheckpointTail(session) || hasHealthyCheckpointTail(session)) && historyContextMatches(session)
         // Identify a genuine model-switch continuation before rejecting busy
         // state; filtering it out would silently fork the native conversation.
         && (switchingModel(session) || canChangeReasoningLevel(session) || (session.state === "IDLE" && !session.cancelRequested && session.pendingToolIds.length === 0))
         && !isEnded(session);
-    });
+    }) : [];
   if (authenticatedTail.length > 1) throw ambiguous("multiple authenticated Factory transcripts match the retained turn; supply X-Bridge-Session");
   if (authenticatedTail[0]) {
     assertSelectedContext(authenticatedTail[0], canChangeHostThinking(authenticatedTail[0]) || canChangeReasoningLevel(authenticatedTail[0]));
@@ -303,7 +312,7 @@ export function resolveSession(
         ? "authenticated-healthy-checkpoint-tail" : "authenticated-history-tail" };
   }
 
-  const activeDuplicates = sessions.filter((session) => {
+  const activeDuplicates = implicitSessions.filter((session) => {
     if (!inHostScope(session)) return false;
     if (session.state !== "NEW" && session.state !== "GENERATING" && session.state !== "RESUMING") return false;
     if (session.contextHash && session.contextHash !== compatibleContextHash(session)) return false;
@@ -318,7 +327,7 @@ export function resolveSession(
   // Cursor can be handed the same completed tool-result body again a few seconds
   // later. That retry is not a new conversation. Claude keeps the old behavior.
   if (requestProvider === "cursor") {
-    const replays = sessions.filter((session) => {
+    const replays = implicitSessions.filter((session) => {
       if (!inHostScope(session) || isEnded(session) || !historyContextMatches(session)) return false;
       // Idle: the turn already finished. Waiting: the turn parked a tool and Droid
       // repeated that same request body. A busy generating session is not a replay.
