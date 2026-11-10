@@ -15,6 +15,9 @@ const usage = `Usage: npm run control -- <command>
                                   Reconcile a cancelled checkpoint whose exact host actions completed.
                                   JSON must contain explicit identity, operationId and expectedUpdatedAt.
                                   Apply also requires checkpointSha256 and receiptsSha256 from dry-run.
+  restore-upstream-checkpoint --input <file> [--dry-run]
+                                  Restore a clean quota-retry record's missing SDK reference from
+                                  exact checkpoint, durable failure, cooldown and lease evidence.
 
 Set BRIDGE_ADMIN_TOKEN. BRIDGE_CONTROL_URL defaults to http://127.0.0.1:18787.
 Only local HTTP(S) origins are accepted. The token is never accepted in arguments.`;
@@ -55,16 +58,16 @@ export async function runControl(args: string[], env: NodeJS.ProcessEnv = proces
   } else if (command === "recover-checkpoint") {
     path = "/internal/native-checkpoint-recovery";
     body = recoveryBody(args.slice(1));
-  } else if (command === "recover-completed-host") {
+  } else if (command === "recover-completed-host" || command === "restore-upstream-checkpoint") {
     if (id !== "--input" || !flag || (value !== undefined && value !== "--dry-run") || rest.length) {
-      throw new Error("recover-completed-host requires --input <file> and optional --dry-run. Use --help.");
+      throw new Error(`${command} requires --input <file> and optional --dry-run. Use --help.`);
     }
     let input: unknown;
     try { input = JSON.parse(readFileSync(flag, "utf8")); }
     catch { throw new Error("Unable to read recovery --input as JSON; no recovery was sent."); }
     if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("Recovery --input must contain a JSON object.");
     body = { ...input as Record<string, unknown>, ...(value ? { dryRun: true } : {}) };
-    path = "/internal/completed-host-recovery";
+    path = command === "recover-completed-host" ? "/internal/completed-host-recovery" : "/internal/upstream-checkpoint-recovery";
   } else if (command === "cancel") {
     if (!id || id.startsWith("-") || args.length !== 2) throw new Error("cancel requires exactly one session ID. Use --help.");
     path = "/internal/cancel";
@@ -90,7 +93,7 @@ export async function runControl(args: string[], env: NodeJS.ProcessEnv = proces
     // A failed response may follow a successful mutation: no implicit retries.
     throw new Error("Could not reach the local bridge. Check the URL and server, then list requests before retrying a decision.");
   }
-  if (!response.ok && ["recover-checkpoint", "recover-completed-host"].includes(command) && response.status !== 401 && response.status !== 403) {
+  if (!response.ok && ["recover-checkpoint", "recover-completed-host", "restore-upstream-checkpoint"].includes(command) && response.status !== 401 && response.status !== 403) {
     let refusal: { type?: unknown; reason?: unknown } | undefined;
     try { refusal = ((await response.json()) as { error?: { type?: unknown; reason?: unknown } }).error; }
     catch { /* fall through to the generic message */ }

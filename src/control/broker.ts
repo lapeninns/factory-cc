@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import type { BridgeRuntime, RuntimeApprovalRequest, RuntimeControl, RuntimePermissionDecision, NativeWorkstreamIdentity } from "../runtime/types.js";
 import type { SessionStore } from "../sessions/store.js";
-import { isEnded } from "../sessions/state.js";
+import { isEnded, type SessionRecord } from "../sessions/state.js";
 import { BridgeError, type ContentBlock, type MessagesRequest } from "../types.js";
 import { canonicalWorkspacePath, COMPACTION_SUMMARY } from "../workspace.js";
 
@@ -43,7 +43,8 @@ export class ControlBroker implements RuntimeControl {
   private closed = false;
 
   constructor(private readonly runtime: BridgeRuntime, private readonly store: SessionStore, private readonly approvalTimeoutMs: number,
-    private readonly options: { desktopLifecycle?: boolean; ignoreUnknownSessionMarkers?: boolean; restoreIdleDesktopBindings?: boolean; factoryNative?: boolean } = {}) {
+    private readonly options: { desktopLifecycle?: boolean; ignoreUnknownSessionMarkers?: boolean; restoreIdleDesktopBindings?: boolean; factoryNative?: boolean;
+      restoreRetainedCheckpoint?: (record: SessionRecord) => Promise<boolean> } = {}) {
     if (options.factoryNative !== undefined && typeof options.factoryNative !== "boolean") throw new Error("Factory-native binding policy must be an explicit boolean.");
     if (options.factoryNative && !options.desktopLifecycle) throw new Error("Factory-native bindings require authenticated Desktop lifecycle events.");
     if (options.desktopLifecycle && options.ignoreUnknownSessionMarkers) throw new Error("Desktop lifecycle cannot ignore unknown session markers.");
@@ -481,6 +482,7 @@ export class ControlBroker implements RuntimeControl {
       const errors: unknown[] = [];
       for (const sessionId of host.bridgeSessions) {
         this.cancelApprovals(sessionId);
+        const previous = this.store.get(sessionId) ? structuredClone(this.store.require(sessionId)) : undefined;
         const terminal = host.terminalResults.get(sessionId);
         const call = terminal && this.runtime.pendingHostCalls?.(sessionId).find((call) => call.toolUseId === terminal.toolUseId && call.toolName === "EndFeatureRun" && canonical(call.input) === canonical(terminal.input));
         let disposition: "resumable" | "terminal" | "interrupted" = "interrupted";
@@ -491,6 +493,7 @@ export class ControlBroker implements RuntimeControl {
             ...(cancelled ? { cancelRequested: true, cancellation: { at: new Date().toISOString(), source: "host" as const } } : {}) });
           if (cancelled) this.store.setState(sessionId, "CANCELLED");
         }
+        const fenced = JSON.stringify(this.store.get(sessionId));
         try {
           if (!cancelled && terminal && call && !terminal.isError && this.runtime.completeHostTool) {
             await this.runtime.completeHostTool(sessionId, { ...call, content: typeof terminal.response === "string" ? terminal.response : JSON.stringify(terminal.response), terminal: true });
@@ -500,6 +503,14 @@ export class ControlBroker implements RuntimeControl {
             const result = await this.runtime.endHostSession?.(sessionId, reason);
             disposition = result?.resumable ? "resumable" : "interrupted";
             sdkSessionId = result?.sdkSessionId;
+            if (!result?.resumable && previous?.state === "IDLE" && previous.retainedCheckpoint && previous.sdkSessionId
+                && !previous.cancelRequested && previous.hostEnded === undefined && !previous.pendingToolIds.length
+                && !previous.endedToolIds?.length && !previous.hostCompletionReceipts?.length
+                && this.options.restoreRetainedCheckpoint && await this.options.restoreRetainedCheckpoint(previous)
+                && JSON.stringify(this.store.get(sessionId)) === fenced) {
+              disposition = "resumable";
+              sdkSessionId = previous.sdkSessionId;
+            }
           }
         } catch (error) {
           errors.push(error);
@@ -508,6 +519,7 @@ export class ControlBroker implements RuntimeControl {
         }
         const session = this.store.get(sessionId);
         if (session) {
+          if (session.cancelRequested || session.state === "CANCELLED") { disposition = "interrupted"; sdkSessionId = undefined; }
           this.store.update(sessionId, { pendingToolIds: [], hostEnded: disposition, ...(sdkSessionId ? { sdkSessionId } : {}), notes: [...session.notes, cancelled ? "factory-cancelled" : "factory-session-ended"] });
           // A normal exec exit can be resumed later with the same official native checkpoint.
           if (session.state !== "FAILED" && session.state !== "CANCELLED") this.store.setState(sessionId, "IDLE");

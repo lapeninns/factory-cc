@@ -27,6 +27,36 @@ The dry run returns `checkpointSha256` and `receiptsSha256`. Add those two value
 
 Recovery preserves the original cancellation and successful receipts in the session audit, advances the native generation, and reconciles the actual completed outcomes in the first resumed native turn. It never edits the original native history. That first turn is reconciliation-only. An exact repeated tool name and input returns a clearly labelled historical receipt. Every new host action and native tool is denied. When the turn finishes, the audit records `reconciledAt`, and a subsequent normal user turn can resume ordinary work or intentionally perform an identical operation. Ambiguous duplicate actions and restoration context exceeding 64 KiB are refused during recovery preparation. A new cancellation requires a new recovery operation and current evidence.
 
+## Native checkpoint retries after provider limits
+
+An established supervised subscription session keeps its SDK checkpoint and assigned account after a verified clean upstream failure. The next attempt resumes that checkpoint under a new native lease generation. Fresh sessions that have no checkpoint retain their existing retry behavior.
+
+Observed account cooldowns are minimum wait times. They are retained in session records, restored from those records and owned controller logs after restart, and excluded from session pruning while unexpired. An elapsed deadline permits another provider attempt. It does not establish remaining allowance or successful inference.
+
+For a legacy clean upstream-retry record whose SDK field was already cleared, `restore-upstream-checkpoint` requires matching durable failure and cooling events, a previously reconciled checkpoint identity, the exact current record version, complete native tool pairing, and a settled predecessor lease. The current generation must be unused. Explicit cancellation, unresolved work and newer conflicting evidence refuse restoration.
+
+Prepare a private request file using the actual record identities and a new operation ID.
+
+```json
+{
+  "operationId": "operator-selected-unique-id",
+  "bridgeSessionId": "sess_example",
+  "factorySessionId": "factory-session-id",
+  "account": "team5",
+  "sdkSessionId": "11111111-2222-4333-8444-555555555555",
+  "nativeGeneration": 5,
+  "expectedUpdatedAt": "2026-11-10T10:39:15.320Z"
+}
+```
+
+```sh
+npm run control -- restore-upstream-checkpoint --input /absolute/private/restore.json --dry-run
+```
+
+Add the returned `checkpointSha256` and `evidenceSha256` to that request file, then repeat the command without `--dry-run`. The operator supplies neither an account transfer nor a shorter cooldown. The bridge derives and preserves the greatest observed account deadline. Preserve the still-open Factory session until restoration is applied when its older runtime cannot preserve an SDK-absent record on host end.
+
+A purpose-built retained-checkpoint proof permits an orderly host end after the in-memory SDK object has been retired. The bridge rechecks identity, file hash and settled leases before recording a resumable host end. A generic idle record receives no such exemption. If checkpoint retry preparation cannot be verified, the original SDK reference remains recorded and further cold imports for that Workstream are refused pending operator recovery.
+
 ## Upgrade an existing installation
 
 Merge the reviewed source into the checkout recorded in the desktop installation, then run these commands from that checkout:

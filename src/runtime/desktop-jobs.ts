@@ -170,6 +170,7 @@ export class DesktopJobsRuntime implements BridgeRuntime {
   private readonly active = new Map<string, ActivePhase>();
   private readonly known = new Map<string, DesktopJobAcquire>();
   private readonly heldHost = new Map<string, HeldHostPhase>();
+  private readonly checkpointPreparations = new Map<string, Promise<void>>();
   private readonly faults: string[] = [];
   /** Queue delay of recent admissions in milliseconds, oldest first. */
   private readonly admissionDelays: number[] = [];
@@ -393,6 +394,7 @@ export class DesktopJobsRuntime implements BridgeRuntime {
   }
 
   async cancel(sessionId: string, reason: string): Promise<void> {
+    await this.checkpointPreparations.get(sessionId)?.catch(() => undefined);
     const held = this.heldHost.get(sessionId);
     if (held && !this.active.has(sessionId)) {
       try { await this.inner.cancel(sessionId, reason); }
@@ -431,6 +433,19 @@ export class DesktopJobsRuntime implements BridgeRuntime {
     await this.inner.prepareColdRetry(sessionId);
     await this.update(sessionId, { state: "failed", cleanupVerified: true });
     this.known.delete(sessionId);
+  }
+
+  prepareCheckpointRetry(sessionId: string, sdkSessionId: string): Promise<void> {
+    if (this.closed || this.active.has(sessionId) || this.heldHost.has(sessionId) || this.checkpointPreparations.has(sessionId) || !this.inner.prepareCheckpointRetry) {
+      return Promise.reject(failure("desktop_retry_unsafe", "The native checkpoint cannot be safely retired for retry."));
+    }
+    const preparation = (async () => {
+      await this.inner.prepareCheckpointRetry!(sessionId, sdkSessionId);
+      await this.update(sessionId, { state: "failed", sdkSessionId, cleanupVerified: true });
+      this.known.delete(sessionId);
+    })();
+    this.checkpointPreparations.set(sessionId, preparation);
+    return preparation.finally(() => { this.checkpointPreparations.delete(sessionId); });
   }
 
   /** This process has used the session's current lease identity and must keep it. */
@@ -512,6 +527,7 @@ export class DesktopJobsRuntime implements BridgeRuntime {
 
   async close(): Promise<void> {
     this.closed = true;
+    await Promise.allSettled([...this.checkpointPreparations.values()]);
     const active = [...new Set([...this.active.keys(), ...this.heldHost.keys()])];
     const outcomes = await Promise.allSettled(active.map((id) => this.cancel(id, "desktop-supervisor-closed")));
     await this.inner.close?.();

@@ -47,6 +47,35 @@ function setup() {
 }
 
 describe("Factory model-phase supervision", () => {
+  it("retains lease ownership until checkpoint retry cleanup is acknowledged", async () => {
+    const fixture = setup();
+    const prepare = vi.fn(async () => undefined);
+    (fixture.inner as BridgeRuntime).prepareCheckpointRetry = prepare;
+    await fixture.runtime.handle(request());
+    fixture.update.mockRejectedValueOnce(new Error("lease update failed"));
+    await expect(fixture.runtime.prepareCheckpointRetry("bridge-1", "sdk")).rejects.toThrow("lease update failed");
+    expect(fixture.runtime.ownsNativeSession("bridge-1")).toBe(true);
+    await fixture.runtime.prepareCheckpointRetry("bridge-1", "sdk");
+    expect(fixture.runtime.ownsNativeSession("bridge-1")).toBe(false);
+    expect(prepare).toHaveBeenCalledWith("bridge-1", "sdk");
+    expect(fixture.update).toHaveBeenLastCalledWith(expect.any(Object), { state: "failed", sdkSessionId: "sdk", cleanupVerified: true });
+  });
+
+  it("serializes shutdown behind checkpoint retry settlement", async () => {
+    const fixture = setup(), acknowledged = deferred<undefined>();
+    (fixture.inner as BridgeRuntime).prepareCheckpointRetry = vi.fn(async () => undefined);
+    await fixture.runtime.handle(request());
+    fixture.update.mockImplementationOnce(async () => acknowledged.promise);
+    const preparing = fixture.runtime.prepareCheckpointRetry("bridge-1", "sdk");
+    await vi.waitFor(() => expect(fixture.update).toHaveBeenCalledTimes(1));
+    const closing = fixture.runtime.close();
+    expect(fixture.inner.close).not.toHaveBeenCalled();
+    acknowledged.resolve(undefined);
+    await preparing; await closing;
+    expect(fixture.update).toHaveBeenCalledTimes(1);
+    expect(fixture.update).toHaveBeenCalledWith(expect.any(Object), { state: "failed", sdkSessionId: "sdk", cleanupVerified: true });
+  });
+
   it("settles a clean interrupted native phase as idle before permitting its next admission", async () => {
     const fixture = setup();
     const running = deferred<RuntimeTurn>();

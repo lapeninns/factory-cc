@@ -159,7 +159,8 @@ export function receiptDigest(receipts: RuntimeHostCompletion[]): string {
 }
 
 /** Read only the exact configured account/project/checkpoint, with no path input from the operator. */
-export function inspectCompletedHostCheckpoint(accounts: readonly SubscriptionAccount[], record: SessionRecord, receipts: RuntimeHostCompletion[]): string {
+export function inspectCompletedHostCheckpoint(accounts: readonly SubscriptionAccount[], record: SessionRecord, receipts: RuntimeHostCompletion[],
+  expectedSettledToolIds: readonly string[] = []): string {
   const account = accounts.find(item => item.profile === record.claudeAccount);
   const root = account?.env.CLAUDE_CONFIG_DIR;
   if (!root || !isAbsolute(root) || !record.factoryCwd || !record.sdkSessionId
@@ -186,7 +187,7 @@ export function inspectCompletedHostCheckpoint(accounts: readonly SubscriptionAc
     const bytes = buffer.subarray(0, length);
     const after = fstatSync(fd);
     if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs || bytes.length !== after.size) refuse("checkpoint_changed");
-    verifyCheckpointActions(bytes.toString("utf8"), record.sdkSessionId, receipts);
+    verifyCheckpointActions(bytes.toString("utf8"), record.sdkSessionId, receipts, expectedSettledToolIds);
     return createHash("sha256").update(bytes).digest("hex");
   } catch (error) {
     if (error instanceof BridgeError) throw error;
@@ -194,7 +195,7 @@ export function inspectCompletedHostCheckpoint(accounts: readonly SubscriptionAc
   } finally { if (fd !== undefined) closeSync(fd); }
 }
 
-function verifyCheckpointActions(text: string, sdkSessionId: string, receipts: RuntimeHostCompletion[]): void {
+function verifyCheckpointActions(text: string, sdkSessionId: string, receipts: RuntimeHostCompletion[], expectedSettledToolIds: readonly string[]): void {
   const calls = new Map<string, { name: string; input: unknown }>();
   const results = new Map<string, { isError: boolean; content: unknown }>();
   for (const line of text.split("\n")) {
@@ -220,6 +221,7 @@ function verifyCheckpointActions(text: string, sdkSessionId: string, receipts: R
   }
   if ([...calls.keys()].some(id => !results.has(id))) refuse("checkpoint_has_pending_tools");
   if ([...results.keys()].some(id => !calls.has(id))) refuse("checkpoint_has_unmatched_results");
+  if (expectedSettledToolIds.some(id => !calls.has(id) || !results.has(id))) refuse("checkpoint_completion_missing");
   const recoveredIds = new Set(receipts.map(receipt => receipt.toolUseId));
   const orderedIds = [...calls.keys()];
   const firstRecovered = orderedIds.findIndex(id => recoveredIds.has(id));

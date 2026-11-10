@@ -11,7 +11,14 @@ export interface SessionRecord {
   /** Exact accepted request that failed upstream after all host work settled. */
   retryableRequestHash?: string;
   /** Admission retries retain the native checkpoint instead of cold-importing it. */
-  retryableRequestKind?: "upstream" | "admission";
+  retryableRequestKind?: "upstream" | "native-upstream" | "admission";
+  /** Durable minimum waits observed from provider failures, independent of routing. */
+  accountCooldowns?: Record<string, string>;
+  /** Minted only after a clean upstream failure and verified native retirement. */
+  retainedCheckpoint?: RetainedCheckpoint;
+  /** Retained identity exists, but a failed preparation has no safe resume proof. */
+  checkpointRetryBlocked?: boolean;
+  upstreamCheckpointRecoveries?: UpstreamCheckpointRecovery[];
   /** Authenticated host receipts retained until an admitted turn consumes them. */
   hostCompletionReceipts?: RuntimeHostCompletion[];
   /** Runtime that owns sdkSessionId. Absent on Claude sessions created before Cursor coexisted. */
@@ -84,6 +91,27 @@ export interface CompletedHostRecovery {
   original: { cancelRequested: boolean; cancellation?: SessionRecord["cancellation"]; hostEnded?: SessionRecord["hostEnded"]; endedToolIds: string[]; notes: string[] };
   receipts: RuntimeHostCompletion[];
   reconciledAt?: string;
+}
+
+export interface RetainedCheckpoint {
+  sdkSessionId: string;
+  account: string;
+  checkpointSha256: string;
+  sourceGeneration: number;
+  preparedAt: string;
+  coolingUntil?: string;
+  origin: "clean-upstream" | "operator-restored";
+  settledToolIds?: string[];
+}
+
+export interface UpstreamCheckpointRecovery {
+  operationId: string;
+  at: string;
+  recordUpdatedAt: string;
+  nativeGeneration: number;
+  proof: RetainedCheckpoint;
+  evidenceSha256: string;
+  before: { sdkSessionId?: string; retryableRequestKind?: SessionRecord["retryableRequestKind"]; retryableRequestHash?: string; accountCooldowns?: Record<string, string> };
 }
 
 /** A session in this condition can never resume or complete another tool round trip. */

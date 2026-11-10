@@ -58,6 +58,13 @@ export class ClaudePool {
     this.coolUntil.set(id, Math.max(this.coolUntil.get(id) ?? 0, this.now() + seconds * 1000));
   }
 
+  /** Restore an observed deadline without shortening any current provider wait. */
+  restoreCooldown(id: string, until: string): void {
+    const at = Date.parse(until);
+    if (!this.members.some(member => member.id === id) || !Number.isFinite(at)) return;
+    this.coolUntil.set(id, Math.max(this.coolUntil.get(id) ?? 0, at));
+  }
+
   status(): Array<PoolMember & { coolingUntil?: string }> {
     const at = this.now();
     return this.members.map((member) => {

@@ -10,7 +10,7 @@ import type { MessagesRequest } from "../../src/types.js";
 
 const dirs: string[] = [];
 afterEach(() => { vi.useRealTimers(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
-function fixture() {
+function fixture(options: ConstructorParameters<typeof ControlBroker>[3] = {}) {
   const dir = mkdtempSync(join(tmpdir(), "control-broker-")); dirs.push(dir);
   const store = new SessionStore(dir, false, 16);
   const calls = new Map<string, RuntimeHostCall[]>();
@@ -18,7 +18,7 @@ function fixture() {
     kind: "sdk", handle: vi.fn(), deliverResults: vi.fn(), cancel: vi.fn(async () => {}),
     pendingHostCalls: (id) => calls.get(id) ?? [], completeHostTool: vi.fn(async () => "accepted" as const), endHostSession: vi.fn(async () => ({ resumable: true })),
   };
-  const broker = new ControlBroker(runtime, store, 1000);
+  const broker = new ControlBroker(runtime, store, 1000, options);
   const session = () => {
     const record = store.create({ role: "worker", model: "test", toolNames: ["EndFeatureRun"] });
     store.setState(record.bridgeSessionId, "GENERATING");
@@ -65,6 +65,41 @@ describe("live permission requests", () => {
 });
 
 describe("authentic Factory lifecycle", () => {
+  it("preserves a proved retained checkpoint when its native object was already disposed", async () => {
+    const verify = vi.fn(async () => true), f = fixture({ restoreRetainedCheckpoint: verify });
+    vi.mocked(f.runtime.endHostSession!).mockResolvedValue({ resumable: false });
+    const start = await f.send("SessionStart"), id = f.session(); f.calls.delete(id); f.broker.bind(start.bindingToken as string, id);
+    f.store.update(id, { state: "IDLE", pendingToolIds: [], sdkSessionId: "retained", nativeGeneration: 5, claudeAccount: "team5",
+      retainedCheckpoint: { sdkSessionId: "retained", account: "team5", checkpointSha256: "0".repeat(64), sourceGeneration: 4,
+        preparedAt: "2026-11-10T11:00:00Z", origin: "clean-upstream" }, retryableRequestKind: "native-upstream" });
+    await f.send("SessionEnd", start.bindingToken as string);
+    expect(verify).toHaveBeenCalledWith(expect.objectContaining({ state: "IDLE", sdkSessionId: "retained" }));
+    expect(verify).toHaveBeenCalledWith(expect.not.objectContaining({ hostEnded: "interrupted" }));
+    expect(f.store.require(id)).toMatchObject({ hostEnded: "resumable", sdkSessionId: "retained" });
+  });
+
+  it("does not substitute generic idle state or a concurrent cancellation for checkpoint proof", async () => {
+    let finish!: (value: boolean) => void;
+    const verify = vi.fn(() => new Promise<boolean>(resolve => { finish = resolve; }));
+    const f = fixture({ restoreRetainedCheckpoint: verify });
+    vi.mocked(f.runtime.endHostSession!).mockResolvedValue({ resumable: false });
+    const start = await f.send("SessionStart"), id = f.session(); f.calls.delete(id); f.broker.bind(start.bindingToken as string, id);
+    f.store.update(id, { state: "IDLE", pendingToolIds: [], sdkSessionId: "retained", retainedCheckpoint: {
+      sdkSessionId: "retained", account: "team5", checkpointSha256: "0".repeat(64), sourceGeneration: 4,
+      preparedAt: "2026-11-10T11:00:00Z", origin: "clean-upstream" } });
+    const ending = f.send("SessionEnd", start.bindingToken as string);
+    await vi.waitFor(() => expect(verify).toHaveBeenCalled());
+    f.store.update(id, { state: "CANCELLED", cancelRequested: true }); finish(true);
+    await ending;
+    expect(f.store.require(id)).toMatchObject({ state: "CANCELLED", hostEnded: "interrupted", cancelRequested: true });
+    const plain = fixture({ restoreRetainedCheckpoint: vi.fn(async () => true) });
+    vi.mocked(plain.runtime.endHostSession!).mockResolvedValue({ resumable: false });
+    const p = await plain.send("SessionStart"), plainId = plain.session(); plain.calls.delete(plainId); plain.broker.bind(p.bindingToken as string, plainId);
+    plain.store.update(plainId, { state: "IDLE", pendingToolIds: [], sdkSessionId: "plain-idle" });
+    await plain.send("SessionEnd", p.bindingToken as string);
+    expect(plain.store.require(plainId).hostEnded).toBe("interrupted");
+  });
+
   it("ends only the exact unique wrapper session when the UI client has no agent binding", async () => {
     const f = fixture(); const { launchId } = f.broker.createLaunch({ cwd: f.dir });
     const start = await f.broker.hostEvent({ eventId: randomUUID(), event: f.event("SessionStart"), launchId });

@@ -16,6 +16,18 @@ const input = { role: "chat" as const, model: "test-model", toolNames: [] };
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe("session capacity and durable identity", () => {
+  it("retains unexpired account cooldown evidence through pruning and restart", () => {
+    const dir = temporaryDir();
+    const store = new SessionStore(dir, true, 2, undefined, { maxRecords: 0, maxAgeMs: 0, journalMaxBytes: 1024 * 1024 });
+    const record = store.create(input);
+    const now = Date.now();
+    store.update(record.bridgeSessionId, { state: "IDLE", accountCooldowns: { team5: new Date(now + 120_000).toISOString() } });
+    expect(store.prune(new Set(), now + 60_000)).toEqual([]);
+    const restarted = new SessionStore(dir, true, 2, undefined, { maxRecords: 0, maxAgeMs: 0, journalMaxBytes: 1024 * 1024 });
+    expect(restarted.require(record.bridgeSessionId).accountCooldowns).toEqual(record.accountCooldowns);
+    expect(restarted.prune(new Set(), now + 120_001)).toEqual([record.bridgeSessionId]);
+  });
+
   it("supports more than 16 completed conversations without exhausting active capacity", () => {
     const store = new SessionStore(temporaryDir(), false, 1);
     for (let i = 0; i < 20; i += 1) {

@@ -650,6 +650,17 @@ export class SdkRuntime implements BridgeRuntime {
   }
 
   async prepareColdRetry(sessionId: string): Promise<void> {
+    return this.prepareRetry(sessionId);
+  }
+
+  async prepareCheckpointRetry(sessionId: string, sdkSessionId: string): Promise<void> {
+    if (!this.config.persistSessions || this.lives.get(sessionId)?.sdkSessionId !== sdkSessionId) {
+      throw new BridgeError(409, "native_checkpoint_mismatch", "The failed query does not own the retained native checkpoint.");
+    }
+    return this.prepareRetry(sessionId);
+  }
+
+  private async prepareRetry(sessionId: string): Promise<void> {
     const live = this.lives.get(sessionId);
     if (!live?.terminal) {
       throw new BridgeError(409, "native_retry_unsafe", "This native generation is not safe to import as history.");

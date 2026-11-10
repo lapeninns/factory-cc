@@ -93,6 +93,23 @@ beforeEach(() => { vi.stubEnv("BRIDGE_TEST_FAKE_KEY", "offline-placeholder-never
 afterEach(async () => { await Promise.all(runtimes.splice(0).map((runtime) => runtime.close())); vi.unstubAllEnvs(); });
 
 describe("official SDK streaming-input lifecycle (injected offline SDK)", () => {
+  it("retires a clean quota failure and resumes the same exact native checkpoint", async () => {
+    const sdk = new FakeSdk(async function* (_input, index) {
+      if (index === 1) throw new BridgeError(429, "rate_limit_error", "synthetic provider limit");
+      yield success("completed");
+    });
+    const { runtime } = create(sdk);
+    const s = session();
+    const first = await runtime.handle(request(s, "first")); s.sdkSessionId = first.sdkSessionId;
+    await expect(runtime.handle(request(s, "second"))).rejects.toMatchObject({ extra: { retry_from_history: true } });
+    await expect(runtime.prepareCheckpointRetry(s.bridgeSessionId, "different-checkpoint")).rejects.toMatchObject({ code: "native_checkpoint_mismatch" });
+    await runtime.prepareCheckpointRetry(s.bridgeSessionId, s.sdkSessionId!);
+    await runtime.handle(request(s, "second"));
+    expect(sdk.calls).toHaveLength(2);
+    expect(sdk.calls[1]!.options.resume).toBe(s.sdkSessionId);
+    expect(JSON.stringify(sdk.inputs.at(-1))).not.toContain("Imported conversation history");
+  });
+
   it("reconciles a completed recovery action without host replay, then permits a later intentional identical call", async () => {
     const received: unknown[] = [];
     const input = { script: "write the owned document" };
