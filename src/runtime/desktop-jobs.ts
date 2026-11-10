@@ -189,7 +189,22 @@ export class DesktopJobsRuntime implements BridgeRuntime {
     if (inner.interrupt) this.interrupt = async (sessionId, reason) => {
       const phase = this.active.get(sessionId);
       if (phase && !phase.lease) { phase.outcome = "cancelled"; phase.controller.abort(); return true; }
-      return inner.interrupt!(sessionId, reason);
+      if (!phase) return inner.interrupt!(sessionId, reason);
+      // The inner interrupt ends handle() before it returns its clean-boundary
+      // proof. Keep execute() from turning that interruption into a failed lease.
+      let settle!: (clean: boolean) => void;
+      const cleanup = new Promise<boolean>(resolve => { settle = resolve; });
+      phase.cleanup = cleanup;
+      let resumable = false;
+      try {
+        resumable = await inner.interrupt!(sessionId, reason);
+        if (phase.cleanup !== cleanup || phase.outcome) return false;
+        if (resumable) phase.outcome = "idle";
+        return resumable;
+      } finally {
+        settle(resumable);
+        if (resumable) await phase.done?.catch(() => undefined);
+      }
     };
     if (inner.pendingHostCalls) this.pendingHostCalls = (id) => inner.pendingHostCalls!(id);
     if (inner.validateHostToolCompletion) this.validateHostToolCompletion = (...args) => inner.validateHostToolCompletion!(...args);

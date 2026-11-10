@@ -47,6 +47,25 @@ function setup() {
 }
 
 describe("Factory model-phase supervision", () => {
+  it("settles a clean interrupted native phase as idle before permitting its next admission", async () => {
+    const fixture = setup();
+    const running = deferred<RuntimeTurn>();
+    fixture.inner.handle.mockImplementationOnce(() => running.promise);
+    fixture.inner.interrupt.mockImplementationOnce(async () => {
+      running.reject(new Error("clean native interruption"));
+      await Promise.resolve();
+      return true;
+    });
+    const pending = fixture.runtime.handle(request());
+    const observed = pending.catch(() => undefined);
+    await vi.waitFor(() => expect(fixture.inner.handle).toHaveBeenCalled());
+    expect(await fixture.runtime.interrupt!("bridge-1", "client-disconnect")).toBe(true);
+    await observed;
+    expect(fixture.inner.cancel).not.toHaveBeenCalled();
+    expect(fixture.releases).toHaveBeenCalledWith(expect.objectContaining({ state: "idle", cleanupVerified: true }));
+    await expect(fixture.runtime.handle(request())).resolves.toMatchObject({ pendingToolIds: [] });
+  });
+
   it("refuses missing trusted identity and a main checkout before model execution", async () => {
     const fixture = setup();
     fixture.options.getBinding = () => undefined;

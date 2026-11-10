@@ -57,7 +57,7 @@ export async function recoverNativeCheckpoint(context: NativeCheckpointRecoveryC
   const record = eligibleRecord(context, request);
   // Inspect a stable set of persisted identities. A sibling can acquire work
   // while the read-only lease queries await their shared-state lock.
-  const related = relatedRecords(context.store, request.factorySessionId);
+  const related = relatedRecoveryRecords(context.store, request.factorySessionId);
   const observed = JSON.stringify(related);
   const siblings = related.filter(item => item.bridgeSessionId !== request.bridgeSessionId).map(item => structuredClone(item));
   // The store hands out its live record; keep the observed failure version.
@@ -66,25 +66,12 @@ export async function recoverNativeCheckpoint(context: NativeCheckpointRecoveryC
     bridgeSessionId: `${request.bridgeSessionId}:g${request.nativeGeneration}`, cwd: record.factoryCwd!,
     subscriptionProfile: record.claudeAccount as SubscriptionProfile, workspacePolicy: context.workspacePolicy, sdkSessionId: request.sdkSessionId });
   const leaseEndedAt = verifyLineage(evidence, request.nativeGeneration, failedAt);
-  for (const sibling of siblings) {
-    const generation = sibling.nativeGeneration;
-    if (!sibling.factoryCwd || !sibling.claudeAccount || !context.accounts.includes(sibling.claudeAccount)
-        || sibling.provider === "cursor" || typeof generation !== "number" || !Number.isSafeInteger(generation)
-        || generation < 0 || generation > 1_000_000
-        || (sibling.sdkSessionId != null && (typeof sibling.sdkSessionId !== "string" || !ID.test(sibling.sdkSessionId)))) {
-      refuse("sibling_identity_unproven");
-    }
-    const siblingEvidence = await context.inspect({ factorySessionId: request.factorySessionId,
-      bridgeSessionId: `${sibling.bridgeSessionId}:g${generation}`, cwd: sibling.factoryCwd,
-      subscriptionProfile: sibling.claudeAccount as SubscriptionProfile, useRecordedWorkspacePolicy: true,
-      ...(sibling.sdkSessionId == null ? {} : { sdkSessionId: sibling.sdkSessionId }) });
-    verifySiblingLineage(siblingEvidence, generation, sibling.sdkSessionId != null);
-  }
+  await inspectRecoverySiblings(context, request.factorySessionId, siblings);
   // Inspection is asynchronous. A concurrent recovery or write may have won.
   const repeated = priorRecovery(context.store, request);
   if (repeated) return repeated;
   const current = eligibleRecord(context, request);
-  if (current.updatedAt !== failedAt || JSON.stringify(relatedRecords(context.store, request.factorySessionId)) !== observed) {
+  if (current.updatedAt !== failedAt || JSON.stringify(relatedRecoveryRecords(context.store, request.factorySessionId)) !== observed) {
     refuse("changed_during_recovery");
   }
   const nextGeneration = request.nativeGeneration + 1;
@@ -101,6 +88,23 @@ export async function recoverNativeCheckpoint(context: NativeCheckpointRecoveryC
   return { ok: true, recovered: true, bridgeSessionId: request.bridgeSessionId, nativeGeneration: nextGeneration };
 }
 
+export async function inspectRecoverySiblings(context: NativeCheckpointRecoveryContext, factorySessionId: string, siblings: SessionRecord[]): Promise<void> {
+  for (const sibling of siblings) {
+    const generation = sibling.nativeGeneration;
+    if (!sibling.factoryCwd || !sibling.claudeAccount || !context.accounts.includes(sibling.claudeAccount)
+        || sibling.provider === "cursor" || typeof generation !== "number" || !Number.isSafeInteger(generation)
+        || generation < 0 || generation > 1_000_000
+        || (sibling.sdkSessionId != null && (typeof sibling.sdkSessionId !== "string" || !ID.test(sibling.sdkSessionId)))) {
+      refuse("sibling_identity_unproven");
+    }
+    const siblingEvidence = await context.inspect({ factorySessionId,
+      bridgeSessionId: `${sibling.bridgeSessionId}:g${generation}`, cwd: sibling.factoryCwd,
+      subscriptionProfile: sibling.claudeAccount as SubscriptionProfile, useRecordedWorkspacePolicy: true,
+      ...(sibling.sdkSessionId == null ? {} : { sdkSessionId: sibling.sdkSessionId }) });
+    verifySiblingLineage(siblingEvidence, generation, sibling.sdkSessionId != null);
+  }
+}
+
 function priorRecovery(store: SessionStore, request: NativeCheckpointRecoveryRequest): Record<string, Json> | undefined {
   const record = store.get(request.bridgeSessionId);
   const receipt = record?.checkpointRecoveries?.find(item => item.sdkSessionId === request.sdkSessionId
@@ -112,15 +116,14 @@ function priorRecovery(store: SessionStore, request: NativeCheckpointRecoveryReq
     nativeGeneration: receipt.toGeneration, recoveredAt: receipt.at };
 }
 
-function relatedRecords(store: SessionStore, factorySessionId: string): SessionRecord[] {
+export function relatedRecoveryRecords(store: SessionStore, factorySessionId: string): SessionRecord[] {
   return store.list().filter(record => record.factorySessionId === factorySessionId);
 }
 
 function eligibleRecord(context: NativeCheckpointRecoveryContext, request: NativeCheckpointRecoveryRequest): SessionRecord {
-  const { store, runtime } = context;
+  const { store } = context;
   const record = store.get(request.bridgeSessionId);
   if (!record) refuse("session_not_found");
-  const id = record.bridgeSessionId;
   if (record.provider === "cursor") refuse("unsupported_provider");
   if (record.factorySessionId !== request.factorySessionId) refuse("factory_session_mismatch");
   if (!record.factoryCwd) refuse("workspace_unknown");
@@ -132,6 +135,13 @@ function eligibleRecord(context: NativeCheckpointRecoveryContext, request: Nativ
   if (record.pendingToolIds.length || record.endedToolIds?.length || record.hostCompletionReceipts?.length) refuse("unresolved_tools");
   if (record.notes.some(note => INTERRUPTED_NOTES.includes(note))) refuse("interrupted_generation");
   if (!record.historyMessageHashes?.length) refuse("no_completed_turn");
+  verifyRecoverySessionInactive(context, record);
+  return record;
+}
+
+export function verifyRecoverySessionInactive(context: NativeCheckpointRecoveryContext, record: SessionRecord): void {
+  const { runtime, store } = context;
+  const id = record.bridgeSessionId;
   const active = (sessionId: string): boolean => context.busy(sessionId) || runtime.ownsNativeSession?.(sessionId) === true
     || runtime.isSessionUsable?.(sessionId) === true || Boolean(runtime.protectedSessionIds?.().includes(sessionId))
     || Boolean(runtime.pendingHostCalls?.(sessionId).length);
@@ -145,7 +155,6 @@ function eligibleRecord(context: NativeCheckpointRecoveryContext, request: Nativ
       refuse("later_work_exists");
     }
   }
-  return record;
 }
 
 function verifyLineage(evidence: NativeGenerationEvidence[], generation: number, failedAt: string): string {

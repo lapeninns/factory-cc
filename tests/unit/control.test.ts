@@ -28,6 +28,24 @@ async function localServer(handler: RequestListener): Promise<string> {
 }
 
 describe("local approval CLI", () => {
+  it("sends an explicit completed-host recovery file with a read-only dry-run override", async () => {
+    const received: unknown[] = [];
+    const url = await localServer(async (req, res) => {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      received.push({ path: req.url, body: JSON.parse(body), authorization: req.headers.authorization });
+      res.end('{"eligible":true}');
+    });
+    const directory = mkdtempSync(join(tmpdir(), "completed-recovery-control-"));
+    directories.push(directory);
+    const file = join(directory, "request.json");
+    writeFileSync(file, JSON.stringify({ operationId: "fixture", bridgeSessionId: "sess_fixture", expectedUpdatedAt: "2026-11-10T02:19:52Z" }));
+    expect(await runControl(["recover-completed-host", "--input", file, "--dry-run"], { BRIDGE_ADMIN_TOKEN: "secret", BRIDGE_CONTROL_URL: url })).toEqual({ eligible: true });
+    expect(received).toEqual([{ path: "/internal/completed-host-recovery", authorization: "Bearer secret",
+      body: { operationId: "fixture", bridgeSessionId: "sess_fixture", expectedUpdatedAt: "2026-11-10T02:19:52Z", dryRun: true } }]);
+    await expect(runControl(["recover-completed-host", "--input", file, "--unsafe"], {})).rejects.toThrow("optional --dry-run");
+  });
+
   it("sends one authenticated decision with the user's exact edited input", async () => {
     const received: unknown[] = [];
     const url = await localServer(async (req, res) => {

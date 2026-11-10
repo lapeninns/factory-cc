@@ -487,7 +487,8 @@ export class ControlBroker implements RuntimeControl {
         let sdkSessionId: string | undefined;
         // Persist replay prohibition before awaiting any live callback cleanup.
         if (this.store.get(sessionId)) {
-          this.store.update(sessionId, { hostEnded: "interrupted", ...(cancelled ? { cancelRequested: true } : {}) });
+          this.store.update(sessionId, { hostEnded: "interrupted", pendingHostRecovery: undefined,
+            ...(cancelled ? { cancelRequested: true, cancellation: { at: new Date().toISOString(), source: "host" as const } } : {}) });
           if (cancelled) this.store.setState(sessionId, "CANCELLED");
         }
         try {

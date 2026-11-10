@@ -24,6 +24,12 @@ export interface SessionRecord {
   controllerWorkspacePolicy?: "controller-readonly" | "controller-host";
   /** Operator recoveries of a failed pre-prompt continuation; the failure stays recorded here. */
   checkpointRecoveries?: NativeCheckpointRecovery[];
+  /** Cancellation origin is recorded separately from the terminal state. */
+  cancellation?: { at: string; source: "client-disconnect" | "admin" | "host" };
+  /** Operator reconciliation of completed actions after a lost transport. */
+  completedHostRecoveries?: CompletedHostRecovery[];
+  /** Present only while the first recovered native turn is being reconciled. */
+  pendingHostRecovery?: { operationId: string; notified?: boolean };
   /** Persist replay safety independently of process-local callback state. */
   hostEnded?: "resumable" | "terminal" | "interrupted";
   role: RoleTag;
@@ -61,6 +67,21 @@ export interface NativeCheckpointRecovery {
   /** Last change to the failed record before recovery. */
   failedAt: string;
   leaseEndedAt: string;
+}
+
+export interface CompletedHostRecovery {
+  operationId: string;
+  at: string;
+  sdkSessionId: string;
+  fromGeneration: number;
+  toGeneration: number;
+  cancelledAt: string;
+  cancellationSource: "client-disconnect" | "unknown-operator-attested";
+  checkpointSha256: string;
+  receiptsSha256: string;
+  leaseEndedAt: string;
+  original: { cancelRequested: boolean; hostEnded?: SessionRecord["hostEnded"]; endedToolIds: string[]; notes: string[] };
+  receipts: RuntimeHostCompletion[];
 }
 
 /** A session in this condition can never resume or complete another tool round trip. */

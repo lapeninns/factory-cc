@@ -92,6 +92,64 @@ beforeEach(() => { vi.stubEnv("BRIDGE_TEST_FAKE_KEY", "offline-placeholder-never
 afterEach(async () => { await Promise.all(runtimes.splice(0).map((runtime) => runtime.close())); vi.unstubAllEnvs(); });
 
 describe("official SDK streaming-input lifecycle (injected offline SDK)", () => {
+  it("reconciles a completed recovery action without host replay, then permits a later intentional identical call", async () => {
+    const received: unknown[] = [];
+    const input = { script: "write the owned document" };
+    const scriptTool = { name: "Script", input_schema: { type: "object" as const, properties: { script: { type: "string" } }, required: ["script"] } };
+    const sdk = new FakeSdk(async function* (_input, index, fake) {
+      const id = index === 0 ? "recovery-retry" : "later-intentional-write";
+      yield { type: "assistant", message: { content: [{ type: "tool_use", id, name: "mcp__droid__Script", input }] } };
+      received.push(await fake.handlers.get("Script")!(input, { toolUseID: id }));
+      yield success(index === 0 ? "Recovered successfully" : "New write completed");
+    });
+    const { runtime } = create(sdk);
+    const receipt = { toolUseId: "original-write", toolName: "Script", input, content: "Document version 7 written", isError: false, terminal: false };
+    const s = session({ state: "IDLE", sdkSessionId: "native-sdk-session", pendingHostRecovery: { operationId: "recovery-operation" },
+      completedHostRecoveries: [{ operationId: "recovery-operation", at: "2026-11-10T05:00:00Z", sdkSessionId: "native-sdk-session",
+        fromGeneration: 0, toGeneration: 1, cancelledAt: "2026-11-10T02:19:52Z", cancellationSource: "unknown-operator-attested",
+        checkpointSha256: "0".repeat(64), receiptsSha256: "1".repeat(64), leaseEndedAt: "2026-11-10T02:19:53Z",
+        original: { cancelRequested: true, endedToolIds: ["original-write"], notes: [] }, receipts: [receipt] }] });
+    const recovered = await runtime.handle(request(s, [{ type: "tool_result", tool_use_id: "original-write", content: "cancelled", is_error: true },
+      { type: "text", text: "Continue the existing work" }], { tools: [scriptTool] }));
+    expect(recovered.response.stop_reason).toBe("end_turn");
+    expect(recovered.pendingToolIds).toEqual([]);
+    expect(runtime.pendingHostCalls(s.bridgeSessionId)).toEqual([]);
+    expect(JSON.stringify(sdk.inputs[0])).toContain("Operator-verified host recovery");
+    expect(JSON.stringify(sdk.inputs[0])).toContain("Document version 7 written");
+    expect(JSON.stringify(received[0])).toContain("It was not executed again");
+    expect(sdk.calls[0]!.options.resume).toBe("native-sdk-session");
+    s.pendingHostRecovery = undefined;
+    const later = await runtime.handle(request(s, "Now intentionally perform the same write again", { tools: [scriptTool] }));
+    expect(later.pendingToolIds).toEqual(["later-intentional-write"]);
+    const completed = await runtime.handle(request(s, [{ type: "tool_result", tool_use_id: "later-intentional-write", content: "Document version 8 written" }], { tools: [scriptTool] }));
+    expect(completed.response.stop_reason).toBe("end_turn");
+    expect(received[1]).toEqual({ content: [{ type: "text", text: "Document version 8 written" }], isError: false });
+  });
+
+  it("never treats a different recovery-turn host tool as a cached completed action", async () => {
+    let reconciled: unknown;
+    const sdk = new FakeSdk(async function* (_input, _index, fake) {
+      yield { type: "assistant", message: { content: [{ type: "tool_use", id: "new-read", name: "mcp__droid__TaskOutput", input: {} }] } };
+      await fake.handlers.get("TaskOutput")!({}, { toolUseID: "new-read" });
+      yield { type: "assistant", message: { content: [{ type: "tool_use", id: "old-write-retry", name: "mcp__droid__Script", input: {} }] } };
+      reconciled = await fake.handlers.get("Script")!({}, { toolUseID: "old-write-retry" });
+      yield success("done");
+    });
+    const { runtime } = create(sdk);
+    const s = session({ state: "IDLE", sdkSessionId: "native-sdk-session", pendingHostRecovery: { operationId: "op" },
+      completedHostRecoveries: [{ operationId: "op", at: "", sdkSessionId: "native-sdk-session", fromGeneration: 0, toGeneration: 1,
+        cancelledAt: "", cancellationSource: "client-disconnect", checkpointSha256: "", receiptsSha256: "", leaseEndedAt: "",
+        original: { cancelRequested: true, endedToolIds: ["old-script"], notes: [] },
+        receipts: [{ toolUseId: "old-script", toolName: "Script", input: {}, content: "old result" }] }] });
+    const tools = [tool, { name: "Script", input_schema: { type: "object" as const, properties: {} } }];
+    const reply = await runtime.handle(request(s, "continue", { tools }));
+    expect(reply.pendingToolIds).toEqual(["new-read"]);
+    s.pendingHostRecovery!.notified = true;
+    const completed = await runtime.handle(request(s, [{ type: "tool_result", tool_use_id: "new-read", content: "new host result" }], { tools }));
+    expect(completed.pendingToolIds).toEqual([]);
+    expect(JSON.stringify(reconciled)).toContain("Historical successful receipt for old-script");
+  });
+
   it("keeps one query for successive turns and does not repeat stable host context", async () => {
     const sdk = new FakeSdk(async function* (_input, index) { yield success(`reply-${index}`); });
     const { runtime } = create(sdk);

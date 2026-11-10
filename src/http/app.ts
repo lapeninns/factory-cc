@@ -32,6 +32,7 @@ import { configuredModels, providerFromModelId, resolveRequestModel, type Bridge
 import { ClaudePool, PERSONAL_ACCOUNT, POOL_PROFILE } from "../upstream/claude-pool.js";
 import { DesktopJobsRuntime, SUBSCRIPTION_WORKER_SLOTS, type DesktopJobBinding, type DesktopWorkspacePolicy } from "../runtime/desktop-jobs.js";
 import { recoverNativeCheckpoint } from "../control/native-recovery.js";
+import { inspectCompletedHostCheckpoint, recoverCompletedHostCheckpoint } from "../control/completed-host-recovery.js";
 import type { RuntimeRequest } from "../runtime/types.js";
 
 export interface BridgeApp {
@@ -440,17 +441,22 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       json(res, 200, { sessions: store.list() });
       return;
     }
-    if (req.method === "POST" && path === "/internal/native-checkpoint-recovery") {
+    if (req.method === "POST" && ["/internal/native-checkpoint-recovery", "/internal/completed-host-recovery"].includes(path)) {
       requireAdminToken(req.headers, config.adminToken);
       const workspacePolicy = controllerWorkspacePolicy(config);
       if (!desktopJobs || !config.controllerPool || !workspacePolicy || !(desktopJobs instanceof DesktopJobsRuntime)) {
         throw new BridgeError(409, "native_recovery_unavailable", "Native checkpoint recovery requires the supervised subscription controller pool.");
       }
       try {
-        const result = await recoverNativeCheckpoint({ store, runtime, workspacePolicy,
+        const context = { store, runtime, workspacePolicy,
           accounts: (config.subscriptionAccounts ?? []).map(account => account.profile),
-          busy: id => activeRequests.has(id) || control.hasApprovals(id),
-          inspect: request => desktopJobs.inspectNativeGenerations(request) }, await readJson(req, config.maxBodyBytes));
+          busy: (id: string) => activeRequests.has(id) || control.hasApprovals(id),
+          inspect: (request: import("../runtime/desktop-jobs.js").NativeGenerationInspection) => desktopJobs.inspectNativeGenerations(request) };
+        const body = await readJson(req, config.maxBodyBytes);
+        const result = path === "/internal/completed-host-recovery"
+          ? await recoverCompletedHostCheckpoint({ ...context,
+            checkpoint: (record, receipts) => inspectCompletedHostCheckpoint(config.subscriptionAccounts ?? [], record, receipts) }, body)
+          : await recoverNativeCheckpoint(context, body);
         logger.info("native_checkpoint_recovery", { sessionId: result.bridgeSessionId, recovered: result.recovered,
           alreadyRecovered: result.alreadyRecovered === true, eligible: result.eligible === true, nativeGeneration: result.nativeGeneration });
         json(res, 200, result);
@@ -465,7 +471,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       const body = (await readJson(req, config.maxBodyBytes)) as { sessionId?: string };
       if (!body.sessionId) throw new BridgeError(400, "invalid_request_error", "sessionId required");
       control.cancelApprovals(body.sessionId);
-      store.update(body.sessionId, { cancelRequested: true });
+      store.update(body.sessionId, { cancelRequested: true, cancellation: { at: new Date().toISOString(), source: "admin" }, pendingHostRecovery: undefined });
       store.setState(body.sessionId, "CANCELLED");
       await runtime.cancel(body.sessionId, "admin-cancel");
       json(res, 200, { cancelled: body.sessionId });
@@ -606,9 +612,10 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     const interrupted = new Promise<never>((_resolve, reject) => { rejectInterrupted = reject; });
     const cancelOwnedRequest = (reason: string, error: BridgeError): void => {
       if (completed || cancellationRequested || activeRequests.get(sessionId) !== owner) return;
+      if (store.require(sessionId).cancelRequested) return;
       cancellationRequested = true;
       watchdog.dispose();
-      store.update(sessionId, { cancelRequested: true });
+      store.update(sessionId, { cancelRequested: true, cancellation: { at: new Date().toISOString(), source: "client-disconnect" }, pendingHostRecovery: undefined });
       store.setState(sessionId, "CANCELLED");
       rejectInterrupted(error);
       void runtime.cancel(sessionId, reason).catch(() => {
@@ -617,21 +624,26 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     };
     // A timed-out turn is interrupted first. If it winds down in time its native
     // checkpoint stays resumable (IDLE); otherwise the process is killed (FAILED).
-    const settleExpiredTurn = async (): Promise<void> => {
+    const settleExpiredTurn = async (reason = "request-timeout"): Promise<void> => {
       control.cancelApprovals(sessionId);
+      const cancellation = store.require(sessionId).cancellation;
       let resumable = false;
       if (runtime.interrupt) {
-        try { resumable = await runtime.interrupt(sessionId, "request-timeout"); }
+        try { resumable = await runtime.interrupt(sessionId, reason); }
         catch { logger.warn("runtime_interrupt_failed", { sessionId }); }
       }
+      const current = store.require(sessionId);
+      // A later explicit cancellation or host end always wins the asynchronous interrupt.
+      if (current.state === "CANCELLED" || current.hostEnded !== undefined || current.cancellation !== cancellation) return;
       if (resumable) {
-        store.update(sessionId, { cancelRequested: false, notes: [...store.require(sessionId).notes, "request-timeout-interrupted"] });
+        store.update(sessionId, { cancelRequested: false, cancellation: undefined,
+          notes: [...current.notes, `${reason}-interrupted`] });
         store.setState(sessionId, "IDLE");
         return;
       }
       store.setState(sessionId, "FAILED");
-      await runtime.cancel(sessionId, "request-timeout").catch(() => {
-        logger.error("runtime_cancel_failed", { sessionId, reason: "request-timeout" });
+      await runtime.cancel(sessionId, reason).catch(() => {
+        logger.error("runtime_cancel_failed", { sessionId, reason });
       });
     };
     const expireOwnedRequest = (kind: TurnTimeout): void => {
@@ -648,7 +660,22 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       });
     };
     const onDisconnect = (): void => {
-      if (!res.writableFinished) cancelOwnedRequest("client-disconnect", new BridgeError(499, "cancelled", "client disconnected"));
+      if (res.writableFinished || completed || cancellationRequested || activeRequests.get(sessionId) !== owner) return;
+      const current = store.require(sessionId);
+      if (current.cancelRequested) return;
+      if (!current.sdkSessionId || current.pendingToolIds.length || current.hostCompletionReceipts?.length
+          || runtime.pendingHostCalls?.(sessionId).length) {
+        cancelOwnedRequest("client-disconnect", new BridgeError(499, "cancelled", "client disconnected"));
+        return;
+      }
+      cancellationRequested = true;
+      timedOut = true;
+      watchdog.dispose();
+      store.update(sessionId, { cancelRequested: true, cancellation: { at: new Date().toISOString(), source: "client-disconnect" } });
+      rejectInterrupted(new BridgeError(499, "client_disconnected", "Client disconnected; the native turn is being interrupted before reuse."));
+      timeoutSettled = settleExpiredTurn("client-disconnect").catch(() => {
+        logger.error("client_disconnect_settle_failed", { sessionId });
+      });
     };
     res.once("close", onDisconnect);
     // Idle limit: any SDK message, delta or tool event restarts it, and a pending
@@ -716,6 +743,8 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         sdkSessionId: turn.sdkSessionId ?? session.sdkSessionId,
         historyMessageHashes: historyMessageHashes([...request.messages, { role: "assistant", content: assistantContent }]),
         usage: { ...turn.response.usage, estimated: turn.response.usage.estimated ?? false },
+        ...(session.pendingHostRecovery ? { pendingHostRecovery: turn.pendingToolIds.length
+          ? { ...session.pendingHostRecovery, notified: true } : undefined } : {}),
       });
       store.setState(sessionId, turn.pendingToolIds.length ? "WAITING_DROID_TOOL" : "IDLE");
       if (turn.pendingToolIds.length) scheduleWorkerEnd(sessionId, turn.pendingToolIds);
@@ -729,7 +758,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         sdkBillingUsage: turn.sdkBillingUsage,
         compactMetadata: turn.compactMetadata,
         // Handoff and Task batch events carry only IDs and tool names: how pending tools finished and which calls went to Droid together.
-        events: (turn.events ?? []).filter((event) => /usage|compact|cancelled_turn|steering_turn|task_batch/i.test(event.type)),
+        events: (turn.events ?? []).filter((event) => /usage|compact|cancelled_turn|steering_turn|task_batch|recovered_host_receipt/i.test(event.type)),
       })));
       completed = true;
       if (writer) writer.finish(turn.response);
@@ -737,6 +766,8 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     } catch (error) {
       completed = true;
       const current = store.get(sessionId);
+      // An interrupted reconciliation cannot cache a historical success into another turn.
+      if (current?.pendingHostRecovery) store.update(sessionId, { pendingHostRecovery: undefined });
       const deferredAdmission = error instanceof BridgeError && error.code === "desktop_job_timeout"
         && error.extra.retry_safe === true && error.extra.phase === "admission"
         && !cancellationRequested && current && !current.cancelRequested && current.hostEnded === undefined

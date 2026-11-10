@@ -1,5 +1,32 @@
 # Run the desktop bridge for weeks
 
+## Completed host actions after a lost connection
+
+`recover-completed-host` is a separate administrator operation for a cancelled native checkpoint whose ended host actions all have authenticated successful receipts. It requires settled native leases, no live callback or approval, exact checkpoint contents and complete tool-result pairing. It refuses recorded administrator or host cancellation. A receipt-less or partially completed handoff requires separate investigation.
+
+Create a private JSON request file with the exact values from the retained session record. Choose a new operation ID for this cancellation.
+
+```json
+{
+  "operationId": "operator-selected-unique-id",
+  "bridgeSessionId": "sess_example",
+  "factorySessionId": "factory-session-id",
+  "sdkSessionId": "11111111-2222-4333-8444-555555555555",
+  "nativeGeneration": 0,
+  "expectedUpdatedAt": "2026-11-10T02:19:52.000Z"
+}
+```
+
+```sh
+npm run control -- recover-completed-host --input /absolute/private/recovery.json --dry-run
+```
+
+For a historical record without cancellation provenance, include `"acknowledgeHistoricalDisconnect": true` only after establishing that the loss was a transport interruption. The audit keeps this as an operator attestation of an unknown historical origin. It does not label the origin as verified.
+
+The dry run returns `checkpointSha256` and `receiptsSha256`. Add those two values to the same request file and run the command without `--dry-run`. It refuses a changed session, checkpoint, receipt set or lease. `BRIDGE_ADMIN_TOKEN` and the loopback `BRIDGE_CONTROL_URL` use the existing control interface.
+
+Recovery preserves the original cancellation and successful receipts in the session audit, advances the native generation, and reconciles the actual completed outcomes in the first resumed native turn. It never edits the original native history. During that turn, an exact repeated tool name and input returns a clearly labelled historical receipt without executing the operation again. A subsequent normal turn can intentionally perform an identical operation. Ambiguous duplicate actions are refused during recovery preparation. A new cancellation requires a new recovery operation and current evidence.
+
 ## Upgrade an existing installation
 
 Merge the reviewed source into the checkout recorded in the desktop installation, then run these commands from that checkout:
