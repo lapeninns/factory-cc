@@ -33,7 +33,7 @@ import { OwnedProcesses } from "./owned-processes.js";
 import { hostActionNeedsWorkspaceReservation } from "./desktop-jobs.js";
 import { upstreamError } from "./upstream-error.js";
 import { redactValue } from "../security/redact.js";
-import { historicalHostResult, hostReceiptContent, hostResultDigest, mcpResultContent as mcpContent, RECOVERY_ONLY_DENIAL, recoveredHostContext } from "./host-recovery.js";
+import { historicalHostResult, hostReceiptContent, matchesSettledHostResult, mcpResultContent as mcpContent, RECOVERY_ONLY_DENIAL, recoveredHostContext } from "./host-recovery.js";
 
 type ModelRoute = ReturnType<typeof resolveRequestModel>;
 
@@ -499,11 +499,7 @@ export class SdkRuntime implements BridgeRuntime {
         results = results.filter(result => {
           const settled = retained.settledToolResults!.find(item => item.toolUseId === result.tool_use_id);
           if (!settled) return true;
-          // Hooks persist array output as an exact JSON scalar. Accept that
-          // representation only when its complete serialized payload matches.
-          const matches = hostResultDigest(result.content, Boolean(result.is_error)) === settled.resultSha256
-            || Array.isArray(result.content) && hostResultDigest(JSON.stringify(result.content), Boolean(result.is_error)) === settled.resultSha256;
-          if (!matches) throw new BridgeError(409, "conflicting_settled_result", "A previously consumed tool result changed.");
+          if (!matchesSettledHostResult(result, retained.settledToolResults!)) throw new BridgeError(409, "conflicting_settled_result", "A previously consumed tool result changed.");
           return false;
         });
       }

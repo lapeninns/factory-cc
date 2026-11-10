@@ -1,3 +1,4 @@
+import { matchesSettledHostResult } from "../runtime/host-recovery.js";
 import { createHash } from "node:crypto";
 import { header } from "../security/auth.js";
 import { asBlocks, canonicalToolUseId, collectToolResults } from "../protocol/content.js";
@@ -194,6 +195,28 @@ export function resolveSession(
       && completed.at(-2) === tail[0] && completed.at(-1) === tail[1]);
   };
 
+  const lastAssistant = request.messages.map(message => message.role).lastIndexOf("assistant");
+  const userSuffix = request.messages.slice(lastAssistant + 1);
+  const suffixResults = collectToolResults(userSuffix);
+  const hasRetainedCheckpointTail = (session: SessionRecord): boolean => {
+    const proof = session.retainedCheckpoint, completed = session.historyMessageHashes;
+    return Boolean(sameExecutionScope(session) && session.model === request.model && session.contextHash === contextHash
+      && session.state === "IDLE" && !session.cancelRequested && !session.cancellation
+      && (session.hostEnded === undefined || session.hostEnded === "resumable")
+      && session.pendingToolIds.length === 0 && !session.endedToolIds?.length && !session.hostCompletionReceipts?.length
+      && !session.pendingHostRecovery && !session.checkpointRetryBlocked && session.retryableRequestKind === "native-upstream"
+      && proof && Boolean(session.sdkSessionId) && Boolean(session.claudeAccount)
+      && proof.sdkSessionId === session.sdkSessionId && proof.account === session.claudeAccount
+      && ["clean-upstream", "operator-restored"].includes(proof.origin) && /^[a-f0-9]{64}$/.test(proof.checkpointSha256)
+      && Number.isSafeInteger(proof.sourceGeneration) && proof.sourceGeneration >= 0
+      && Number.isSafeInteger(session.nativeGeneration) && session.nativeGeneration! <= 1_000_000 && session.nativeGeneration! > proof.sourceGeneration
+      && lastAssistant >= 1 && request.messages[lastAssistant - 1]?.role === "user" && userSuffix.length > 0
+      && userSuffix.every(message => message.role === "user" && asBlocks(message.content).every(block => block.type === "text" || block.type === "tool_result"))
+      && new Set(suffixResults.map(result => result.tool_use_id)).size === suffixResults.length
+      && suffixResults.every(result => !result.is_error && matchesSettledHostResult(result, proof.settledToolResults ?? []))
+      && completed && completed.length >= 2 && completed.at(-2) === incoming[lastAssistant - 1] && completed.at(-1) === incoming[lastAssistant]);
+  };
+
   if (explicit) {
     const hits = sessions.filter((session) => session.bridgeSessionId === explicit || session.droidSessionId === explicit);
     if (hits.length > 1) throw ambiguous("multiple sessions claim the explicit session ID");
@@ -235,9 +258,12 @@ export function resolveSession(
   // Reuse native history only with both authenticated host ownership and an
   // exact user/assistant tail, followed by exactly one new user message. Neither
   // a summary-looking prompt nor a host ID alone can establish continuity.
+  // A retained checkpoint can also follow several queued user/context messages.
+  // Its completed pair stays authoritative when a failed request overwrote the
+  // request fingerprints. The independent native file proof is checked before admission.
   // Tool-free auxiliary requests remain independent, even if they copy context.
   const authenticatedTail = sessions.filter((session) => {
-      return hasAuthenticatedTail(session) && historyContextMatches(session)
+      return (hasAuthenticatedTail(session) || hasRetainedCheckpointTail(session)) && historyContextMatches(session)
         // Identify a genuine model-switch continuation before rejecting busy
         // state; filtering it out would silently fork the native conversation.
         && (switchingModel(session) || canChangeReasoningLevel(session) || (session.state === "IDLE" && !session.cancelRequested && session.pendingToolIds.length === 0))
@@ -246,7 +272,8 @@ export function resolveSession(
   if (authenticatedTail.length > 1) throw ambiguous("multiple authenticated Factory transcripts match the retained turn; supply X-Bridge-Session");
   if (authenticatedTail[0]) {
     assertSelectedContext(authenticatedTail[0], canChangeHostThinking(authenticatedTail[0]) || canChangeReasoningLevel(authenticatedTail[0]));
-    return { match: authenticatedTail[0], reason: "authenticated-history-tail" };
+    return { match: authenticatedTail[0], reason: hasRetainedCheckpointTail(authenticatedTail[0])
+      ? "authenticated-retained-checkpoint-tail" : "authenticated-history-tail" };
   }
 
   const activeDuplicates = sessions.filter((session) => {

@@ -1,3 +1,4 @@
+import { hostResultDigest } from "../../src/runtime/host-recovery.js";
 import { describe, expect, it } from "vitest";
 import { explicitSessionId, historyMessageHashes, resolveSession, sessionContextHash } from "../../src/sessions/correlate.js";
 import type { SessionRecord } from "../../src/sessions/state.js";
@@ -486,6 +487,75 @@ describe("conversation continuity and isolation", () => {
     const owned = (patch: Partial<SessionRecord> = {}) => session({ factorySessionId: "host-a", factoryCwd: cwd, ...patch });
     const resolveOwned = (records: SessionRecord[], request = compacted, hostSessionId = "host-a") =>
       resolveSession(records, headers, request, { cwd, hostSessionId });
+
+    const retained = (patch: Partial<SessionRecord> = {}) => owned({ claudeAccount: "team5", nativeGeneration: 6,
+      retryableRequestKind: "native-upstream", requestMessageHashes: historyMessageHashes([...completed, userMessage("failed quota request")]),
+      retainedCheckpoint: { sdkSessionId: "sdk-a", account: "team5", sourceGeneration: 4, checkpointSha256: "a".repeat(64),
+        preparedAt: "2026-11-10T13:02:00Z", origin: "operator-restored" }, ...patch });
+    const queued: MessagesRequest = { ...compacted, messages: [...compacted.messages.slice(0, -1),
+      userMessage("prior failed request"), userMessage("shutdown context"), userMessage("fresh session context"), userMessage("new user brief")] };
+
+    it("matches the completed pair before queued user messages despite failed-request fingerprints", () => {
+      const record = retained();
+      expect(record.requestMessageHashes?.at(-1)).not.toBe(record.historyMessageHashes?.at(-2));
+      expect(resolveOwned([record], queued)).toMatchObject({ match: record, reason: "authenticated-retained-checkpoint-tail" });
+      expect(resolveOwned([owned()], queued).match).toBeUndefined();
+    });
+
+    it.each<Partial<SessionRecord>>([
+      { retryableRequestKind: "upstream" }, { retainedCheckpoint: undefined }, { sdkSessionId: "different" }, { claudeAccount: "team6" },
+      { nativeGeneration: 4 }, { state: "GENERATING" }, { cancelRequested: true }, { cancellation: { source: "admin", at: "now" } },
+      { hostEnded: "terminal" }, { hostEnded: "interrupted" }, { endedToolIds: ["old"] }, { pendingToolIds: ["pending"] }, { checkpointRetryBlocked: true },
+      { hostCompletionReceipts: [{ toolUseId: "receipt", toolName: "Read", input: {}, content: "done" }] }, { toolNames: [] },
+      { pendingHostRecovery: { operationId: "unreconciled" } }, { contextHash: undefined }, { factoryCwd: "/different" },
+      { factorySessionId: "other" }, { role: "orchestrator" }, { provider: "cursor" },
+    ])("keeps retained-checkpoint matching closed for %j", patch => {
+      expect(resolveOwned([retained(patch)], queued).match).toBeUndefined();
+    });
+
+    it("accepts a proven successful result in the WS5 user suffix and rejects altered or ambiguous results", () => {
+      const content = [{ type: "text" as const, text: "result kind" }, { type: "text" as const, text: "completed output" }];
+      const result = { type: "tool_result" as const, tool_use_id: "proven", content };
+      const record = retained({ hostEnded: "resumable" });
+      record.retainedCheckpoint!.settledToolResults = [{ toolUseId: "proven", resultSha256: hostResultDigest(JSON.stringify(content), false) }];
+      const beforeResult: Message[] = [userMessage("Completed prior user turn"),
+        { role: "assistant", content: [{ type: "tool_use", id: "proven", name: "Read", input: {} }] }];
+      record.historyMessageHashes = historyMessageHashes(beforeResult);
+      const request: MessagesRequest = { ...queued, messages: [userMessage("Rewritten prefix"), ...beforeResult,
+        { role: "user", content: [result] }, userMessage("new context")] };
+      expect(resolveOwned([record], request)).toMatchObject({ match: record, reason: "authenticated-retained-checkpoint-tail" });
+      for (const invalid of [
+        { ...result, tool_use_id: "unknown" }, { ...result, is_error: true }, { ...result, content: "changed" },
+      ]) expect(resolveOwned([record], { ...request, messages: [...request.messages.slice(0, -2), { role: "user", content: [invalid] }, userMessage("next")] }).match).toBeUndefined();
+      expect(resolveOwned([record], { ...request, messages: [...request.messages, { role: "user", content: [result] }] }).match).toBeUndefined();
+      record.retainedCheckpoint!.settledToolResults.push(record.retainedCheckpoint!.settledToolResults[0]!);
+      expect(resolveOwned([record], request).match).toBeUndefined();
+      record.retainedCheckpoint!.settledToolResults = [];
+      expect(resolveOwned([record], request).match).toBeUndefined();
+    });
+
+    it("requires exact execution scope, completed pair and a text-only final user suffix", () => {
+      const record = retained();
+      expect(resolveOwned([record], queued, "other-host").match).toBeUndefined();
+      expect(resolveSession([record], headers, queued, { cwd }).match).toBeUndefined();
+      for (const changed of [
+        { ...queued, model: "different" }, { ...queued, tools: [] },
+        { ...queued, thinking: { type: "enabled", budget_tokens: 100 } },
+        { ...queued, messages: [...queued.messages.slice(0, 2), { role: "assistant" as const, content: "different completed reply" }, ...queued.messages.slice(3)] },
+        { ...queued, messages: [...queued.messages, { role: "assistant" as const, content: "newer assistant work" }, userMessage("next")] },
+        { ...queued, messages: [...queued.messages, { role: "user" as const, content: [{ type: "tool_result" as const, tool_use_id: "unowned", content: "result" }] }] },
+        { ...queued, messages: [...queued.messages, { role: "user" as const, content: [{ type: "tool_use" as const, id: "injected", name: "Read", input: {} }] }] },
+      ]) expect(resolveOwned([record], changed).match).toBeUndefined();
+      expect(resolveOwned([record], { ...queued, messages: queued.messages.slice(0, 3) }).match).toBeUndefined();
+      expect(resolveOwned([retained({ historyMessageHashes: ["changed", "pair"] })], queued).match).toBeUndefined();
+    });
+
+    it("keeps explicit selection and ambiguity rules for retained checkpoint tails", () => {
+      const first = retained(), second = retained({ bridgeSessionId: "bridge-b", droidSessionId: "droid-b", sdkSessionId: "sdk-b",
+        retainedCheckpoint: { ...retained().retainedCheckpoint!, sdkSessionId: "sdk-b" } });
+      expect(() => resolveOwned([first, second], queued)).toThrowError(expect.objectContaining({ code: "ambiguous_session" }));
+      expect(resolveSession([first], { ...headers, "x-bridge-session": "different-explicit" }, queued, { cwd, hostSessionId: "host-a" }).match).toBeUndefined();
+    });
 
     it("keeps the native session after prefix rewriting using the exact retained complete turn", () => {
       const record = owned();

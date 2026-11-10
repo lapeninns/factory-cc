@@ -50,6 +50,16 @@ export function hostResultDigest(content: string | ContentBlock[], isError: bool
   return nativeResultDigest(mcpResultContent(hostReceiptContent(content)), isError);
 }
 
+/** The same complete result representation is used for selection and delivery. */
+export function matchesSettledHostResult(result: { tool_use_id: string; content: string | ContentBlock[]; is_error?: boolean },
+  receipts: readonly { toolUseId: string; resultSha256: string }[]): boolean {
+  const matches = receipts.filter(receipt => receipt.toolUseId === result.tool_use_id);
+  if (matches.length !== 1) return false;
+  const expected = matches[0]!.resultSha256;
+  return hostResultDigest(result.content, Boolean(result.is_error)) === expected
+    || Array.isArray(result.content) && hostResultDigest(JSON.stringify(result.content), Boolean(result.is_error)) === expected;
+}
+
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
   if (value !== null && typeof value === "object") return `{${Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`).join(",")}}`;

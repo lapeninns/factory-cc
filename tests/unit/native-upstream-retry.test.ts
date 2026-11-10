@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -49,6 +49,94 @@ async function fixture() {
 }
 
 describe("established native upstream retry", () => {
+  async function compactedRetryFixture(status = 529, generation = 6) {
+    const f = await fixture();
+    f.runtime.handle.mockRejectedValueOnce(new BridgeError(status, status === 429 ? "rate_limit_error" : "overloaded_error", "limit",
+      { retry_from_history: true, ...(status === 429 ? { retry_after: 120 } : {}) }));
+    expect((await postMessages(f.app.url, "client", f.next)).status).toBe(status);
+    f.app.store.update(f.record.bridgeSessionId, { nativeGeneration: generation,
+      retainedCheckpoint: { ...f.record.retainedCheckpoint!, sourceGeneration: generation - 2 } });
+    const ended = await fetch(`${f.app.url}/internal/host-events`, { method: "POST",
+      headers: { authorization: "Bearer hook", "content-type": "application/json" },
+      body: JSON.stringify({ eventId: randomUUID(), bindingToken: f.token,
+        event: { hook_event_name: "SessionEnd", session_id: f.record.factorySessionId, cwd: join(f.root, "workspace"), reason: "exit" } }) });
+    expect(ended.status).toBe(200);
+    await f.app.close(); apps.splice(apps.indexOf(f.app), 1);
+    const restartedConfig = { ...f.config, port: 0 };
+    const app = createBridgeApp(restartedConfig, f.logger, "", f.runtime); apps.push(app); await listen(app, restartedConfig);
+    const token = await hostStart(app, f.root);
+    const record = app.store.require(f.record.bridgeSessionId);
+    expect(record).toMatchObject({ nativeGeneration: generation + 1, sdkSessionId: f.sdkSessionId, hostEnded: "resumable" });
+    const request = { ...firstTurn(token), messages: [
+      { role: "user", content: `${COMPACTION_SUMMARY}\nRewritten prefix` },
+      ...firstTurn(f.token).messages,
+      { role: "assistant", content: [{ type: "text", text: "Planned." }] },
+      { role: "user", content: "Previous failed quota request" },
+      { role: "user", content: "Orderly shutdown context" },
+      { role: "user", content: "Fresh host context" },
+      { role: "user", content: `[factory-cc-session:${token}] Continue the workstream` },
+    ] };
+    expect(f.record.requestMessageHashes?.at(-1)).not.toBe(f.record.historyMessageHashes?.at(-2));
+    return { ...f, app, record, request };
+  }
+
+  it.each([6, 2])("resumes the exact checkpoint after Quit, restart and fresh generation following g%s", async generation => {
+    const f = await compactedRetryFixture(529, generation);
+    const response = await postMessages(f.app.url, "client", f.request);
+    expect(response.status).toBe(200); expect(response.session).toBe(f.record.bridgeSessionId);
+    expect(f.observed.at(-1)).toEqual({ account: f.record.claudeAccount, sdk: f.sdkSessionId, generation: generation + 1, recovery: undefined });
+    expect(f.app.store.list()).toHaveLength(1);
+    expect(f.runtime.prepareColdRetry).not.toHaveBeenCalled();
+  });
+
+  it("selects a WS5-shaped resumed checkpoint with an exact proven result before the new text", async () => {
+    const f = await compactedRetryFixture(529, 2);
+    const content = [{ type: "text" as const, text: "Script completed" }, { type: "text" as const, text: "output" }];
+    const resultId = "consumed-script";
+    writeFileSync(f.file, [
+      { sessionId: f.sdkSessionId, message: { role: "assistant", content: [{ type: "tool_use", id: resultId, name: "mcp__droid__Script", input: {} }] } },
+      { sessionId: f.sdkSessionId, message: { role: "user", content: [{ type: "tool_result", tool_use_id: resultId, content: mcpResultContent(JSON.stringify(content)) }] } },
+    ].map(row => JSON.stringify(row)).join("\n") + "\n");
+    f.app.store.update(f.record.bridgeSessionId, { retainedCheckpoint: { ...f.record.retainedCheckpoint!,
+      checkpointSha256: createHash("sha256").update(readFileSync(f.file)).digest("hex"), settledToolIds: [resultId],
+      settledToolResults: [{ toolUseId: resultId, resultSha256: hostResultDigest(JSON.stringify(content), false) }] } });
+    const request = { ...f.request, messages: [...f.request.messages.slice(0, 3),
+      { role: "user", content: [{ type: "tool_result", tool_use_id: resultId, content }] }, f.request.messages.at(-1)!] };
+    const response = await postMessages(f.app.url, "client", request);
+    expect(response.status).toBe(200);
+    expect(response.session).toBe(f.record.bridgeSessionId);
+    expect(f.observed.at(-1)).toEqual({ account: f.record.claudeAccount, sdk: f.sdkSessionId, generation: 3, recovery: undefined });
+    expect(f.app.store.list()).toHaveLength(1);
+    expect(f.runtime.prepareColdRetry).not.toHaveBeenCalled();
+  });
+
+  it.each(["checkpoint", "receipt", "cancel", "explicit-id", "tool-result"])("refuses compacted retained retry when %s is unsafe", async unsafe => {
+    const f = await compactedRetryFixture();
+    if (unsafe === "checkpoint") writeFileSync(f.file, JSON.stringify({ sessionId: f.sdkSessionId, message: { role: "user", content: [] } }) + "\n");
+    if (unsafe === "receipt") f.app.store.update(f.record.bridgeSessionId, { hostCompletionReceipts: [{ toolUseId: "unknown", toolName: "Read", input: {}, content: "done" }] });
+    if (unsafe === "cancel") f.app.store.update(f.record.bridgeSessionId, { cancelRequested: true });
+    const request = unsafe === "tool-result" ? { ...f.request, messages: [...f.request.messages,
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "unknown", content: "done" }] }] } : f.request;
+    const before = structuredClone(f.record), count = f.runtime.handle.mock.calls.length;
+    const response = await postMessages(f.app.url, "client", request, unsafe === "explicit-id" ? { "x-bridge-session": "wrong-id" } : {});
+    expect(response.status).toBe(409);
+    expect(f.record).toEqual(before);
+    expect(f.app.store.list()).toHaveLength(1);
+    expect(f.runtime.handle).toHaveBeenCalledTimes(count);
+    expect(f.runtime.prepareColdRetry).not.toHaveBeenCalled();
+  });
+
+  it("enforces the original account cooldown before a compacted retained retry", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(new Date("2026-11-10T13:00:00Z"));
+    const f = await compactedRetryFixture(429), calls = f.runtime.handle.mock.calls.length;
+    expect((await postMessages(f.app.url, "client", f.request)).status).toBe(429);
+    expect(f.runtime.handle).toHaveBeenCalledTimes(calls);
+    expect(f.record.sdkSessionId).toBe(f.sdkSessionId);
+    vi.setSystemTime(new Date("2026-11-10T13:03:00Z"));
+    expect((await postMessages(f.app.url, "client", f.request)).status).toBe(200);
+    expect(f.observed.at(-1)?.recovery).toBeUndefined();
+  });
+
   it.each(["legacy", "retained", "cooling"])("fences the same Factory scope's %s checkpoint when changed history no longer correlates", async kind => {
     const f = await fixture();
     if (kind === "legacy") f.app.store.update(f.record.bridgeSessionId, { sdkSessionId: undefined, retryableRequestKind: "upstream", retryableRequestHash: "1".repeat(64) });
