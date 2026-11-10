@@ -65,6 +65,37 @@ describe("live permission requests", () => {
 });
 
 describe("authentic Factory lifecycle", () => {
+  it("starts cancellation despite a flush failure and retries incomplete persistence after concurrent callers", async () => {
+    const f = fixture(), start = await f.send("SessionStart"), token = start.bindingToken as string;
+    const id = f.session(); f.broker.bind(token, id);
+    const persistence = f.store as unknown as { flush(record: { state: string }): void };
+    const flush = persistence.flush.bind(f.store);
+    let rejected = false;
+    vi.spyOn(persistence, "flush").mockImplementation(record => {
+      if (!rejected && record.state === "CANCELLED") {
+        rejected = true;
+        throw new Error("one-time persistence failure after record mutation");
+      }
+      flush(record);
+    });
+    let complete!: () => void;
+    const cleanup = new Promise<void>(resolve => { complete = resolve; });
+    vi.mocked(f.runtime.cancel).mockImplementationOnce(() => cleanup);
+    const first = f.send("Notification", token, { notification_type: "cancelled" });
+    expect(f.store.require(id)).toMatchObject({ state: "CANCELLED", cancelRequested: true });
+    expect(f.runtime.cancel).toHaveBeenCalledExactlyOnceWith(id, "factory-cancelled");
+    const concurrent = f.send("Notification", token, { notification_type: "cancelled" });
+    expect(f.runtime.cancel).toHaveBeenCalledTimes(1);
+    complete();
+    const outcomes = await Promise.allSettled([first, concurrent]);
+    expect(outcomes.map(result => result.status)).toEqual(["rejected", "rejected"]);
+    expect(await f.send("Notification", token, { notification_type: "cancelled" })).toMatchObject({ ok: true });
+    expect(f.runtime.cancel).toHaveBeenCalledTimes(2);
+    expect(f.store.require(id)).toMatchObject({ state: "CANCELLED", cancelRequested: true, hostEnded: "interrupted" });
+    expect(await f.send("Notification", token, { notification_type: "cancelled" })).toMatchObject({ alreadyEnded: true });
+    expect(f.runtime.cancel).toHaveBeenCalledTimes(2);
+  });
+
   it.each(["notification", "launch"])("latches %s cancellation while an orderly checkpoint proof is pending", async route => {
     let finish!: (value: boolean) => void;
     const verify = vi.fn(() => new Promise<boolean>(resolve => { finish = resolve; }));
