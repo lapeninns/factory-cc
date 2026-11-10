@@ -648,13 +648,19 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     const retry = retries[0] && { match: retries[0], reason: retries[0].retryableRequestKind === "admission" ? "admission-retry"
       : retries[0].retryableRequestKind === "native-upstream" ? "native-upstream-retry" : "upstream-retry" };
     const resolved = selectedReconciliation ? { match: selectedOwner, reason: "selected-lineage-reconciliation" }
-      : retry && !implicitAuxiliary ? retry : resolveSession(routingRecords, headers, request, {
+      : retry && !implicitAuxiliary && !historicalReconciliation ? retry : resolveSession(routingRecords, headers, request, {
         cwd, hostSessionId: factorySession?.sessionId, allowModelSwitch: config.models !== undefined, provider, claudeProfile: listed?.claudeProfile,
         // Droid desktop has no conversation ID header or hooks to disambiguate.
         continueIdenticalTranscripts: config.desktopProfile, auxiliaryRetry: retry,
       });
-    if (historicalReconciliation && (resolved.match !== selectedOwner || resolved.reason !== "authenticated-retained-checkpoint-tail")) {
-      throw new BridgeError(409, "native_lineage_retained_tail_required", "Continue historical reconciliation with the exact authenticated retained history.");
+    if (historicalReconciliation) {
+      const original = selectedOwner.nativeLineageSelection!.selected.record;
+      const retrying = selectedOwner.retainedCheckpoint?.origin === "clean-upstream"
+        || selectedOwner.retryableRequestHash !== original.retryableRequestHash;
+      if (resolved.match !== selectedOwner || resolved.reason !== "authenticated-retained-checkpoint-tail"
+          || retrying && selectedOwner.retryableRequestHash !== requestFingerprint) {
+        throw new BridgeError(409, "native_lineage_retained_tail_required", "Continue historical reconciliation with the exact authenticated retained history.");
+      }
     }
     if (resolved.match?.nativeLineageSelection && resolved.match !== selectedOwner) await verifyLineageOwner(resolved.match);
     if (config.controllerPool && factorySession) {

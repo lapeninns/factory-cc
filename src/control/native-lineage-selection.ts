@@ -59,7 +59,7 @@ export async function selectNativeLineage(context: NativeLineageSelectionContext
   const historical: NativeLineageSelection["historical"] = [];
   const inactive: NativeLineageSelection["inactive"] = [];
   for (const record of context.store.list().filter(record => inventory.some(item => item.bridgeSessionId === record.bridgeSessionId) && !record.sdkSessionId)) {
-    inactive.push({ record: structuredClone(record), evidence: await inspect(context, record, true) });
+    inactive.push({ record: structuredClone(record), evidence: await inspect(context, record, { checkpointOptional: true }) });
   }
   const proofs: NativeLineageBranchProof[] = [];
   const selectedCheckpoint = context.lineageCheckpoint(selected);
@@ -70,7 +70,7 @@ export async function selectNativeLineage(context: NativeLineageSelectionContext
   const requiredDispositions: Array<Omit<NativeLineageHistoricalDisposition, "approvalReference" | "approvedAt">> = [];
   for (const record of scope) {
     const checkpoint = context.lineageCheckpoint(record);
-    const evidence = await inspect(context, record, false, record === selected ? retained?.sourceGeneration : undefined);
+    const evidence = await inspect(context, record, { exactGeneration: record === selected ? retained?.sourceGeneration : undefined });
     if (record === selected && retained) {
       const source = evidence.find(item => item.generation === retained.sourceGeneration);
       if (source?.state !== "failed" || source.endedBy !== "session_update"
@@ -102,8 +102,9 @@ export async function selectNativeLineage(context: NativeLineageSelectionContext
   if (Buffer.byteLength(lineageReconciliationContext(audit)) > MAX_LINEAGE_CONTEXT_BYTES
       || Buffer.byteLength(JSON.stringify(audit)) > 16 * 1024 * 1024) refuse("reconciliation_context_too_large");
   for (const proof of proofs) {
-    if (!sameToolInput(await inspect(context, proof.record, false,
-      proof === chosen ? retained?.sourceGeneration : undefined), proof.evidence)
+    if (!sameToolInput(await inspect(context, proof.record, {
+      exactGeneration: proof === chosen ? retained?.sourceGeneration : undefined,
+    }), proof.evidence)
         || !sameToolInput(context.lineageCheckpoint(proof.record), proof.checkpoint)) refuse("proof_changed");
   }
   for (const proof of historical) {
@@ -111,7 +112,7 @@ export async function selectNativeLineage(context: NativeLineageSelectionContext
     if (!sameToolInput(await inspect(context, proof.record), proof.evidence) || checkpoint.checkpointSha256 !== proof.checkpointSha256
         || lineageDigest(checkpoint.outcomes) !== proof.outcomesSha256) refuse("proof_changed");
   }
-  for (const proof of inactive) if (!sameToolInput(await inspect(context, proof.record, true), proof.evidence)) refuse("proof_changed");
+  for (const proof of inactive) if (!sameToolInput(await inspect(context, proof.record, { checkpointOptional: true }), proof.evidence)) refuse("proof_changed");
   const repeated = priorSelection(context, request, requestSha256);
   if (repeated) return repeated;
   eligible(context, request);
@@ -176,7 +177,7 @@ export async function verifySelectedLineage(context: NativeLineageSelectionConte
         || context.lineageCheckpoint(source.record).checkpointSha256 !== source.checkpointSha256) refuse("source_proof_changed");
   }
   for (const proof of owner.nativeLineageSelection?.inactive ?? []) {
-    if (!sameToolInput(await inspect(context, proof.record, true), proof.evidence)) refuse("source_proof_changed");
+    if (!sameToolInput(await inspect(context, proof.record, { checkpointOptional: true }), proof.evidence)) refuse("source_proof_changed");
   }
   if (owner.pendingLineageReconciliation) {
     const selection = owner.nativeLineageSelection!;
@@ -184,18 +185,51 @@ export async function verifySelectedLineage(context: NativeLineageSelectionConte
     const checkpoint = context.lineageCheckpoint(owner);
     const retained = owner.retainedCheckpoint;
     if (!selection.sources.length) {
-      if (!retained || !sameToolInput(retained, selection.selected.record.retainedCheckpoint)
-          || !sameToolInput(checkpoint, proof)) refuse("selected_checkpoint_changed");
-      if (!sameToolInput(await inspect(context, owner, false, retained.sourceGeneration), selection.selected.evidence)) {
-        refuse("selected_checkpoint_lease_changed");
-      }
-    }
-    if (retained) {
+      await verifyHistoricalSelectedCheckpoint(context, owner, selection, checkpoint);
+      if (!sameToolInput(context.lineageCheckpoint(owner), checkpoint)) refuse("selected_checkpoint_changed");
+    } else if (retained) {
       if (retained.sdkSessionId !== owner.sdkSessionId || retained.account !== owner.claudeAccount
           || retained.checkpointSha256 !== checkpoint.checkpointSha256) refuse("selected_checkpoint_changed");
     } else if (!sameToolInput(checkpoint, proof)) refuse("selected_checkpoint_changed");
   }
   if (JSON.stringify(scopeInventory(context.store.list(), owner)) !== observed) refuse("scope_changed");
+}
+
+async function verifyHistoricalSelectedCheckpoint(context: NativeLineageSelectionContext, owner: SessionRecord,
+  selection: NativeLineageSelection, checkpoint: NativeLineageCheckpoint): Promise<void> {
+  const original = selection.selected;
+  const initial = original.record.retainedCheckpoint;
+  const retained = owner.retainedCheckpoint;
+  if (!initial || !retained || owner.retryableRequestKind !== "native-upstream" || owner.checkpointRetryBlocked
+      || retained.sdkSessionId !== owner.sdkSessionId || retained.account !== owner.claudeAccount
+      || retained.checkpointSha256 !== checkpoint.checkpointSha256) refuse("selected_checkpoint_changed");
+  if (sameToolInput(retained, initial)) {
+    if (!sameToolInput(checkpoint, original.checkpoint)) refuse("selected_checkpoint_changed");
+    if (!sameToolInput(await inspect(context, owner, { exactGeneration: initial.sourceGeneration }), original.evidence)) {
+      refuse("selected_checkpoint_lease_changed");
+    }
+    return;
+  }
+
+  // The clean-upstream retirement path can advance this same SDK while the
+  // historical reconciliation is pending. Its old proof remains immutable.
+  const generation = retained.sourceGeneration;
+  const originalGeneration = original.record.nativeGeneration!;
+  if (retained.origin !== "clean-upstream" || !HASH.test(owner.retryableRequestHash ?? "")
+      || owner.state !== "IDLE" || owner.pendingToolIds.length || owner.endedToolIds?.length
+      || owner.hostCompletionReceipts?.length || owner.pendingHostRecovery
+      || !Number.isSafeInteger(generation) || generation <= originalGeneration || generation >= owner.nativeGeneration!
+      || !Number.isFinite(Date.parse(retained.preparedAt))
+      || !sameToolInput(retained.settledToolIds ?? [], initial.settledToolIds ?? [])
+      || !sameToolInput(retained.settledToolResults ?? [], initial.settledToolResults ?? [])
+      || !sameToolInput(checkpoint.outcomes, original.checkpoint.outcomes)
+      || !sameToolInput(checkpoint.settledToolResults, original.checkpoint.settledToolResults)) refuse("selected_checkpoint_changed");
+  const evidence = await inspect(context, owner, { exactGeneration: generation, allowSettledOwnerAfter: originalGeneration });
+  const retries = evidence.filter(item => item.generation > originalGeneration);
+  if (!sameToolInput(evidence.filter(item => item.generation <= originalGeneration), original.evidence)
+      || retries.some(item => !item.checkpointMatches || item.state !== "failed" || item.endedBy !== "session_update"
+        || Date.parse(item.endedAt!) < Date.parse(selection.at)
+        || Date.parse(item.endedAt!) > Date.parse(retained.preparedAt))) refuse("selected_checkpoint_lease_changed");
 }
 
 function scopeInventory(records: SessionRecord[], owner: SessionRecord) {
@@ -273,8 +307,9 @@ function eligible(context: NativeLineageSelectionContext, request: SelectionRequ
   }
   return owner;
 }
-async function inspect(context: NativeLineageSelectionContext, record: SessionRecord, checkpointOptional = false,
-  exactGeneration?: number): Promise<NativeGenerationEvidence[]> {
+async function inspect(context: NativeLineageSelectionContext, record: SessionRecord,
+  { checkpointOptional = false, exactGeneration, allowSettledOwnerAfter = Infinity }:
+  { checkpointOptional?: boolean; exactGeneration?: number; allowSettledOwnerAfter?: number } = {}): Promise<NativeGenerationEvidence[]> {
   const generation = exactGeneration ?? record.nativeGeneration!;
   const evidence = await context.inspect({ factorySessionId: record.factorySessionId!, bridgeSessionId: `${record.bridgeSessionId}:g${generation}`,
     cwd: record.factoryCwd!, subscriptionProfile: record.claudeAccount as SubscriptionProfile, useRecordedWorkspacePolicy: true, sdkSessionId: record.sdkSessionId! });
@@ -283,7 +318,8 @@ async function inspect(context: NativeLineageSelectionContext, record: SessionRe
       || evidence.some(item => !item.bindingMatches || !Number.isSafeInteger(item.generation) || item.generation > generation || item.generation < 0)
       || latest.length !== 1 || !checkpointOptional && !latest[0]!.checkpointMatches || latest[0]!.generation < (exactGeneration ?? generation - 1)
       || evidence.some(item => !TERMINAL.includes(item.state) || !item.cleanupVerified || item.externalCleanupRequired
-        || item.hostActionReservation || item.ownerAlive || item.supervisorAlive || !Number.isFinite(Date.parse(item.endedAt ?? "")))) refuse("lease_unsettled");
+        || item.hostActionReservation || item.ownerAlive && item.generation <= allowSettledOwnerAfter
+        || item.supervisorAlive || !Number.isFinite(Date.parse(item.endedAt ?? "")))) refuse("lease_unsettled");
   if (recoverySessionActive(context, record.bridgeSessionId)) refuse("record_identity_or_activity_changed");
   return evidence.sort((a, b) => a.generation - b.generation);
 }

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -353,8 +353,8 @@ describe("healthy native continuity after compaction", () => {
   });
 });
 
-async function historicalSelectionFixture() {
-  const f = await fixture([], true, true);
+async function historicalSelectionFixture(failures: number[] = []) {
+  const f = await fixture(failures, true, true);
   const proof = { ...f.record.retainedCheckpoint!, sourceGeneration: 0, preparedAt: "2026-11-10T13:01:00Z" };
   f.app.store.update(f.record.bridgeSessionId, { nativeGeneration: 4, createdAt: "2026-11-10T12:00:00Z", retainedCheckpoint: proof,
     upstreamCheckpointRecoveries: [{ operationId: "restore-earlier-checkpoint", at: proof.preparedAt, recordUpdatedAt: "2026-11-10T13:00:00Z",
@@ -385,14 +385,22 @@ async function historicalSelectionFixture() {
     selectedSdkSessionId: f.sdkId, sourceBridgeSessionIds: [] };
   const send = async (data: unknown) => fetch(`${f.app.url}/internal/select-native-lineage`, { method: "POST",
     headers: { authorization: "Bearer admin", "content-type": "application/json" }, body: JSON.stringify(data) });
-  const vendor = vendorRequest(f);
-  vendor.messages.push({ role: "user", content: `[factory-cc-session:${f.token}] Confirm the restored checkpoint` });
-  const request: MessagesRequest = { ...vendor, messages: [
-    ...Array.from({ length: 18 }, (): Message => ({ role: "user", content: `[factory-cc-session:${f.token}]` })),
-    ...Array.from({ length: 700 - vendor.messages.length }, (_, index): Message => ({
+  const earlierBoundaries = Array.from({ length: 3 }, (_, index): Message[] => [
+    { role: "assistant", content: [{ type: "tool_use", id: `old-factory-${index}`, name: "Script", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: `old-factory-${index}`, content: "Earlier Factory result" }] },
+    { role: "user", content: "Earlier visible turn" },
+  ]).flat();
+  const tail = [...f.request.messages,
+    { role: "user", content: [{ type: "text", text: "internal context" }], visibility: "llm_only" } as const,
+    { role: "user", content: `[factory-cc-session:${f.token}] Continue` } as const,
+    { role: "user", content: `[factory-cc-session:${f.token}] Confirm the restored checkpoint` } as const];
+  const factoryHistory = [
+    ...Array.from({ length: 22 }, (): Message => ({ role: "user", content: `[factory-cc-session:${f.token}]` })),
+    ...Array.from({ length: 718 - 22 - earlierBoundaries.length - tail.length }, (_, index): Message => ({
       role: index % 2 ? "assistant" : "user", content: `Older transcript message ${index}`,
-    })), ...vendor.messages,
-  ] };
+    })), ...earlierBoundaries, ...tail,
+  ];
+  const request: MessagesRequest = { ...f.request, messages: factoryTurnBoundaries(factoryHistory as Array<Message & { visibility?: string }>) };
   const preview = async () => {
     const response = await send({ ...body, dryRun: true });
     expect(response.status).toBe(200);
@@ -405,13 +413,14 @@ async function historicalSelectionFixture() {
         ...item, approvalReference: `test-only-historical-${index}`, approvedAt: proof.preparedAt,
       })) };
   };
-  return { ...f, histories, request, leases, proof, body, approval, send, preview, approved };
+  return { ...f, histories, request, factoryMessageCount: factoryHistory.length, leases, proof, body, approval, send, preview, approved };
 }
 
 describe("explicit historical-only selection for a restored native checkpoint", () => {
   it("holds the 718-message Factory shape until both archives are approved, then continues twice on the same SDK", async () => {
     const f = await historicalSelectionFixture();
-    expect(f.request.messages).toHaveLength(718);
+    expect(f.factoryMessageCount).toBe(718);
+    expect(f.request.messages).toHaveLength(722);
     expect((await postMessages(f.app.url, "client", f.request, f.headers)).json.error).toMatchObject({ type: "native_checkpoint_selection_required" });
     expect(f.sdk.inputs).toHaveLength(0);
     const request = await f.approved();
@@ -468,6 +477,88 @@ describe("explicit historical-only selection for a restored native checkpoint", 
     expect((await postMessages(f.app.url, "client", request, f.headers)).status).toBe(kind === "unbound" ? 400 : 409);
     expect(f.record.pendingLineageReconciliation).toBeDefined();
     expect(f.sdk.options).toHaveLength(0);
+  });
+
+  it("rechecks the retained tail and exact request after a pre-prompt 503", async () => {
+    const f = await historicalSelectionFixture();
+    expect((await f.send(await f.approved())).status).toBe(200);
+    vi.spyOn(f.runtime, "handle").mockRejectedValueOnce(new BridgeError(503, "desktop_job_timeout", "deferred",
+      { retry_safe: true, phase: "admission" }));
+    expect((await postMessages(f.app.url, "client", f.request, f.headers)).status).toBe(503);
+    expect(f.record.retainedCheckpoint).toEqual(f.proof);
+    expect(f.record.pendingLineageReconciliation).toBeDefined();
+    expect(f.sdk.inputs).toHaveLength(0);
+    const changed = structuredClone(f.request);
+    changed.messages.at(-1)!.content = `[factory-cc-session:${f.token}] Different retry request`;
+    expect((await postMessages(f.app.url, "client", changed, f.headers)).json.error).toMatchObject({ type: "native_lineage_retained_tail_required" });
+    expect(f.sdk.inputs).toHaveLength(0);
+    expect((await postMessages(f.app.url, "client", f.request, f.headers)).status).toBe(200);
+    expect(f.sdk.options.map(option => option.resume)).toEqual([f.sdkId]);
+    expect(f.record.pendingLineageReconciliation).toBeUndefined();
+    expect(f.sdk.toolInvocations).toBe(0);
+  });
+
+  it.each([429, 529])("retries historical reconciliation after %s using a newer clean lease on the same SDK", async status => {
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(new Date("2026-11-10T14:00:00Z"));
+    const f = await historicalSelectionFixture([status]);
+    expect((await f.send(await f.approved())).status).toBe(200);
+    const originalAudit = structuredClone(f.record.nativeLineageSelection);
+    f.checkpointRetry.mockImplementationOnce(async (sessionId, sdkSessionId) => {
+      appendFileSync(f.file, JSON.stringify({ type: "cost-state", sessionId: sdkSessionId, totalDuration: 10 }) + "\n");
+      await SdkRuntime.prototype.prepareCheckpointRetry.call(f.runtime, sessionId, sdkSessionId);
+    });
+    f.sdk.attemptTools = true;
+    const failed = await postMessages(f.app.url, "client", f.request, f.headers);
+    expect(failed.status, JSON.stringify(failed.json)).toBe(status);
+    expect(f.record).toMatchObject({ state: "IDLE", nativeGeneration: 6, sdkSessionId: f.sdkId, retryableRequestKind: "native-upstream",
+      retainedCheckpoint: { origin: "clean-upstream", sourceGeneration: 5, settledToolResults: f.proof.settledToolResults } });
+    expect(f.record.retainedCheckpoint!.checkpointSha256).not.toBe(f.proof.checkpointSha256);
+    expect(f.record.nativeLineageSelection).toEqual(originalAudit);
+    expect(f.record.pendingLineageReconciliation).toBeDefined();
+    const inspect = f.leases.getMockImplementation()!;
+    f.leases.mockImplementation(async request => {
+      const evidence = await inspect(request);
+      if (request.sdkSessionId !== f.sdkId || !request.bridgeSessionId.endsWith(":g5")) return evidence;
+      const initial = await inspect({ ...request, bridgeSessionId: `${f.record.bridgeSessionId}:g0` });
+      return [...initial, ...evidence.map(row => ({ ...row, ownerAlive: true, endedAt: "2026-11-10T14:00:00Z" }))];
+    });
+    if (status === 429) {
+      expect((await postMessages(f.app.url, "client", f.request, f.headers)).status).toBe(429);
+      expect(f.sdk.inputs).toHaveLength(1);
+      vi.setSystemTime(new Date("2026-11-10T14:02:00Z"));
+    }
+    const changed = structuredClone(f.request);
+    changed.messages.at(-1)!.content = `[factory-cc-session:${f.token}] Different retry request`;
+    expect((await postMessages(f.app.url, "client", changed, f.headers)).json.error).toMatchObject({ type: "native_lineage_retained_tail_required" });
+    expect(f.sdk.inputs).toHaveLength(1);
+    const resumed = await postMessages(f.app.url, "client", f.request, f.headers);
+    expect(resumed.status, JSON.stringify(resumed.json)).toBe(200);
+    expect(f.sdk.options.map(option => option.resume)).toEqual([f.sdkId, f.sdkId]);
+    expect(f.sdk.inputs.every(input => !input.message.content.some(block => block.type === "tool_result"))).toBe(true);
+    expect(f.sdk.denials).toHaveLength(4);
+    expect(f.sdk.denials.every(result => (result as { behavior: string }).behavior === "deny")).toBe(true);
+    expect(f.record.pendingLineageReconciliation).toBeUndefined();
+    expect(f.record.nativeLineageSelection?.reconciledAt).toBeDefined();
+  });
+
+  it("refuses an idempotent selection when the retained file changes during lease inspection", async () => {
+    const f = await historicalSelectionFixture();
+    const input = await f.approved();
+    expect((await f.send(input)).status).toBe(200);
+    const inspect = f.leases.getMockImplementation()!;
+    let changed = false;
+    f.leases.mockImplementation(async request => {
+      const result = await inspect(request);
+      if (!changed && request.sdkSessionId === f.sdkId) {
+        changed = true;
+        appendFileSync(f.file, JSON.stringify({ type: "cost-state", sessionId: f.sdkId, totalDuration: 10 }) + "\n");
+      }
+      return result;
+    });
+    const repeated = await f.send(input);
+    expect(repeated.status).toBe(409);
+    expect(await repeated.json()).toMatchObject({ error: { reason: "selected_checkpoint_changed" } });
+    expect(f.record.pendingLineageReconciliation).toBeDefined();
   });
 
   it("refuses a sibling introduced during the first historical lease check", async () => {
