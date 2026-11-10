@@ -8,7 +8,7 @@ import type { ContentBlock, Message, MessagesRequest, RoleTag } from "../types.j
 import { BridgeError } from "../types.js";
 import { providerFromModelId, type ModelProvider } from "../models.js";
 import { droidReasoningLevel, requestAtReasoningLevel, requestWithoutReasoningLevel } from "../runtime/reasoning.js";
-import { isEnded, type SessionRecord } from "./state.js";
+import { isEnded, nativePurpose, type SessionRecord } from "./state.js";
 import { canonicalWorkspacePath, resolveRequestCwd } from "../workspace.js";
 
 type Headers = Record<string, string | string[] | undefined>;
@@ -142,7 +142,7 @@ export function resolveSession(
     && session.factorySessionId === options.hostSessionId && session.factoryCwd !== undefined
     && canonicalWorkspacePath(session.factoryCwd) === workspace
     && session.role === roleFromHeaders(headers)
-    && session.toolNames.length > 0 && Boolean(request.tools?.length);
+    && nativePurpose(session) === "interactive" && Boolean(request.tools?.length);
   const canChangeHostThinking = (session: SessionRecord): boolean => switchingModel(session) && sameExecutionScope(session);
   // Same-model selector changes are a different field from an arbitrary thinking
   // blob. The previous level's hash must still match, so model, role, directory
@@ -158,7 +158,7 @@ export function resolveSession(
   const canChangeReasoningLevel = (session: SessionRecord): boolean => {
     if (switchingModel(session) || session.model !== request.model || !session.contextHash || !hostAgrees(session)) return false;
     if (sessionProvider(session) !== requestProvider || session.role !== roleFromHeaders(headers)) return false;
-    if (session.toolNames.length === 0 || !request.tools?.length) return false;
+    if (nativePurpose(session) !== "interactive" || !request.tools?.length) return false;
     const current = droidReasoningLevel(request);
     if ((session.reasoning ?? undefined) === current) return false;
     const previous = session.reasoning
@@ -191,7 +191,7 @@ export function resolveSession(
       && !asBlocks(tailMessages[2].content).some((block) => block.type === "tool_result")
       && session.factorySessionId === options.hostSessionId && session.factoryCwd !== undefined
       && canonicalWorkspacePath(session.factoryCwd) === workspace
-      && session.sdkSessionId && session.toolNames.length > 0
+      && session.sdkSessionId && nativePurpose(session) === "interactive"
       && completed !== undefined && completed.length >= 2
       && session.requestMessageHashes?.at(-1) === completed.at(-2)
       && completed.at(-2) === tail[0] && completed.at(-1) === tail[1]);

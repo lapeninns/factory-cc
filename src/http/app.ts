@@ -10,9 +10,9 @@ import type { BridgeConfig } from "../config.js";
 import { appendLogLine, type Logger } from "../logging.js";
 import { parseMessagesRequest } from "../protocol/validate.js";
 import { apiError } from "../protocol/messages.js";
-import { explicitSessionId, historyMessageHashes, historyPrefixHash, resolveSession, roleFromHeaders, sessionContextHash } from "../sessions/correlate.js";
+import { explicitSessionId, historyMessageHashes, historyPrefixHash, resolveSession, roleFromHeaders, sessionContextHash, sessionProvider } from "../sessions/correlate.js";
 import { droidReasoningLevel } from "../runtime/reasoning.js";
-import { isEnded, type SessionRecord } from "../sessions/state.js";
+import { isEnded, nativePurpose, type SessionRecord } from "../sessions/state.js";
 import { droidEndedTools } from "../sessions/droid-turn-outcomes.js";
 import { HUMAN_WAIT_TOOLS, MISSION_SPAWN_TOOLS, MISSION_WORKER_END_TOOL } from "../runtime/mission-tools.js";
 import { compactedSummaryText, lastSummarizedToolCall, sameToolInput, summaryQuote } from "../sessions/compaction.js";
@@ -612,7 +612,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     const requestFingerprint = createHash("sha256").update(JSON.stringify({ request, role, cwd, provider, contextHash, host: control.hostSessionId(prepared.binding) ?? null })).digest("hex");
     const explicit = explicitSessionId(headers, request);
     if (config.controllerPool && factorySession && store.list().some(session => session.factorySessionId === factorySession.sessionId
-        && session.checkpointRetryBlocked && session.sdkSessionId)) {
+        && nativePurpose(session) !== "auxiliary" && session.checkpointRetryBlocked && session.sdkSessionId)) {
       throw new BridgeError(409, "native_checkpoint_retry_unavailable", "This Workstream retains a native checkpoint whose retry proof needs operator recovery. A cold import was refused.");
     }
     let routingRecords = store.list();
@@ -626,6 +626,10 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       if (!context) throw new BridgeError(409, "native_recovery_unavailable", "Native lineage proof validation is unavailable.");
       await verifySelectedLineage(context, selectedOwner);
       routingRecords = routingRecords.filter(record => !excluded.has(record.bridgeSessionId));
+    }
+    if (selectedOwner?.pendingLineageReconciliation && (selectedOwner.contextHash !== contextHash
+        || selectedOwner.model !== request.model || sessionProvider(selectedOwner) !== provider)) {
+      throw new BridgeError(409, "lineage_reconciliation_context_changed", "Finish lineage reconciliation with the selected execution settings before changing models or reasoning.");
     }
     const selectedReconciliation = selectedOwner?.pendingLineageReconciliation && (!explicit || explicit === selectedOwner.bridgeSessionId)
       && selectedOwner.contextHash === contextHash && selectedOwner.state === "IDLE" && !selectedOwner.cancelRequested;
@@ -642,7 +646,8 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     if (config.controllerPool && factorySession) {
       const retainedLineages = routingRecords.filter(session => session.factorySessionId === factorySession.sessionId
         && session.factoryCwd === factorySession.cwd
-        && (hostAllowsAnyTools(request) && session.sdkSessionId && (!isEnded(session) || session.hostCompletionReceipts?.length)
+        && nativePurpose(session) !== "auxiliary"
+        && (hostAllowsAnyTools(request) && session.sdkSessionId
           || session.retainedCheckpoint || session.retryableRequestKind === "native-upstream"
           || session.retryableRequestKind === "upstream" && !session.sdkSessionId && session.historyMessageHashes?.length));
       if (retainedLineages.some(session => session.bridgeSessionId !== resolved.match?.bridgeSessionId)) {
@@ -686,6 +691,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     const session = resolved.match
       ?? withSlot(() => store.create({
         role,
+        nativePurpose: hostAllowsAnyTools(request) ? "interactive" : "auxiliary",
         model: request.model,
         ...(claudeAccount ? { claudeAccount } : {}),
         ...(config.controllerPool ? { nativeGeneration: 0 } : {}),
@@ -825,6 +831,9 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         hostEnded: undefined,
         retryableRequestHash: undefined,
         retryableRequestKind: retainedCheckpointVerified ? "native-upstream" : undefined,
+        ...(hostAllowsAnyTools(request) ? { nativePurpose: "interactive" as const } : {}),
+        ...(session.nativeLineageSelection && !session.pendingLineageReconciliation
+          ? { nativeLineageContext: { model: request.model, contextHash, reasoning: droidReasoningLevel(request) } } : {}),
         role,
         model: request.model,
         ...(provider === "cursor" ? { provider } : {}),

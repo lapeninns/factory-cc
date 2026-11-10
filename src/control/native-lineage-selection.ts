@@ -4,7 +4,7 @@ import { BridgeError, type Json } from "../types.js";
 import type { NativeGenerationEvidence, SubscriptionProfile } from "../runtime/desktop-jobs.js";
 import { lineageReconciliationContext, MAX_LINEAGE_CONTEXT_BYTES } from "../runtime/host-recovery.js";
 import { sameToolInput } from "../sessions/compaction.js";
-import { isEnded, type LineageCancellation, type NativeLineageHistoricalDisposition, type NativeLineageBranchProof, type NativeLineageCheckpoint, type NativeLineageSelection, type SessionRecord } from "../sessions/state.js";
+import { isEnded, nativePurpose, type LineageCancellation, type NativeLineageHistoricalDisposition, type NativeLineageBranchProof, type NativeLineageCheckpoint, type NativeLineageSelection, type SessionRecord } from "../sessions/state.js";
 import { recoverySessionActive, type NativeCheckpointRecoveryContext } from "./native-recovery.js";
 
 interface Identity { bridgeSessionId: string; sdkSessionId: string; account: string; nativeGeneration: number; expectedUpdatedAt: string }
@@ -107,6 +107,8 @@ export async function selectNativeLineage(context: NativeLineageSelectionContext
     historicalBridgeSessionIds: historical.map(source => source.record.bridgeSessionId), scopeInventory: inventory };
   context.store.updateAtomic(selected.bridgeSessionId, { nativeLineageSelection: audit,
     pendingLineageReconciliation: request.operationId,
+    nativePurpose: "interactive",
+    nativeLineageContext: { model: selected.model, contextHash: selected.contextHash, reasoning: selected.reasoning },
     nativeGeneration: selected.nativeGeneration! + 1,
     notes: [...selected.notes, `native-lineage-selected:${request.operationId}`].slice(-128) });
   return { ok: true, selected: true, operationId: request.operationId, bridgeSessionId: selected.bridgeSessionId };
@@ -125,9 +127,12 @@ export function selectedLineageSources(records: SessionRecord[], owner: SessionR
   const audit = owner.nativeLineageSelection;
   if (!audit) return new Set();
   const original = audit.selected.record;
+  const currentContext = owner.pendingLineageReconciliation ? original : owner.nativeLineageContext ?? original;
   if (owner.sdkSessionId !== original.sdkSessionId || owner.claudeAccount !== original.claudeAccount
       || owner.factorySessionId !== original.factorySessionId || owner.factoryCwd !== original.factoryCwd
-      || owner.contextHash !== original.contextHash || owner.model !== original.model || owner.role !== original.role
+      || owner.contextHash !== currentContext.contextHash || owner.model !== currentContext.model
+      || owner.reasoning !== currentContext.reasoning || owner.role !== original.role || owner.provider !== original.provider
+      || nativePurpose(owner) === "auxiliary"
       || !Number.isSafeInteger(owner.nativeGeneration) || owner.nativeGeneration! > 1_000_000
       || owner.nativeGeneration! <= original.nativeGeneration! || owner.cancelRequested || isEnded(owner)) refuse("selected_owner_changed");
   const inventory = scopeInventory(records, owner);
@@ -142,7 +147,7 @@ export function selectedLineageSources(records: SessionRecord[], owner: SessionR
 }
 
 export async function verifySelectedLineage(context: NativeLineageSelectionContext, owner: SessionRecord): Promise<void> {
-  const observed = JSON.stringify(context.store.list());
+  const observed = JSON.stringify(scopeInventory(context.store.list(), owner));
   selectedLineageSources(context.store.list(), owner);
   for (const source of owner.nativeLineageSelection?.sources ?? []) {
     if (!sameToolInput(context.lineageCheckpoint(source.record), source.checkpoint)
@@ -167,11 +172,11 @@ export async function verifySelectedLineage(context: NativeLineageSelectionConte
           || retained.checkpointSha256 !== checkpoint.checkpointSha256) refuse("selected_checkpoint_changed");
     } else if (!sameToolInput(checkpoint, proof)) refuse("selected_checkpoint_changed");
   }
-  if (JSON.stringify(context.store.list()) !== observed) refuse("scope_changed");
+  if (JSON.stringify(scopeInventory(context.store.list(), owner)) !== observed) refuse("scope_changed");
 }
 
 function scopeInventory(records: SessionRecord[], owner: SessionRecord) {
-  return records.filter(record => record.factorySessionId === owner.factorySessionId && record.factoryCwd === owner.factoryCwd && record.toolNames.length > 0)
+  return records.filter(record => record.factorySessionId === owner.factorySessionId && record.factoryCwd === owner.factoryCwd && nativePurpose(record) !== "auxiliary")
     .map(record => ({ bridgeSessionId: record.bridgeSessionId, sha256: lineageDigest(record) }))
     .sort((a, b) => a.bridgeSessionId.localeCompare(b.bridgeSessionId));
 }
@@ -181,7 +186,7 @@ function isHistorical(record: SessionRecord, owner: SessionRecord): boolean {
 }
 function selectionScope(records: SessionRecord[], owner: SessionRecord): SessionRecord[] {
   return records.filter(record => record.factorySessionId === owner.factorySessionId && record.factoryCwd === owner.factoryCwd
-    && record.sdkSessionId && record.toolNames.length > 0).sort((a, b) => a.bridgeSessionId.localeCompare(b.bridgeSessionId));
+    && record.sdkSessionId && nativePurpose(record) !== "auxiliary").sort((a, b) => a.bridgeSessionId.localeCompare(b.bridgeSessionId));
 }
 function eligible(context: NativeLineageSelectionContext, request: SelectionRequest): SessionRecord {
   const owner = context.store.require(request.selected.bridgeSessionId);
@@ -189,8 +194,9 @@ function eligible(context: NativeLineageSelectionContext, request: SelectionRequ
       || owner.state !== "IDLE" || owner.cancelRequested || owner.cancellation
       || owner.hostEnded && owner.hostEnded !== "resumable" || owner.pendingToolIds.length || owner.endedToolIds?.length
       || owner.hostCompletionReceipts?.length || owner.pendingHostRecovery || owner.pendingLineageReconciliation
-      || owner.nativeLineageSelection || owner.checkpointRetryBlocked || !owner.historyMessageHashes?.length) refuse("selected_owner_unavailable");
-  const all = context.store.list().filter(record => record.factorySessionId === owner.factorySessionId && record.factoryCwd === owner.factoryCwd);
+      || owner.nativeLineageSelection || owner.checkpointRetryBlocked || !owner.historyMessageHashes?.length
+      || nativePurpose(owner) === "auxiliary") refuse("selected_owner_unavailable");
+  const all = context.store.list().filter(record => record.factorySessionId === owner.factorySessionId && record.factoryCwd === owner.factoryCwd && nativePurpose(record) !== "auxiliary");
   if (all.some(record => !record.sdkSessionId && (!isEnded(record) || record.historyMessageHashes?.length || record.pendingToolIds.length || record.endedToolIds?.length
       || record.hostCompletionReceipts?.length || recoverySessionActive(context, record.bridgeSessionId)))) refuse("unresolved_scope_record");
   const nativeScope = selectionScope(context.store.list(), owner);

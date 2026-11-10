@@ -269,6 +269,37 @@ describe("healthy native continuity after compaction", () => {
     expect(f.sdk.options.map(option => option.resume)).toEqual([f.sdkId, f.sdkId]);
     expect(f.app.store.list()).toHaveLength(1);
   });
+  it.each(["FAILED", "CANCELLED"] as const)("keeps a terminal %s legacy SDK with an empty catalog from cold-forking", async state => {
+    const f = await fixture(); const request = healthyRequest(f);
+    f.app.store.update(f.record.bridgeSessionId, { state, toolNames: [], retainedCheckpoint: undefined, retryableRequestKind: undefined });
+    request.messages = [{ role: "user", content: `[factory-cc-session:${f.token}] Different compacted history` }];
+    const before = structuredClone(f.record);
+    expect((await postMessages(f.app.url, "client", request, f.headers)).status).toBe(409);
+    expect(f.app.store.list()).toHaveLength(1); expect(f.record).toEqual(before); expect(f.sdk.options).toHaveLength(0);
+  });
+
+  it("does not let a genuine auxiliary native record block the interactive owner", async () => {
+    const f = await fixture(), request = healthyRequest(f);
+    const auxiliary = f.app.store.create({ role: "orchestrator", model: "opus", nativePurpose: "auxiliary", toolNames: ["Script"] });
+    f.app.store.update(auxiliary.bridgeSessionId, { state: "IDLE", sdkSessionId: randomUUID(), factorySessionId: FACTORY_SESSION,
+      factoryCwd: f.record.factoryCwd, historyMessageHashes: ["aux-user", "aux-response"], contextHash: "aux-context" });
+    const response = await postMessages(f.app.url, "client", request, f.headers);
+    expect(response.status).toBe(200); expect(response.session).toBe(f.record.bridgeSessionId);
+    expect(f.sdk.options[0]?.resume).toBe(f.sdkId);
+    expect(f.record.nativePurpose).toBe("interactive"); expect(auxiliary.nativePurpose).toBe("auxiliary");
+  });
+
+  it("records a fresh tools-none request as auxiliary even when a tool catalog is supplied", async () => {
+    const f = await fixture(); healthyRequest(f);
+    const response = await postMessages(f.app.url, "client", { ...f.request, tool_choice: { type: "none" },
+      messages: [{ role: "user", content: `[factory-cc-session:${f.token}] Auxiliary summary` }] }, f.headers);
+    expect(response.status).toBe(200);
+    expect(f.app.store.require(response.session!).nativePurpose).toBe("auxiliary");
+    const request = healthyRequest(f);
+    const continuation = await postMessages(f.app.url, "client", request, f.headers);
+    expect(continuation.status).toBe(200); expect(continuation.session).toBe(f.record.bridgeSessionId);
+  });
+
   it.each(["missing-anchor", "assistant-work", "unproven-result"])("refuses healthy %s before allocating a cold branch", async kind => {
     const f = await fixture(), request = healthyRequest(f), before = structuredClone(f.record);
     if (kind === "missing-anchor") request.messages.splice(1, 2);
@@ -379,6 +410,55 @@ describe("selected native lineage HTTP to SDK reconciliation", () => {
     expect(f.record.hostEnded).toBe("resumable");
     expect(f.record.pendingLineageReconciliation).toBeDefined();
     expect(f.record.sdkSessionId).toBe(f.sdkId);
+  });
+
+  it("keeps an interactive owner through an explicit empty-tools turn and subsequent compaction", async () => {
+    const f = await selectionFixture(); f.config.desktopProfile = false;
+    const headers = { ...f.headers, "x-bridge-cwd": f.record.factoryCwd! };
+    const first = await postMessages(f.app.url, "client", f.request, headers);
+    expect(first.status).toBe(200);
+    const noTools: MessagesRequest = { ...f.request, tools: [], messages: [...f.request.messages,
+      { role: "assistant", content: first.json.content as ContentBlock[] },
+      { role: "user", content: `[factory-cc-session:${f.token}] Explain without tools` }] };
+    const second = await postMessages(f.app.url, "client", noTools, { ...headers, "x-bridge-session": f.record.bridgeSessionId });
+    expect(second.status, JSON.stringify(second.json)).toBe(200);
+    expect(f.record.toolNames).toEqual([]); expect(f.record.nativePurpose).toBe("interactive");
+    const next: MessagesRequest = { ...f.request, messages: [{ role: "user", content: `[factory-cc-session:${f.token}] Rewritten summary` },
+      noTools.messages.at(-1)!, { role: "assistant", content: second.json.content as ContentBlock[] },
+      { role: "user", content: "Context" }, { role: "user", content: "Continue normally" }] };
+    const third = await postMessages(f.app.url, "client", next, headers);
+    expect(third.status, JSON.stringify(third.json)).toBe(200); expect(third.session).toBe(f.record.bridgeSessionId);
+    expect(f.sdk.inputs).toHaveLength(3); expect(f.record.sdkSessionId).toBe(f.sdkId);
+  });
+
+  it.each(["model", "reasoning"])("preserves a legitimate %s change and the following selected-owner request", async change => {
+    const f = await selectionFixture();
+    f.config.models!.push({ id: "other", model: "claude-sonnet-4-6", displayName: "Other" });
+    const first = await postMessages(f.app.url, "client", f.request, f.headers);
+    expect(first.status).toBe(200);
+    const originalAudit = structuredClone(f.record.nativeLineageSelection);
+    const switched: MessagesRequest = { ...f.request, ...(change === "model" ? { model: "other" } : { output_config: { effort: "high" } }),
+      messages: [...f.request.messages, { role: "assistant", content: first.json.content as ContentBlock[] },
+        { role: "user", content: `[factory-cc-session:${f.token}] Change the ${change}` }] };
+    const second = await postMessages(f.app.url, "client", switched, f.headers);
+    expect(second.status, JSON.stringify(second.json)).toBe(200); expect(second.session).toBe(f.record.bridgeSessionId);
+    expect(f.record.nativeLineageSelection).toEqual(originalAudit);
+    const next: MessagesRequest = { ...switched, messages: [...switched.messages,
+      { role: "assistant", content: second.json.content as ContentBlock[] }, { role: "user", content: `[factory-cc-session:${f.token}] Continue` }] };
+    const third = await postMessages(f.app.url, "client", next, f.headers);
+    expect(third.status, JSON.stringify(third.json)).toBe(200); expect(third.session).toBe(f.record.bridgeSessionId);
+    expect(f.record.nativeLineageSelection).toEqual(originalAudit);
+    expect(f.sdk.options.every(option => option.resume === f.sdkId)).toBe(true);
+    expect(f.sdk.inputs).toHaveLength(3); expect(f.app.store.list()).toHaveLength(2);
+  });
+
+  it.each(["model", "reasoning"])("keeps pending reconciliation strict for a %s change", async change => {
+    const f = await selectionFixture();
+    f.config.models!.push({ id: "other", model: "claude-sonnet-4-6", displayName: "Other" });
+    const request = { ...f.request, ...(change === "model" ? { model: "other" } : { output_config: { effort: "high" } }) };
+    const response = await postMessages(f.app.url, "client", request, { ...f.headers, "x-bridge-session": f.record.bridgeSessionId });
+    expect(response.status).toBe(409); expect(f.sdk.inputs).toHaveLength(0);
+    expect(f.record.pendingLineageReconciliation).toBeDefined();
   });
 
   it("preserves reconciliation on pre-prompt deferral and refuses a terminal 502 retry", async () => {

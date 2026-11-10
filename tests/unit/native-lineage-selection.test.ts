@@ -162,6 +162,51 @@ describe("explicit native lineage selection", () => {
     expect(f.owner.nativeLineageSelection).toBeUndefined();
   });
 
+  it.each(["factory", "cwd"])("permits unrelated %s work during inspection but rejects a new matching branch", async kind => {
+    const f = fixture(); await apply(f);
+    const unrelated = f.store.create({ role: "orchestrator", model: "opus", toolNames: [] });
+    f.store.update(unrelated.bridgeSessionId, { state: "IDLE", factorySessionId: kind === "factory" ? "another-factory" : f.body.factorySessionId,
+      factoryCwd: kind === "cwd" ? "/another-workspace" : f.body.factoryCwd });
+    const inspect = f.context.inspect;
+    f.context.inspect = async request => { f.store.update(unrelated.bridgeSessionId, { notes: [randomUUID()] }); return inspect(request); };
+    await expect(verifySelectedLineage(f.context, f.owner)).resolves.toBeUndefined();
+    const branch = f.store.create({ role: "orchestrator", model: "opus", nativeGeneration: 0, claudeAccount: "team5", toolNames: [] });
+    f.store.update(branch.bridgeSessionId, { state: "FAILED", sdkSessionId: randomUUID(), factorySessionId: f.body.factorySessionId,
+      factoryCwd: f.body.factoryCwd, contextHash: f.owner.contextHash });
+    await expect(verifySelectedLineage(f.context, f.owner)).rejects.toMatchObject({ extra: { reason: "scope_changed" } });
+  });
+
+  it("rejects a source record changing during asynchronous proof verification", async () => {
+    const f = fixture(); await apply(f);
+    const inspect = f.context.inspect;
+    f.context.inspect = async request => { f.records[1]!.notes.push("concurrent source change"); return inspect(request); };
+    await expect(verifySelectedLineage(f.context, f.owner)).rejects.toMatchObject({ extra: { reason: "scope_changed" } });
+  });
+
+  it.each(["model", "reasoning", "provider", "account", "sdk", "factory", "cwd"])("refuses an unadmitted selected-owner %s change", async kind => {
+    const f = fixture(); await apply(f); f.owner.pendingLineageReconciliation = undefined;
+    if (kind === "model") f.owner.model = "unadmitted-model";
+    if (kind === "reasoning") f.owner.reasoning = "high";
+    if (kind === "provider") f.owner.provider = "cursor";
+    if (kind === "account") f.owner.claudeAccount = "team6";
+    if (kind === "sdk") f.owner.sdkSessionId = randomUUID();
+    if (kind === "factory") f.owner.factorySessionId = randomUUID();
+    if (kind === "cwd") f.owner.factoryCwd = "/different";
+    await expect(verifySelectedLineage(f.context, f.owner)).rejects.toThrow();
+  });
+
+  it("keeps empty-catalog legacy owners in the audited inventory and excludes proven auxiliaries", async () => {
+    const f = fixture(); f.records.forEach(record => { record.toolNames = []; });
+    const auxiliary = f.store.create({ role: "orchestrator", model: "opus", nativePurpose: "auxiliary", toolNames: ["Script"] });
+    f.store.update(auxiliary.bridgeSessionId, { state: "IDLE", sdkSessionId: randomUUID(), factorySessionId: f.body.factorySessionId,
+      factoryCwd: f.body.factoryCwd, contextHash: "different-aux-context" });
+    await apply(f);
+    expect(f.owner.nativeLineageSelection?.scopeInventory).toHaveLength(3);
+    expect(selectedLineageSources(f.store.list(), f.owner).has(auxiliary.bridgeSessionId)).toBe(false);
+    f.store.update(f.owner.bridgeSessionId, { toolNames: [] });
+    await expect(verifySelectedLineage(f.context, f.owner)).resolves.toBeUndefined();
+  });
+
   it("revalidates the owner audit when consuming sibling exceptions", async () => {
     const f = fixture(); await apply(f);
     expect(() => verifyRecoverySessionInactive(f.context, f.owner)).not.toThrow();

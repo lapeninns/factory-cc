@@ -9,6 +9,8 @@ export interface SessionRecord {
   factorySessionId?: string;
   factoryCwd?: string;
   sdkSessionId?: string;
+  /** Persisted purpose is independent of the latest mutable host tool catalog. */
+  nativePurpose?: "interactive" | "auxiliary";
   /** Exact accepted request that failed upstream after all host work settled. */
   retryableRequestHash?: string;
   /** Admission retries retain the native checkpoint instead of cold-importing it. */
@@ -24,6 +26,8 @@ export interface SessionRecord {
   lineageCancellation?: LineageCancellation;
   nativeLineageSelection?: NativeLineageSelection;
   pendingLineageReconciliation?: string;
+  /** Current execution settings admitted after the immutable baseline selection. */
+  nativeLineageContext?: { model: string; contextHash?: string; reasoning?: string };
   /** Authenticated host receipts retained until an admitted turn consumes them. */
   hostCompletionReceipts?: RuntimeHostCompletion[];
   /** Runtime that owns sdkSessionId. Absent on Claude sessions created before Cursor coexisted. */
@@ -222,4 +226,10 @@ export interface NativeLineageHistoricalDisposition {
   disposition: "archive-superseded";
   approvalReference: string;
   approvedAt: string;
+}
+
+/** Missing legacy provenance remains a possible interactive owner. */
+export function nativePurpose(record: Pick<SessionRecord, "nativePurpose" | "toolNames">): "interactive" | "auxiliary" | "unknown" {
+  if (record.nativePurpose === "interactive" || record.nativePurpose === "auxiliary") return record.nativePurpose;
+  return record.toolNames.length ? "interactive" : "unknown";
 }

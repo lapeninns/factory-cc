@@ -2,6 +2,7 @@ import { appendFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rena
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { nativePurpose } from "../../src/sessions/state.js";
 import { SessionStore } from "../../src/sessions/store.js";
 import { historyMessageHashes, resolveSession, sessionContextHash } from "../../src/sessions/correlate.js";
 import type { Message, MessagesRequest } from "../../src/types.js";
@@ -16,6 +17,18 @@ const input = { role: "chat" as const, model: "test-model", toolNames: [] };
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe("session capacity and durable identity", () => {
+  it("persists purpose and never demotes an interactive owner with a later empty catalog", () => {
+    const dir = temporaryDir(), store = new SessionStore(dir, true, 4);
+    const auxiliary = store.create({ ...input, nativePurpose: "auxiliary" });
+    store.update(auxiliary.bridgeSessionId, { nativePurpose: "interactive", state: "IDLE" });
+    store.update(auxiliary.bridgeSessionId, { nativePurpose: "auxiliary", toolNames: [] });
+    expect(nativePurpose(auxiliary)).toBe("interactive");
+    expect(nativePurpose(new SessionStore(dir, true, 4).require(auxiliary.bridgeSessionId))).toBe("interactive");
+    const legacy = store.create(input);
+    expect(nativePurpose(legacy)).toBe("unknown");
+    expect(nativePurpose({ ...legacy, toolNames: ["Read"] })).toBe("interactive");
+  });
+
   it("rolls back an atomic update when the persistent journal cannot be appended", () => {
     const dir = temporaryDir(), store = new SessionStore(dir, true, 2);
     const record = store.create(input);

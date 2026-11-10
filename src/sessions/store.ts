@@ -42,6 +42,7 @@ export class SessionStore {
     role: RoleTag;
     model: string;
     provider?: ModelProvider;
+    nativePurpose?: SessionRecord["nativePurpose"];
     claudeAccount?: string;
     nativeGeneration?: number;
     controllerWorkspacePolicy?: SessionRecord["controllerWorkspacePolicy"];
@@ -61,6 +62,7 @@ export class SessionStore {
       state: "NEW",
       model: input.model,
       ...(input.provider ? { provider: input.provider } : {}),
+      ...(input.nativePurpose ? { nativePurpose: input.nativePurpose } : {}),
       ...(input.claudeAccount ? { claudeAccount: input.claudeAccount } : {}),
       ...(input.nativeGeneration === undefined ? {} : { nativeGeneration: input.nativeGeneration }),
       ...(input.controllerWorkspacePolicy === undefined ? {} : { controllerWorkspacePolicy: input.controllerWorkspacePolicy }),
@@ -111,8 +113,10 @@ export class SessionStore {
 
   private applyUpdate(id: string, patch: Partial<SessionRecord>, committed?: () => void): SessionRecord {
     const record = this.require(id);
+    // Restoring an earlier request snapshot must not demote an admitted owner.
+    const purpose = record.nativePurpose === "interactive" ? "interactive" : patch.nativePurpose ?? record.nativePurpose;
     if (patch.state && !isActive(record.state) && isActive(patch.state)) this.requireCapacity();
-    Object.assign(record, patch, { updatedAt: new Date().toISOString() });
+    Object.assign(record, patch, { updatedAt: new Date().toISOString(), ...(purpose ? { nativePurpose: purpose } : {}) });
     // A host ending (hostEnded) ends the session just as a terminal state does.
     retirePendingTools(record);
     this.sessions.set(id, record);
