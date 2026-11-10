@@ -3,7 +3,7 @@ import { hostResultDigest } from "../../src/runtime/host-recovery.js";
 import { describe, expect, it } from "vitest";
 import { explicitSessionId, historyMessageHashes, resolveSession, sessionContextHash } from "../../src/sessions/correlate.js";
 import type { SessionRecord } from "../../src/sessions/state.js";
-import type { Message, MessagesRequest } from "../../src/types.js";
+import type { ContentBlock, Message, MessagesRequest } from "../../src/types.js";
 
 const headers = { "x-bridge-role": "chat" };
 const cwd = "/tmp/project-a";
@@ -534,6 +534,33 @@ describe("conversation continuity and isolation", () => {
       record.retainedCheckpoint!.settledToolResults = [];
       expect(resolveOwned([record], request).match).toBeUndefined();
     });
+
+    it.each(["valid", "wrong-marker", "extra-block", "before-result", "empty-result", "mixed-result", "duplicate-marker", "unknown-result", "failed-result", "changed-result", "duplicate-result", "missing-id", "no-followup", "later-assistant"])(
+      "validates the exact consumed-result turn boundary (%s)", kind => {
+        const result: ContentBlock = { type: "tool_result", tool_use_id: "proven", content: "completed" };
+        const beforeResult: Message[] = [userMessage("Earlier tool request"),
+          { role: "assistant", content: [{ type: "tool_use", id: "proven", name: "Read", input: {} }] }];
+        const record = retained(); record.historyMessageHashes = historyMessageHashes(beforeResult);
+        record.retainedCheckpoint!.settledToolResults = [{ toolUseId: "proven", resultSha256: hostResultDigest("completed", false) }];
+        let resultMessage: Message = { role: "user", content: [result] };
+        const marker: Message = { role: "assistant", content: [{ type: "text", text: "---" }] };
+        if (kind === "wrong-marker") marker.content = [{ type: "text", text: "----" }];
+        if (kind === "extra-block") marker.content = [{ type: "text", text: "---" }, { type: "text", text: "new work" }];
+        if (kind === "empty-result") resultMessage.content = [];
+        if (kind === "mixed-result") resultMessage.content = [result, { type: "text", text: "mixed" }];
+        if (kind === "unknown-result") resultMessage.content = [{ ...result, tool_use_id: "unknown" }];
+        if (kind === "failed-result") resultMessage.content = [{ ...result, is_error: true }];
+        if (kind === "changed-result") resultMessage.content = [{ ...result, content: "different" }];
+        if (kind === "duplicate-result") resultMessage.content = [result, result];
+        if (kind === "missing-id") resultMessage.content = [{ type: "tool_result", content: "completed" }];
+        const suffix = kind === "before-result" ? [marker, resultMessage] : [resultMessage, marker];
+        if (kind === "duplicate-marker") suffix.push(marker);
+        if (kind !== "no-followup") suffix.push(userMessage("llm-only context"), userMessage("new visible user turn"));
+        if (kind === "later-assistant") suffix.push({ role: "assistant", content: "Substantive new reply" }, userMessage("continue"));
+        const request: MessagesRequest = { ...queued, messages: [userMessage("Rewritten prefix"), ...beforeResult, ...suffix] };
+        const resolved = resolveOwned([record], request);
+        expect(resolved.match).toBe(kind === "valid" ? record : undefined);
+      });
 
     it("requires exact execution scope, completed pair and a text-only final user suffix", () => {
       const record = retained();

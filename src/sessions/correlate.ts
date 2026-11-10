@@ -1,3 +1,4 @@
+import { sameToolInput } from "./compaction.js";
 import { hostAllowsAnyTools } from "../runtime/native-tool-policy.js";
 import { matchesSettledHostResult } from "../runtime/host-recovery.js";
 import { createHash } from "node:crypto";
@@ -198,8 +199,9 @@ export function resolveSession(
 
   const lastAssistant = request.messages.map(message => message.role).lastIndexOf("assistant");
   const userSuffix = request.messages.slice(lastAssistant + 1);
-  const suffixResultBlocks = userSuffix.flatMap(message => asBlocks(message.content)).filter(block => block.type === "tool_result");
-  const suffixResults = collectToolResults(userSuffix);
+  const separator = sameToolInput(request.messages[lastAssistant]?.content, [{ type: "text", text: "---" }]);
+  const separatorResult = request.messages[lastAssistant - 1];
+  const separatorResultBlocks = separatorResult ? asBlocks(separatorResult.content) : [];
   const hasRetainedCheckpointTail = (session: SessionRecord): boolean => {
     const proof = session.retainedCheckpoint, completed = session.historyMessageHashes;
     return Boolean(sameExecutionScope(session) && hostAllowsAnyTools(request) && session.model === request.model && session.contextHash === contextHash
@@ -212,13 +214,18 @@ export function resolveSession(
       && ["clean-upstream", "operator-restored"].includes(proof.origin) && /^[a-f0-9]{64}$/.test(proof.checkpointSha256)
       && Number.isSafeInteger(proof.sourceGeneration) && proof.sourceGeneration >= 0
       && Number.isSafeInteger(session.nativeGeneration) && session.nativeGeneration! <= 1_000_000 && session.nativeGeneration! > proof.sourceGeneration
-      && lastAssistant >= 1 && request.messages[lastAssistant - 1]?.role === "user" && userSuffix.length > 0
-      && userSuffix.every(message => message.role === "user" && asBlocks(message.content).every(block => block.type === "text" || block.type === "tool_result"))
-      && suffixResultBlocks.every(block => "tool_use_id" in block && typeof block.tool_use_id === "string" && block.tool_use_id.length > 0)
-      && suffixResults.length === suffixResultBlocks.length
-      && new Set(suffixResults.map(result => result.tool_use_id)).size === suffixResults.length
-      && suffixResults.every(result => !result.is_error && matchesSettledHostResult(result, proof.settledToolResults ?? []))
-      && completed && completed.length >= 2 && completed.at(-2) === incoming[lastAssistant - 1] && completed.at(-1) === incoming[lastAssistant]);
+      && completed && completed.length >= 2 && userSuffix.length > 0
+      && (lastAssistant >= 1 && request.messages[lastAssistant - 1]?.role === "user"
+        && completed.at(-2) === incoming[lastAssistant - 1] && completed.at(-1) === incoming[lastAssistant]
+        && verifiedRetainedSuffix(userSuffix, proof.settledToolResults ?? [])
+        // Factory inserts this exact boundary after consumed results when a
+        // new visible user turn follows. It carries no new assistant work.
+        || separator && lastAssistant >= 3 && request.messages[lastAssistant - 3]?.role === "user"
+        && completed.at(-2) === incoming[lastAssistant - 3] && completed.at(-1) === incoming[lastAssistant - 2]
+        && separatorResult?.role === "user" && separatorResultBlocks.length > 0
+        && separatorResultBlocks.every(block => block.type === "tool_result")
+        && userSuffix.every(message => message.role === "user" && asBlocks(message.content).every(block => block.type === "text"))
+        && verifiedRetainedSuffix([separatorResult, ...userSuffix], proof.settledToolResults ?? [])));
   };
 
   if (explicit) {
@@ -340,6 +347,17 @@ function assertContext(session: SessionRecord, contextHash: string, headers: Hea
   if (legacyMismatch || (session.contextHash && session.contextHash !== contextHash)) {
     throw new BridgeError(409, "session_context_changed", "model, role, workspace or execution settings changed; start a new session");
   }
+}
+
+function verifiedRetainedSuffix(messages: Message[], receipts: readonly { toolUseId: string; resultSha256: string }[]): boolean {
+  const blocks = messages.flatMap(message => asBlocks(message.content));
+  const resultBlocks = blocks.filter(block => block.type === "tool_result");
+  const results = collectToolResults(messages);
+  return messages.every(message => message.role === "user")
+    && blocks.every(block => block.type === "text" || block.type === "tool_result")
+    && resultBlocks.every(block => "tool_use_id" in block && typeof block.tool_use_id === "string" && block.tool_use_id.length > 0)
+    && results.length === resultBlocks.length && new Set(results.map(result => result.tool_use_id)).size === results.length
+    && results.every(result => !result.is_error && matchesSettledHostResult(result, receipts));
 }
 
 function holdsToolId(ids: readonly string[] | undefined, toolUseId: string): boolean {

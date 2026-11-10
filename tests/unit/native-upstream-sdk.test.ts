@@ -17,6 +17,7 @@ class ProviderAdapter implements SdkHandle {
   readonly inputs: SdkUserInput[] = [];
   readonly handlers = new Map<string, (args: Record<string, unknown>, extra?: unknown) => Promise<unknown>>();
   closes = 0;
+  toolInvocations = 0;
   constructor(readonly sdkSessionId: string, readonly failures: number[]) {}
   tool(name: string, _description: string, _schema: unknown, handler: (args: Record<string, unknown>, extra?: unknown) => Promise<unknown>): unknown {
     this.handlers.set(name, handler);
@@ -26,7 +27,7 @@ class ProviderAdapter implements SdkHandle {
     return { ...options, instance: {
       isConnected: () => true, sendToolListChanged() {}, server: { setRequestHandler() {}, async sendToolListChanged() {} },
       registerTool: (name: string, _config: unknown, handler: (args: Record<string, unknown>, extra?: unknown) => Promise<unknown>) => {
-        this.handlers.set(name, handler);
+        this.handlers.set(name, async (...args) => { this.toolInvocations++; return handler(...args); });
         return { update() {}, remove: () => this.handlers.delete(name) };
       },
     } };
@@ -96,7 +97,29 @@ async function fixture(failures: number[] = [], resultOnly = false) {
     retainedCheckpoint: { sdkSessionId: sdkId, account: "team5", sourceGeneration: 4, preparedAt: new Date().toISOString(), origin: "operator-restored",
       checkpointSha256: createHash("sha256").update(readFileSync(file)).digest("hex"), settledToolIds: [resultId],
       settledToolResults: [{ toolUseId: resultId, resultSha256: hostResultDigest(JSON.stringify(resultContent), false) }] } });
-  return { app, runtime, sdk, sdkId, record, request, headers, coldRetry, checkpointRetry };
+  return { app, runtime, sdk, sdkId, record, request, headers, coldRetry, checkpointRetry, token };
+}
+
+/** Mirrors Factory Wz before the outbound role/content-only projection. */
+function factoryTurnBoundaries(messages: Array<Message & { visibility?: string; hiddenFromUserViews?: boolean }>): Message[] {
+  const result: Message[] = [];
+  let pendingResultIndex = -1;
+  for (const message of messages) {
+    if (message.role === "assistant") pendingResultIndex = -1;
+    else if (Array.isArray(message.content) && message.content.some(block => block.type === "tool_result")) pendingResultIndex = result.length;
+    else if (pendingResultIndex >= 0 && message.role === "user" && message.hiddenFromUserViews !== true && message.visibility !== "llm_only") {
+      result.splice(pendingResultIndex + 1, 0, { role: "assistant", content: [{ type: "text", text: "---" }] });
+      pendingResultIndex = -1;
+    }
+    result.push({ role: message.role, content: message.content });
+  }
+  return result;
+}
+function vendorRequest(f: Awaited<ReturnType<typeof fixture>>): MessagesRequest {
+  return { ...f.request, messages: factoryTurnBoundaries([...f.request.messages,
+    { role: "user", content: [{ type: "text", text: "internal context" }], visibility: "llm_only" },
+    { role: "user", content: [{ type: "text", text: `[factory-cc-session:${f.token}] Continue` }] },
+  ]) };
 }
 
 describe("retained checkpoint HTTP to SDK delivery", () => {
@@ -111,6 +134,33 @@ describe("retained checkpoint HTTP to SDK delivery", () => {
     expect(f.record.retainedCheckpoint).toBeUndefined();
     expect(f.record.retryableRequestKind).toBeUndefined();
     expect(f.coldRetry).not.toHaveBeenCalled();
+  });
+
+  it("reconciles the vendor-inserted result boundary through HTTP and the real SDK", async () => {
+    const f = await fixture([], true), request = vendorRequest(f);
+    expect(request.messages[4]).toEqual({ role: "assistant", content: [{ type: "text", text: "---" }] });
+    const response = await postMessages(f.app.url, "client", request, f.headers);
+    expect(response.status).toBe(200);
+    expect(response.session).toBe(f.record.bridgeSessionId);
+    expect(f.sdk.options[0]?.resume).toBe(f.sdkId);
+    expect(f.sdk.inputs).toHaveLength(1);
+    expect(f.sdk.toolInvocations).toBe(0);
+    expect(f.sdk.inputs[0]!.message.content.some(block => block.type === "tool_result")).toBe(false);
+    expect(f.app.store.list()).toHaveLength(1);
+    expect(f.coldRetry).not.toHaveBeenCalled();
+  });
+
+  it.each(["wrong-marker", "extra-block", "unknown-result", "failed-result", "no-followup"])("refuses unsafe vendor boundary %s before SDK admission", async kind => {
+    const f = await fixture([], true), request = vendorRequest(f), before = structuredClone(f.record);
+    if (kind === "wrong-marker") request.messages[4] = { role: "assistant", content: [{ type: "text", text: "----" }] };
+    if (kind === "extra-block") request.messages[4] = { role: "assistant", content: [{ type: "text", text: "---" }, { type: "text", text: "new response" }] };
+    if (kind === "unknown-result") request.messages[3] = { role: "user", content: [{ type: "tool_result", tool_use_id: "unknown", content: "done" }] };
+    if (kind === "failed-result") request.messages[3] = { role: "user", content: [{ type: "tool_result", tool_use_id: "already-completed", content: "done", is_error: true }] };
+    if (kind === "no-followup") request.messages = request.messages.slice(0, 5);
+    expect((await postMessages(f.app.url, "client", request, f.headers)).status).toBe(409);
+    expect(f.sdk.options).toHaveLength(0);
+    expect(f.record).toEqual(before);
+    expect(f.app.store.list()).toHaveLength(1);
   });
 
   it.each(["none", "missing", "null", "numeric"])("refuses %s selection before a real SDK query", async kind => {
@@ -136,10 +186,11 @@ describe("retained checkpoint HTTP to SDK delivery", () => {
     expect(f.sdk.options[0]?.resume).toBe(f.sdkId);
   });
 
-  it.each([429, 529])("preserves a rewritten-prefix continuation after %s and resumes the same SDK", async status => {
+  it.each([{ status: 429, boundary: false }, { status: 529, boundary: false }, { status: 429, boundary: true }, { status: 529, boundary: true }])(
+    "preserves rewritten-prefix retry %j on the same SDK", async ({ status, boundary }) => {
     vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(new Date("2026-11-10T13:30:00Z"));
-    const f = await fixture([status]);
-    const failed = await postMessages(f.app.url, "client", f.request, f.headers);
+    const f = await fixture([status], boundary), request = boundary ? vendorRequest(f) : f.request;
+    const failed = await postMessages(f.app.url, "client", request, f.headers);
     expect(failed.status).toBe(status);
     expect(failed.json.error).toMatchObject({ checkpoint_retained: true, retry_mode: "native_checkpoint" });
     expect(f.record).toMatchObject({ state: "IDLE", sdkSessionId: f.sdkId, claudeAccount: "team5", nativeGeneration: 8,
@@ -149,11 +200,11 @@ describe("retained checkpoint HTTP to SDK delivery", () => {
     expect(f.sdk.closes).toBeGreaterThan(0);
     if (status === 429) {
       expect(f.record.accountCooldowns?.team5).toBe("2026-11-10T13:31:00.000Z");
-      expect((await postMessages(f.app.url, "client", f.request, f.headers)).status).toBe(429);
+      expect((await postMessages(f.app.url, "client", request, f.headers)).status).toBe(429);
       expect(f.sdk.inputs).toHaveLength(1);
       vi.setSystemTime(new Date("2026-11-10T13:32:00Z"));
     }
-    const retried = await postMessages(f.app.url, "client", f.request, f.headers);
+    const retried = await postMessages(f.app.url, "client", request, f.headers);
     expect(retried.status).toBe(200);
     expect(retried.session).toBe(f.record.bridgeSessionId);
     expect(f.sdk.inputs).toHaveLength(2);
