@@ -55,17 +55,38 @@ export async function recoverNativeCheckpoint(context: NativeCheckpointRecoveryC
   const settled = priorRecovery(context.store, request);
   if (settled) return settled;
   const record = eligibleRecord(context, request);
+  // Inspect a stable set of persisted identities. A sibling can acquire work
+  // while the read-only lease queries await their shared-state lock.
+  const related = relatedRecords(context.store, request.factorySessionId);
+  const observed = JSON.stringify(related);
+  const siblings = related.filter(item => item.bridgeSessionId !== request.bridgeSessionId).map(item => structuredClone(item));
   // The store hands out its live record; keep the observed failure version.
   const failedAt = record.updatedAt;
   const evidence = await context.inspect({ factorySessionId: request.factorySessionId,
     bridgeSessionId: `${request.bridgeSessionId}:g${request.nativeGeneration}`, cwd: record.factoryCwd!,
     subscriptionProfile: record.claudeAccount as SubscriptionProfile, workspacePolicy: context.workspacePolicy, sdkSessionId: request.sdkSessionId });
   const leaseEndedAt = verifyLineage(evidence, request.nativeGeneration, failedAt);
+  for (const sibling of siblings) {
+    const generation = sibling.nativeGeneration;
+    if (!sibling.factoryCwd || !sibling.claudeAccount || !context.accounts.includes(sibling.claudeAccount)
+        || sibling.provider === "cursor" || typeof generation !== "number" || !Number.isSafeInteger(generation)
+        || generation < 0 || generation > 1_000_000
+        || (sibling.sdkSessionId != null && (typeof sibling.sdkSessionId !== "string" || !ID.test(sibling.sdkSessionId)))) {
+      refuse("sibling_identity_unproven");
+    }
+    const siblingEvidence = await context.inspect({ factorySessionId: request.factorySessionId,
+      bridgeSessionId: `${sibling.bridgeSessionId}:g${generation}`, cwd: sibling.factoryCwd,
+      subscriptionProfile: sibling.claudeAccount as SubscriptionProfile, workspacePolicy: context.workspacePolicy,
+      ...(sibling.sdkSessionId == null ? {} : { sdkSessionId: sibling.sdkSessionId }) });
+    verifySiblingLineage(siblingEvidence, generation, sibling.sdkSessionId != null);
+  }
   // Inspection is asynchronous. A concurrent recovery or write may have won.
   const repeated = priorRecovery(context.store, request);
   if (repeated) return repeated;
   const current = eligibleRecord(context, request);
-  if (current.updatedAt !== failedAt) refuse("changed_during_recovery");
+  if (current.updatedAt !== failedAt || JSON.stringify(relatedRecords(context.store, request.factorySessionId)) !== observed) {
+    refuse("changed_during_recovery");
+  }
   const nextGeneration = request.nativeGeneration + 1;
   if (request.dryRun) {
     return { ok: true, eligible: true, recovered: false, bridgeSessionId: request.bridgeSessionId,
@@ -89,6 +110,10 @@ function priorRecovery(store: SessionStore, request: NativeCheckpointRecoveryReq
   // Later work on the recovered record is never rewritten by a repeated call.
   return { ok: true, recovered: false, alreadyRecovered: true, bridgeSessionId: request.bridgeSessionId,
     nativeGeneration: receipt.toGeneration, recoveredAt: receipt.at };
+}
+
+function relatedRecords(store: SessionStore, factorySessionId: string): SessionRecord[] {
+  return store.list().filter(record => record.factorySessionId === factorySessionId);
 }
 
 function eligibleRecord(context: NativeCheckpointRecoveryContext, request: NativeCheckpointRecoveryRequest): SessionRecord {
@@ -137,6 +162,16 @@ function verifyLineage(evidence: NativeGenerationEvidence[], generation: number,
   if (evidence.some(item => item !== target && (!TERMINAL_LEASES.includes(item.state) || item.externalCleanupRequired
       || item.hostActionReservation || item.ownerAlive || item.supervisorAlive))) refuse("predecessor_unresolved");
   return target.endedAt!;
+}
+
+function verifySiblingLineage(evidence: NativeGenerationEvidence[], generation: number, checkpointExpected: boolean): void {
+  const matching = evidence.filter(item => item.generation === generation);
+  if (matching.length !== 1 || evidence.some(item => !item.bindingMatches || item.generation > generation)
+      || (checkpointExpected && matching[0]!.checkpointMatches !== true)) refuse("sibling_lease_evidence_unproven");
+  if (evidence.some(item => !TERMINAL_LEASES.includes(item.state) || !item.cleanupVerified
+      || item.externalCleanupRequired || item.hostActionReservation || item.ownerAlive || item.supervisorAlive)) {
+    refuse("sibling_lease_unsettled");
+  }
 }
 
 function refuse(reason: string): never {

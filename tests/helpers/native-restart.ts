@@ -5,6 +5,8 @@ import { loadConfig, type BridgeConfig, type SubscriptionAccount } from "../../s
 import { createBridgeApp, listen, type BridgeApp } from "../../src/http/app.js";
 import { createLogger } from "../../src/logging.js";
 import type { BridgeRuntime, RuntimeTurn } from "../../src/runtime/types.js";
+import { acquireDesktopJobLease } from "../../src/runtime/desktop-jobs.js";
+import { SessionStore } from "../../src/sessions/store.js";
 import { sanitizedSubscriptionEnvironment } from "../../src/workers/subscription-auth.js";
 
 /** Fixed fixture identities; none of them belongs to a real account or session. */
@@ -90,4 +92,18 @@ export async function runFirstController(root: string): Promise<{ bridgeSessionI
   } finally {
     await app.close();
   }
+}
+
+/** A failed import with a real lease whose owning process exits before recovery. */
+export async function runFailedImport(root: string, profile: "team2" | "team3", state: "failed" | "unknown"): Promise<string> {
+  const store = new SessionStore(join(root, "bridge", "data", "sessions"), true, 16);
+  const record = store.create({ role: "orchestrator", model: "opus", claudeAccount: profile, nativeGeneration: 0, toolNames: ["Read"] });
+  store.update(record.bridgeSessionId, { factorySessionId: FACTORY_SESSION, factoryCwd: join(root, "workspace") });
+  const lease = await acquireDesktopJobLease({ pythonExecutable: "/usr/bin/python3", runtimePackagePath: resolve("native-runtime"),
+    stateRoot: join(root, "leases"), maxRunning: 8 }, { factorySessionId: FACTORY_SESSION,
+    bridgeSessionId: `${record.bridgeSessionId}:g0`, cwd: join(root, "workspace"), role: "orchestrator",
+    subscriptionProfile: profile, workspacePolicy: "factory-native" }, new AbortController().signal);
+  await lease.release({ state, cleanupVerified: state === "failed" });
+  store.setState(record.bridgeSessionId, "FAILED");
+  return record.bridgeSessionId;
 }

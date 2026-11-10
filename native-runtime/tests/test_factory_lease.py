@@ -1015,7 +1015,15 @@ class FactoryLeaseTests(unittest.TestCase):
                 self.send(child, {**request, **patch})
                 self.assertIs(self.receive(child)['generations'][0][field], expected)
                 self.assertEqual(child.wait(timeout=3), 0)
-        for extra in ({'role': 'orchestrator'}, {'bridgeSessionId': 'bridge-lineage'}):
+        settlement_request = {key: value for key, value in request.items() if key != 'sdkSessionId'}
+        child = self.start()
+        self.send(child, settlement_request)
+        settlement = self.receive(child)['generations'][0]
+        self.assertIsNone(settlement['checkpointMatches'])
+        self.assertTrue(settlement['bindingMatches'])
+        self.assertTrue(settlement['cleanupVerified'])
+        self.assertEqual(child.wait(timeout=3), 0)
+        for extra in ({'role': 'orchestrator'}, {'bridgeSessionId': 'bridge-lineage'}, {'sdkSessionId': None}):
             with self.subTest(extra=extra):
                 self.assertFalse(self.refused({**request, **extra})['ok'])
         self.assertEqual(self.jobs_snapshot(), before)

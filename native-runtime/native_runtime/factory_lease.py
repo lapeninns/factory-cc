@@ -380,7 +380,7 @@ def inspect(config, request):
         raise ProtocolError("unexpected_fields")
     factory = _identifier(request.get("factorySessionId"))
     bridge = _identifier(request.get("bridgeSessionId"))
-    checkpoint = _identifier(request.get("sdkSessionId"))
+    checkpoint = _identifier(request["sdkSessionId"]) if "sdkSessionId" in request else None
     lineage = _lineage(bridge)
     profile = request.get("subscriptionProfile")
     policy = request.get("workspacePolicy")
@@ -403,7 +403,7 @@ def inspect(config, request):
         "ownerAlive": matches(job.get("leaseOwnerIdentity"), table),
         "supervisorAlive": matches(job.get("supervisorIdentity"), table),
         "cleanupVerified": job.get("reportedCleanupVerified") is True,
-        "checkpointMatches": (job.get("sessionId") == checkpoint) if job.get("sessionId") else None,
+        "checkpointMatches": (job.get("sessionId") == checkpoint) if checkpoint is not None and job.get("sessionId") else None,
         "bindingMatches": (job.get("factorySessionId") == factory and job.get("worktree") == workspace["worktree"]
                            and job.get("workspacePolicy") == policy and job.get("subscriptionProfile") == profile
                            and job.get("profile") == profile and job.get("authMode") == "subscription"),

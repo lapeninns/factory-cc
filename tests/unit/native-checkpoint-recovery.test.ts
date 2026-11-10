@@ -30,6 +30,13 @@ function firstController(root: string): { bridgeSessionId: string; token: string
   { cwd: process.cwd(), encoding: "utf8", timeout: 60_000, stdio: ["ignore", "pipe", "ignore"] });
   return JSON.parse(output.trim().split("\n").at(-1)!);
 }
+function failedImport(root: string, account: "team2" | "team3", state: "failed" | "unknown" = "failed"): string {
+  const helper = pathToFileURL(join(process.cwd(), "tests/helpers/native-restart.ts")).href;
+  const output = execFileSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e",
+    `const m = await import(${JSON.stringify(helper)}); process.stdout.write("\\n" + JSON.stringify(await m.runFailedImport(process.argv[1], process.argv[2], process.argv[3])) + "\\n");`, root, account, state],
+  { cwd: process.cwd(), encoding: "utf8", timeout: 60_000, stdio: ["ignore", "pipe", "ignore"] });
+  return JSON.parse(output.trim().split("\n").at(-1)!);
+}
 function leases(root: string): Array<Record<string, unknown>> {
   return readdirSync(join(root, "leases", "jobs")).filter(name => name.endsWith(".json"))
     .map(name => JSON.parse(readFileSync(join(root, "leases", "jobs", name), "utf8")) as Record<string, unknown>)
@@ -97,9 +104,7 @@ describe("native Workstream continuation after an orderly controller restart", (
     // and a cold import created a sibling that never completed a turn.
     const failedStore = new SessionStore(join(root, "bridge", "data", "sessions"), true, 16);
     failedStore.setState(first.bridgeSessionId, "FAILED");
-    const sibling = failedStore.create({ role: "unknown", model: "opus", claudeAccount: first.account, nativeGeneration: 0, toolNames: ["Read"] });
-    failedStore.update(sibling.bridgeSessionId, { factorySessionId: FACTORY_SESSION, factoryCwd: join(root, "workspace") });
-    failedStore.setState(sibling.bridgeSessionId, "FAILED");
+    const siblingId = failedImport(root, first.account === "team2" ? "team3" : "team2");
     const { app, runtime } = await secondController(root);
     const token = await hostStart(app, root);
     const failed = structuredClone(app.store.require(first.bridgeSessionId));
@@ -118,7 +123,8 @@ describe("native Workstream continuation after an orderly controller restart", (
     expect(recovered).toMatchObject({ state: "IDLE", nativeGeneration: 1, sdkSessionId: CHECKPOINT,
       notes: [...failed.notes, "native-checkpoint-recovered:g0->g1"],
       checkpointRecoveries: [{ sdkSessionId: CHECKPOINT, fromGeneration: 0, toGeneration: 1, failedAt: failed.updatedAt }] });
-    expect(app.store.require(sibling.bridgeSessionId).state).toBe("FAILED");
+    expect(app.store.require(siblingId)).toMatchObject({ state: "FAILED", nativeGeneration: 0 });
+    expect(app.store.require(siblingId).sdkSessionId).toBeUndefined();
     expect(await recover(app, identity)).toMatchObject({ status: 200, json: { recovered: false, alreadyRecovered: true, nativeGeneration: 1 } });
 
     const resumed = await postMessages(app.url, "client", continuation(first.token, token));
@@ -128,7 +134,28 @@ describe("native Workstream continuation after an orderly controller restart", (
     const later = structuredClone(app.store.require(first.bridgeSessionId));
     expect(await recover(app, identity)).toMatchObject({ status: 200, json: { alreadyRecovered: true } });
     expect(app.store.require(first.bridgeSessionId)).toEqual(later);
-    expect(leases(root).map(lease => [String(lease.bridgeSessionId).split(":").at(-1), lease.state])).toEqual([["g0", "cancelled"], ["g1", "idle"]]);
+    expect(leases(root).filter(lease => String(lease.bridgeSessionId).startsWith(first.bridgeSessionId))
+      .map(lease => [String(lease.bridgeSessionId).split(":").at(-1), lease.state])).toEqual([["g0", "cancelled"], ["g1", "idle"]]);
+  }, 60_000);
+
+  it("refuses recovery while a failed import on another account has an uncertain durable lease", async () => {
+    const root = directory();
+    const first = firstController(root);
+    const failedStore = new SessionStore(join(root, "bridge", "data", "sessions"), true, 16);
+    failedStore.setState(first.bridgeSessionId, "FAILED");
+    const siblingId = failedImport(root, first.account === "team2" ? "team3" : "team2", "unknown");
+    const { app, runtime } = await secondController(root);
+    await hostStart(app, root);
+    const before = structuredClone(app.store.require(first.bridgeSessionId));
+    const identity = { bridgeSessionId: first.bridgeSessionId, factorySessionId: FACTORY_SESSION,
+      sdkSessionId: CHECKPOINT, nativeGeneration: 0 };
+
+    expect(await recover(app, identity)).toMatchObject({ status: 409,
+      json: { error: { type: "native_recovery_refused", reason: "sibling_lease_unsettled" } } });
+    expect(app.store.require(first.bridgeSessionId)).toEqual(before);
+    expect(app.store.require(siblingId).state).toBe("FAILED");
+    expect(app.store.require(siblingId).historyMessageHashes).toBeUndefined();
+    expect(runtime.turns).toEqual([]);
   }, 60_000);
 });
 
@@ -190,6 +217,28 @@ describe("generation advance on a fresh authenticated Desktop start", () => {
     expect(await f.broker.hostEvent({ eventId: randomUUID(), desktopLifecycle: true, bindingToken: first.bindingToken,
       event: { hook_event_name: "SessionStart", session_id: "factory-one", cwd: f.cwd } })).toMatchObject({ bindingToken: first.bindingToken });
     expect(f.generation()).toBe(4);
+  });
+
+  it("publishes no host when generation persistence fails and renews all records on retry", async () => {
+    const f = fixture([{}, {}]);
+    const update = f.store.update.bind(f.store);
+    let writes = 0;
+    vi.spyOn(f.store, "update").mockImplementation((id, patch) => {
+      writes += 1;
+      if (writes === 2) throw new Error("generation write failed");
+      return update(id, patch);
+    });
+
+    await expect(f.start()).rejects.toThrow("generation write failed");
+    expect(f.records.map((_, index) => f.generation(index))).toEqual([4, 3]);
+    expect(f.broker.describe()).toMatchObject({ activeHostSessions: 0 });
+
+    const registered = await f.start();
+    expect(f.records.map((_, index) => f.generation(index))).toEqual([5, 4]);
+    expect(f.broker.describe()).toMatchObject({ activeHostSessions: 1 });
+    expect(await f.start()).toMatchObject({ bindingToken: registered.bindingToken });
+    expect(f.records.map((_, index) => f.generation(index))).toEqual([5, 4]);
+    expect(writes).toBe(4);
   });
 });
 
@@ -298,10 +347,82 @@ describe("operator native checkpoint recovery predicates", () => {
     live.ctx.busy = id => id === older.bridgeSessionId;
     expect(await refusal(recoverNativeCheckpoint(live.ctx, live.body))).toBe("sibling_active");
 
-    const failedImport = fixture();
-    const imported = failedImport.store.create({ role: "orchestrator", model: "opus", toolNames: ["Read"] });
-    failedImport.store.update(imported.bridgeSessionId, { factorySessionId: FACTORY_SESSION, createdAt: "2099-01-01T00:00:00.000Z", state: "FAILED" });
-    expect(await refusal(recoverNativeCheckpoint(failedImport.ctx, failedImport.body))).toBe("accepted");
+  });
+
+  function sibling(f: ReturnType<typeof fixture>, patch: Partial<SessionRecord> = {}) {
+    const imported = f.store.create({ role: "orchestrator", model: "opus", toolNames: ["Read"],
+      nativeGeneration: 0, claudeAccount: "team1" });
+    return f.store.update(imported.bridgeSessionId, { factorySessionId: FACTORY_SESSION, factoryCwd: f.cwd,
+      createdAt: "2099-01-01T00:00:00.000Z", state: "FAILED", ...patch });
+  }
+
+  it.each([undefined, null])("allows a failed sibling with SDK checkpoint %s only after its durable lease settles", async sdkSessionId => {
+    const f = fixture();
+    const imported = sibling(f);
+    Object.assign(imported, { sdkSessionId });
+    f.inspect.mockResolvedValueOnce([lease()]).mockResolvedValueOnce([lease({ state: "failed", endedBy: "phase_release", checkpointMatches: null })]);
+
+    expect(await recoverNativeCheckpoint(f.ctx, f.body)).toMatchObject({ recovered: true });
+    expect(f.inspect).toHaveBeenNthCalledWith(2, { factorySessionId: FACTORY_SESSION,
+      bridgeSessionId: `${imported.bridgeSessionId}:g0`, cwd: f.cwd, subscriptionProfile: "team1", workspacePolicy: "factory-native" });
+    expect(imported.state).toBe("FAILED");
+    expect(imported.sdkSessionId).toBe(sdkSessionId);
+  });
+
+  it("refuses a recorded sibling checkpoint that differs from its durable generation", async () => {
+    const f = fixture();
+    sibling(f, { sdkSessionId: CHECKPOINT });
+    const before = structuredClone(f.record);
+    f.inspect.mockResolvedValueOnce([lease()]).mockResolvedValueOnce([lease({ checkpointMatches: false })]);
+    expect(await refusal(recoverNativeCheckpoint(f.ctx, f.body))).toBe("sibling_lease_evidence_unproven");
+    expect(f.record).toEqual(before);
+  });
+
+  it.each([
+    [[], "sibling_lease_evidence_unproven"],
+    [[lease({ bindingMatches: false })], "sibling_lease_evidence_unproven"],
+    [[lease({ generation: 1 })], "sibling_lease_evidence_unproven"],
+    [[lease(), lease({ generation: 1 })], "sibling_lease_evidence_unproven"],
+    [[lease({ state: "unknown", externalCleanupRequired: true })], "sibling_lease_unsettled"],
+    [[lease({ externalCleanupRequired: true })], "sibling_lease_unsettled"],
+    [[lease({ state: "failed", cleanupVerified: false })], "sibling_lease_unsettled"],
+    [[lease({ hostActionReservation: true })], "sibling_lease_unsettled"],
+    [[lease({ ownerAlive: true })], "sibling_lease_unsettled"],
+    [[lease({ supervisorAlive: true })], "sibling_lease_unsettled"],
+  ] as Array<[NativeGenerationEvidence[], string]>)("refuses unproven sibling lease evidence %j as %s", async (evidence, reason) => {
+    const f = fixture();
+    const imported = sibling(f);
+    const before = structuredClone(f.record);
+    const siblingBefore = structuredClone(imported);
+    f.inspect.mockResolvedValueOnce([lease()]).mockResolvedValueOnce(evidence);
+
+    expect(await refusal(recoverNativeCheckpoint(f.ctx, f.body))).toBe(reason);
+    expect(f.record).toEqual(before);
+    expect(imported).toEqual(siblingBefore);
+  });
+
+  it.each([
+    { nativeGeneration: undefined }, { claudeAccount: "team9" }, { factoryCwd: undefined }, { sdkSessionId: "../checkpoint" },
+  ])("refuses a sibling whose durable identity cannot be established %j", async patch => {
+    const f = fixture();
+    sibling(f, patch);
+    const before = structuredClone(f.record);
+    expect(await refusal(recoverNativeCheckpoint(f.ctx, f.body))).toBe("sibling_identity_unproven");
+    expect(f.record).toEqual(before);
+  });
+
+  it.each(["created", "changed"])("refuses a sibling %s while durable evidence is inspected", async action => {
+    const f = fixture();
+    const imported = action === "changed" ? sibling(f) : undefined;
+    const before = structuredClone(f.record);
+    f.inspect.mockImplementationOnce(async () => {
+      if (imported) f.store.update(imported.bridgeSessionId, { notes: ["changed during inspection"] });
+      else sibling(f);
+      return [lease()];
+    });
+
+    expect(await refusal(recoverNativeCheckpoint(f.ctx, f.body))).toBe("changed_during_recovery");
+    expect(f.record).toEqual(before);
   });
 
   it("does not apply a recovery when the record changes while leases are inspected, and supports dry runs", async () => {

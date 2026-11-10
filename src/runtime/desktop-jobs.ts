@@ -43,14 +43,14 @@ export interface NativeGenerationEvidence {
   ownerAlive: boolean;
   supervisorAlive: boolean;
   cleanupVerified: boolean;
-  /** Null when the lease never recorded a native checkpoint. */
+  /** Null when no checkpoint comparison was requested or the lease recorded none. */
   checkpointMatches: boolean | null;
   bindingMatches: boolean;
   endedAt: string | null;
   /** How the lease reached its current state: a session-level update, an admitted phase's release, or another path. */
   endedBy: "session_update" | "phase_release" | "other";
 }
-export type NativeGenerationInspection = Omit<DesktopJobAcquire, "role" | "resumeSessionId"> & { sdkSessionId: string };
+export type NativeGenerationInspection = Omit<DesktopJobAcquire, "role" | "resumeSessionId"> & { sdkSessionId?: string };
 export const NATIVE_GENERATION_REFUSALS = ["lease_binding_mismatch", "terminal_session_cannot_reacquire", "stale_native_generation",
   "native_predecessor_unresolved", "native_checkpoint_mismatch"] as const;
 export interface DesktopJobLease { jobId: string; release(result: DesktopJobRelease): Promise<void> }
@@ -663,7 +663,8 @@ export async function inspectDesktopJobGenerations(options: DesktopLeaseOptions,
   }
   const channel = new LeaseChannel({ ...options, admissionTimeoutMs: options.releaseTimeoutMs ?? DEFAULT_RELEASE_TIMEOUT_MS }, { op: "inspect",
     factorySessionId: request.factorySessionId, bridgeSessionId: request.bridgeSessionId, cwd: request.cwd,
-    subscriptionProfile: request.subscriptionProfile, workspacePolicy: request.workspacePolicy, sdkSessionId: request.sdkSessionId });
+    subscriptionProfile: request.subscriptionProfile, workspacePolicy: request.workspacePolicy,
+    ...(request.sdkSessionId === undefined ? {} : { sdkSessionId: request.sdkSessionId }) });
   await channel.exited;
   const value = channel.inspection;
   if (!Array.isArray(value) || value.length > 64 || !value.every(isGenerationEvidence)) {

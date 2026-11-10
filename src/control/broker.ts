@@ -314,10 +314,10 @@ export class ControlBroker implements RuntimeControl {
       if (!host || host.ended) {
         host = { token: randomBytes(32).toString("hex"), sessionId: event.session_id, cwd, cwdAliases: new Set([cwd, resolve(event.cwd), ...(launch?.cwdAliases ?? [])]), bridgeSessions: new Set(), ended: false, terminalResults: new Map(), launchId: typeof launchId === "string" ? launchId : undefined,
           ...(desktopLifecycle ? { desktopLifecycle: true } : {}) };
+        if (desktopLifecycle) this.advanceInheritedGenerations(host);
         this.hosts.set(key, host);
         this.tokens.set(host.token, host);
         launch?.hosts.add(host);
-        if (desktopLifecycle) this.advanceInheritedGenerations(host);
       }
       host.cwdAliases.add(resolve(event.cwd));
       this.observeNativeWorkstream(host, event);
