@@ -695,9 +695,12 @@ describe("selected native lineage HTTP to SDK reconciliation", () => {
         event: { hook_event_name: "SessionEnd", session_id: FACTORY_SESSION, cwd: f.record.factoryCwd, reason: "exit" } }) });
     expect(ended.status).toBe(200); expect(f.record.hostEnded).toBe("resumable");
     await f.app.close(); apps.splice(apps.indexOf(f.app), 1);
-    const sdk = new ProviderAdapter(f.sdkId, []), runtime = new SdkRuntime(f.config, { info() {}, warn() {}, error() {} }, sdk);
+    // A fresh listener prevents the test HTTP client reusing the just-closed
+    // connection. The restarted controller still shares the persisted state.
+    const restartedConfig = { ...f.config, port: 0 };
+    const sdk = new ProviderAdapter(f.sdkId, []), runtime = new SdkRuntime(restartedConfig, { info() {}, warn() {}, error() {} }, sdk);
     vi.spyOn(DesktopJobsRuntime.prototype, "handle").mockImplementation((input, sink) => runtime.handle(input, sink));
-    const app = createBridgeApp(f.config, { info() {}, warn() {}, error() {} }, "", runtime); apps.push(app); await listen(app, f.config);
+    const app = createBridgeApp(restartedConfig, { info() {}, warn() {}, error() {} }, "", runtime); apps.push(app); await listen(app, restartedConfig);
     const token = await hostStart(app, f.root), owner = app.store.require(f.record.bridgeSessionId);
     const request: MessagesRequest = { ...f.request, messages: [{ role: "user", content: `[factory-cc-session:${token}] Fresh compacted context` },
       f.request.messages.at(-1)!, { role: "assistant", content: first.json.content as ContentBlock[] },
