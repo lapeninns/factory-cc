@@ -128,3 +128,20 @@ describe("pool recovery and all-account admission", () => {
     expect(new PoolUnavailableError(7).retryAfterSeconds).toBe(7);
   });
 });
+
+it("keeps a terminal worker's account reserved until lease settlement is confirmed", async () => {
+  const f = fixture(), pool = new SubscriptionWorkerPool(f.root, f.backends);
+  const started = await pool.start(scope, { ...input, operationId: "pending-settlement" });
+  const worker = [...f.workers.values()][0]!;
+  Object.assign(worker, { state: "completed", cleanupVerified: true, leaseReleased: false });
+  const report = await pool.accounts();
+  expect(report.remainingProviderAllowance).toBe("unknown");
+  const account = (report.accounts as Array<Record<string, unknown>>).find(item => item.profile === worker.subscriptionProfile)!;
+  expect(account).toMatchObject({ state: "recovery_required", eligible: false, activeWorkers: 1 });
+  expect(account.recoveryWorkers).toEqual([{ id: started.id, backendId: worker.id }]);
+  Object.assign(worker, { leaseReleased: true });
+  const recovered = await pool.accounts();
+  expect((recovered.accounts as Array<Record<string, unknown>>).find(item => item.profile === worker.subscriptionProfile))
+    .toMatchObject({ state: "ready", eligible: true, activeWorkers: 0, recoveryWorkers: [] });
+  expect(f.starts).toHaveLength(1);
+});

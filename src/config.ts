@@ -48,6 +48,8 @@ export interface BridgeConfig {
   readonly controllerHostTools?: boolean;
   /** Operator opt-in to visible Factory Workstream agents through SpawnAgent. */
   readonly controllerSpawnAgents?: boolean;
+  /** Model transport only: all tools and agent lifecycle execute in Factory. */
+  readonly factoryNative?: boolean;
   /** Operator-only policy for the bridge's extra host-action confirmation. */
   readonly controllerApprovalPolicy?: "ask" | "bypass";
   /** Private native account descriptors, deeply frozen and non-enumerable. */
@@ -339,7 +341,15 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
   if (controllerSpawnAgents && !controllerHostTools) {
     throw new Error("Controller SpawnAgent delegation requires pooled subscription host tools.");
   }
-  const controllerApprovalPolicy = overrides.controllerApprovalPolicy ?? "ask";
+  if (overrides.factoryNative !== undefined && typeof overrides.factoryNative !== "boolean") {
+    throw new Error("Factory-native policy must be a boolean supplied by operator configuration.");
+  }
+  const factoryNative = overrides.factoryNative === true;
+  if (factoryNative && (!controllerHostTools || !controllerSpawnAgents || overrides.nativeWorkflows)) {
+    throw new Error("Factory-native mode requires pooled host tools and SpawnAgent, and excludes native workflows.");
+  }
+  const controllerApprovalPolicy = overrides.controllerApprovalPolicy ?? (factoryNative ? "bypass" : "ask");
+  if (factoryNative && controllerApprovalPolicy !== "bypass") throw new Error("Factory-native mode delegates approval decisions to Factory; bridge confirmation must be bypass.");
   if (controllerApprovalPolicy !== "ask" && controllerApprovalPolicy !== "bypass") {
     throw new Error("Controller approval policy must be ask or bypass supplied by operator configuration.");
   }
@@ -460,6 +470,7 @@ export function loadConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig 
   Object.defineProperty(config, "controllerPool", { value: controllerPool, enumerable: true });
   Object.defineProperty(config, "controllerHostTools", { value: controllerHostTools, enumerable: true });
   Object.defineProperty(config, "controllerSpawnAgents", { value: controllerSpawnAgents, enumerable: true });
+  Object.defineProperty(config, "factoryNative", { value: factoryNative, enumerable: true });
   Object.defineProperty(config, "controllerApprovalPolicy", { value: controllerApprovalPolicy, enumerable: true });
   if (subscriptionAccounts) Object.defineProperty(config, "subscriptionAccounts", { value: subscriptionAccounts });
   return config;

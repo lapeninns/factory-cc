@@ -196,6 +196,13 @@ describe("fixed subscription Desktop admission", () => {
   it("requires one exact unprefixed Opus model", () => {
     expect(() => config({ models: [{ id: "team2/opus", model: "claude-opus-5-5", displayName: "fixture" }] })).toThrow(/fixed unprefixed/);
   });
+  it("gives pooled controllers the same eight-worker admission ceiling as fixed worker services", async () => {
+    const value = controllerPool();
+    const runtime = { kind: "fake", close: vi.fn(async () => {}) } as unknown as BridgeRuntime;
+    const app = createBridgeApp(value, createLogger(value.logDir), join(value.sandboxDir, "canary"), runtime);
+    try { expect(captured.options).toMatchObject({ maxRunning: 8 }); }
+    finally { await app.close().catch(error => { if ((error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") throw error; }); }
+  });
   it("takes the shared lease seat only from immutable operator config", async () => {
     const value = config();
     const runtime = { kind: "fake", close: vi.fn(async () => {}) } as unknown as BridgeRuntime;

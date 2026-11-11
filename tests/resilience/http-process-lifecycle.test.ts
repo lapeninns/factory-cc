@@ -126,3 +126,17 @@ it("allows an exact retry after startup timeout without leaving a process or rej
   sdk.account = "ok";
   expect((await post(body(), "start-retry")).status).toBe(200);
 });
+
+it("fails an over-window cold import explicitly, without account failover or replay, and leaves short sessions working", async () => {
+  const { sdk, post, app } = await fixture(); sdk.mode = "prompt_too_long";
+  const history = { ...body(), messages: [{ role: "user", content: "old task" }, { role: "assistant", content: "old answer" }, { role: "user", content: "continue" }] };
+  const failed = await post(history, "overflow");
+  expect(failed.status).toBe(400);
+  expect(failed.body).toMatchObject({ type: "error", error: { type: "invalid_request_error", sdk_terminal_reason: "prompt_too_long",
+    recovery_action: "compact_conversation", retry_from_history: false, cold_import: true, imported_messages: 3 } });
+  expect(String((failed.body as { error: { message: string } }).error.message)).toMatch(/prompt is too long/i);
+  expect(app.store.require(failed.session)).toMatchObject({ state: "FAILED", retryableRequestHash: undefined });
+  await vi.waitFor(() => expect(sdk.children[0]!.signalCode).not.toBeNull(), { timeout: 6000 });
+  sdk.mode = "success";
+  expect((await post(body(), "short")).status).toBe(200);
+});

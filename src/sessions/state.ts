@@ -1,3 +1,4 @@
+import type { NativeGenerationEvidence } from "../runtime/desktop-jobs.js";
 import type { ModelProvider } from "../models.js";
 import type { RoleTag, SessionState } from "../types.js";
 import type { RuntimeHostCompletion } from "../runtime/types.js";
@@ -8,10 +9,25 @@ export interface SessionRecord {
   factorySessionId?: string;
   factoryCwd?: string;
   sdkSessionId?: string;
+  /** Persisted purpose is independent of the latest mutable host tool catalog. */
+  nativePurpose?: "interactive" | "auxiliary";
   /** Exact accepted request that failed upstream after all host work settled. */
   retryableRequestHash?: string;
   /** Admission retries retain the native checkpoint instead of cold-importing it. */
-  retryableRequestKind?: "upstream" | "admission";
+  retryableRequestKind?: "upstream" | "native-upstream" | "admission";
+  /** Durable minimum waits observed from provider failures, independent of routing. */
+  accountCooldowns?: Record<string, string>;
+  /** Minted only after a clean upstream failure and verified native retirement. */
+  retainedCheckpoint?: RetainedCheckpoint;
+  /** Retained identity exists, but a failed preparation has no safe resume proof. */
+  checkpointRetryBlocked?: boolean;
+  upstreamCheckpointRecoveries?: UpstreamCheckpointRecovery[];
+  dormantCheckpointRetirement?: DormantCheckpointRetirement;
+  lineageCancellation?: LineageCancellation;
+  nativeLineageSelection?: NativeLineageSelection;
+  pendingLineageReconciliation?: string;
+  /** Current execution settings admitted after the immutable baseline selection. */
+  nativeLineageContext?: { model: string; contextHash?: string; reasoning?: string };
   /** Authenticated host receipts retained until an admitted turn consumes them. */
   hostCompletionReceipts?: RuntimeHostCompletion[];
   /** Runtime that owns sdkSessionId. Absent on Claude sessions created before Cursor coexisted. */
@@ -22,6 +38,14 @@ export interface SessionRecord {
   nativeGeneration?: number;
   /** Operator-selected workspace capability associated with the native generation. */
   controllerWorkspacePolicy?: "controller-readonly" | "controller-host";
+  /** Operator recoveries of a failed pre-prompt continuation; the failure stays recorded here. */
+  checkpointRecoveries?: NativeCheckpointRecovery[];
+  /** Cancellation origin is recorded separately from the terminal state. */
+  cancellation?: { at: string; source: "client-disconnect" | "admin" | "host" };
+  /** Operator reconciliation of completed actions after a lost transport. */
+  completedHostRecoveries?: CompletedHostRecovery[];
+  /** Present only while the first recovered native turn is being reconciled. */
+  pendingHostRecovery?: { operationId: string; notified?: boolean };
   /** Persist replay safety independently of process-local callback state. */
   hostEnded?: "resumable" | "terminal" | "interrupted";
   role: RoleTag;
@@ -49,6 +73,61 @@ export interface SessionRecord {
     output_tokens: number;
     estimated: boolean;
   };
+}
+
+export interface NativeCheckpointRecovery {
+  at: string;
+  sdkSessionId: string;
+  fromGeneration: number;
+  toGeneration: number;
+  /** Last change to the failed record before recovery. */
+  failedAt: string;
+  leaseEndedAt: string;
+}
+
+export interface CompletedHostRecovery {
+  operationId: string;
+  at: string;
+  sdkSessionId: string;
+  fromGeneration: number;
+  toGeneration: number;
+  recordUpdatedAt: string;
+  cancelledAt?: string;
+  cancellationSource: "client-disconnect" | "unknown-operator-attested";
+  checkpointSha256: string;
+  receiptsSha256: string;
+  leaseEndedAt: string;
+  original: { cancelRequested: boolean; cancellation?: SessionRecord["cancellation"]; hostEnded?: SessionRecord["hostEnded"]; endedToolIds: string[]; notes: string[] };
+  receipts: RuntimeHostCompletion[];
+  reconciledAt?: string;
+}
+
+export interface SettledToolResult {
+  toolUseId: string;
+  resultSha256: string;
+}
+
+export interface RetainedCheckpoint {
+  sdkSessionId: string;
+  account: string;
+  checkpointSha256: string;
+  sourceGeneration: number;
+  preparedAt: string;
+  coolingUntil?: string;
+  origin: "clean-upstream" | "operator-restored";
+  settledToolIds?: string[];
+  settledToolResults?: SettledToolResult[];
+}
+
+export interface UpstreamCheckpointRecovery {
+  operationId: string;
+  at: string;
+  recordUpdatedAt: string;
+  nativeGeneration: number;
+  proof: RetainedCheckpoint;
+  evidenceSha256: string;
+  receiptsSha256?: string;
+  before: { sdkSessionId?: string; retryableRequestKind?: SessionRecord["retryableRequestKind"]; retryableRequestHash?: string; accountCooldowns?: Record<string, string>; hostCompletionReceipts?: RuntimeHostCompletion[] };
 }
 
 /** A session in this condition can never resume or complete another tool round trip. */
@@ -85,4 +164,72 @@ export function transition(record: SessionRecord, next: SessionState): SessionRe
   record.state = next;
   record.updatedAt = new Date().toISOString();
   return retirePendingTools(record);
+}
+
+export interface DormantCheckpointRetirement {
+  operationId: string;
+  at: string;
+  before: Omit<SessionRecord, "dormantCheckpointRetirement">;
+  targetBridgeSessionId: string;
+  targetCreatedAt: string;
+  targetRecordUpdatedAt: string;
+  targetAccount: string;
+  targetNativeGeneration: number;
+  checkpointSha256: string;
+  evidenceSha256: string;
+  evidence: NativeGenerationEvidence[];
+}
+
+
+export interface NativeLineageOutcome {
+  toolUseId: string;
+  toolName: string;
+  input: unknown;
+  content: unknown;
+  isError: boolean;
+}
+export interface NativeLineageCheckpoint {
+  checkpointSha256: string;
+  outcomes: NativeLineageOutcome[];
+  settledToolResults: SettledToolResult[];
+}
+export interface LineageCancellation {
+  before: Pick<SessionRecord, "bridgeSessionId" | "factorySessionId" | "factoryCwd" | "sdkSessionId" | "claudeAccount" | "nativeGeneration" | "provider" | "controllerWorkspacePolicy" | "contextHash" | "state" | "cancelRequested" | "cancellation" | "hostEnded" | "pendingToolIds" | "endedToolIds" | "hostCompletionReceipts" | "updatedAt">;
+  historySha256: string;
+}
+export interface NativeLineageBranchProof {
+  record: SessionRecord;
+  checkpoint: NativeLineageCheckpoint;
+  evidence: NativeGenerationEvidence[];
+}
+export interface NativeLineageSelection {
+  operationId: string;
+  at: string;
+  requestSha256: string;
+  proofSha256: string;
+  approval: { reference: string; approvedAt: string; selectedBridgeSessionId: string; selectedSdkSessionId: string; sourceBridgeSessionIds: string[] };
+  selected: NativeLineageBranchProof;
+  sources: NativeLineageBranchProof[];
+  historical: Array<{ record: SessionRecord; checkpointSha256: string; outcomesSha256: string; evidence: NativeGenerationEvidence[];
+    disposition?: NativeLineageHistoricalDisposition }>;
+  scopeInventory: Array<{ bridgeSessionId: string; sha256: string }>;
+  inactive: Array<{ record: SessionRecord; evidence: NativeGenerationEvidence[] }>;
+  reconciledAt?: string;
+}
+
+export interface NativeLineageHistoricalDisposition {
+  bridgeSessionId: string;
+  sdkSessionId: string;
+  checkpointSha256: string;
+  outcomesSha256: string;
+  selected: { bridgeSessionId: string; sdkSessionId: string; account: string; nativeGeneration: number; expectedUpdatedAt: string };
+  disposition: "archive-superseded";
+  approvalReference: string;
+  approvedAt: string;
+}
+
+/** Missing legacy provenance remains a possible interactive owner. */
+export function nativePurpose(record: Pick<SessionRecord, "nativePurpose" | "toolNames">): "interactive" | "auxiliary" | "unknown" {
+  if (record.nativePurpose === "interactive" || record.nativePurpose === "auxiliary") return record.nativePurpose;
+  return record.toolNames.length ? "interactive" : "unknown";
 }

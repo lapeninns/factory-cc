@@ -86,8 +86,12 @@ describe("native controller pool identity", () => {
   it("rejects an incorrect account before sending any prompt", async () => {
     const sdk = new FakeSdk(); sdk.identity = "member1@example.invalid";
     const runtime = new SdkRuntime(config(), logger, sdk); runtimes.push(runtime);
+    logger.warn.mockClear();
     await expect(runtime.handle(request("team7"))).rejects.toMatchObject({ code: "auth_mode_mismatch" });
     expect(sdk.inputs).toHaveLength(0);
+    const record = logger.warn.mock.calls.find(([event]) => event === "sdk_session_failed")?.[1];
+    expect(record).toMatchObject({ code: "auth_mode_mismatch", phase: "startup", claudeProfile: "team7", sentUserTurns: 0 });
+    expect(JSON.stringify(record)).not.toContain("member1@example.invalid");
   });
   it("rejects an unconfigured selected account before native startup", async () => {
     const sdk = new FakeSdk(), runtime = new SdkRuntime(config(), logger, sdk); runtimes.push(runtime);
@@ -126,6 +130,21 @@ describe("native controller pool identity", () => {
     await expect(runtime.handle(request())).rejects.toMatchObject({ code: "rate_limit_error" });
     await expect(runtime.prepareColdRetry("bridge-one")).rejects.toMatchObject({ code: "native_retry_unsafe" });
   });
+  it("does not grant reserved native controller capacity from model role headers", () => {
+    const input = request("team8");
+    input.factorySession = { sessionId: "native-factory", cwd: "/fixture", desktopLifecycle: true };
+    input.headers["x-bridge-role"] = "orchestrator";
+    expect(controllerJobBinding({ ...config(), factoryNative: true, controllerHostTools: true }, input))
+      .toMatchObject({ workspacePolicy: "factory-native", inferenceRole: "worker" });
+  });
+
+  it.each(["orchestrator", "agent"] as const)("uses authenticated role metadata for the native %s connection", role => {
+    const input = request("team8");
+    input.factorySession = { sessionId: "native-factory", cwd: "/fixture", desktopLifecycle: true, nativeWorkstream: { role, workstreamId: "00000000-0000-0000-0000-000000000001" } };
+    expect(controllerJobBinding({ ...config(), factoryNative: true, controllerHostTools: true }, input))
+      .toMatchObject({ subscriptionProfile: "team8", nativeGeneration: 0, workspacePolicy: "factory-native", inferenceRole: role === "agent" ? "worker" : "orchestrator" });
+  });
+
   it("binds the lease to the same privately selected account and generation", () => {
     const input = request("team8"); input.factorySession = { sessionId: "factory-one", cwd: "/fixture", desktopLifecycle: true };
     expect(controllerJobBinding(config(), input)).toMatchObject({ subscriptionProfile: "team8", nativeGeneration: 0, workspacePolicy: "controller-readonly" });
@@ -153,7 +172,30 @@ describe("controller pool native lease generations", () => {
     ]);
     await runtime.close();
   });
-});
+  it("asks a new generation to continue the persisted checkpoint, except for a cold import", async () => {
+    const root = directory();
+    const binding: DesktopJobBinding = { sessionId: "factory", cwd: root, subscriptionProfile: "team1", workspacePolicy: "factory-native", nativeGeneration: 3 };
+    const inner = { kind: "fake" as const, handle: vi.fn(async () => turn()), cancel: vi.fn(async () => undefined), deliverResults: vi.fn(async () => []) };
+    const acquire = vi.fn(async (_request: import("../../src/runtime/desktop-jobs.js").DesktopJobAcquire) => ({ jobId: "job", release: vi.fn(async () => undefined) }));
+    const update = vi.fn(async (_request: import("../../src/runtime/desktop-jobs.js").DesktopJobAcquire) => undefined);
+    const runtime = new DesktopJobsRuntime(inner, { pythonExecutable: "/usr/bin/python3", runtimePackagePath: root, factoryNative: true,
+      stateRoot: join(root, "state"), getBinding: () => binding, acquireLease: acquire, updateRecord: update });
+    const resumed = request("team1", "bridge-resume"); resumed.session.sdkSessionId = "checkpoint-one";
+    await runtime.handle(resumed);
+    const imported = request("team1", "bridge-import"); imported.session.sdkSessionId = "checkpoint-one"; imported.recovery = "cold-import";
+    await runtime.handle(imported);
+    expect(acquire.mock.calls.map(([value]) => value.resumeSessionId)).toEqual(["checkpoint-one", undefined]);
+    expect(runtime.ownsNativeSession("bridge-resume")).toBe(true);
+
+    // A refused lineage leaves no identity for later cleanup to update.
+    acquire.mockRejectedValueOnce(new BridgeError(409, "native_generation_refused", "refused", { phase: "admission", checkpoint_retained: true, reason: "lease_binding_mismatch" }));
+    await expect(runtime.handle(request("team1", "bridge-refused"))).rejects.toMatchObject({ code: "native_generation_refused" });
+    expect(runtime.ownsNativeSession("bridge-refused")).toBe(false);
+    await runtime.cancel("bridge-refused", "request-failed");
+    expect(update).not.toHaveBeenCalled();
+    await runtime.close();
+    expect(update.mock.calls.map(([value]) => value.bridgeSessionId).sort()).toEqual(["bridge-import:g3", "bridge-resume:g3"]);
+  });});
 
 describe("controller account selection and failover", () => {
   async function start() {

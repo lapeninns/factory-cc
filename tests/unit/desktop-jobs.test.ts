@@ -47,6 +47,70 @@ function setup() {
 }
 
 describe("Factory model-phase supervision", () => {
+  it("retains lease ownership until checkpoint retry cleanup is acknowledged", async () => {
+    const fixture = setup();
+    const prepare = vi.fn(async () => undefined);
+    (fixture.inner as BridgeRuntime).prepareCheckpointRetry = prepare;
+    await fixture.runtime.handle(request());
+    fixture.update.mockRejectedValueOnce(new Error("lease update failed"));
+    await expect(fixture.runtime.prepareCheckpointRetry("bridge-1", "sdk")).rejects.toThrow("lease update failed");
+    expect(fixture.runtime.ownsNativeSession("bridge-1")).toBe(true);
+    await fixture.runtime.prepareCheckpointRetry("bridge-1", "sdk");
+    expect(fixture.runtime.ownsNativeSession("bridge-1")).toBe(false);
+    expect(prepare).toHaveBeenCalledWith("bridge-1", "sdk");
+    expect(fixture.update).toHaveBeenLastCalledWith(expect.any(Object), { state: "failed", sdkSessionId: "sdk", cleanupVerified: true });
+  });
+
+  it("serializes shutdown behind checkpoint retry settlement", async () => {
+    const fixture = setup(), acknowledged = deferred<undefined>();
+    (fixture.inner as BridgeRuntime).prepareCheckpointRetry = vi.fn(async () => undefined);
+    await fixture.runtime.handle(request());
+    fixture.update.mockImplementationOnce(async () => acknowledged.promise);
+    const preparing = fixture.runtime.prepareCheckpointRetry("bridge-1", "sdk");
+    await vi.waitFor(() => expect(fixture.update).toHaveBeenCalledTimes(1));
+    const closing = fixture.runtime.close();
+    expect(fixture.inner.close).not.toHaveBeenCalled();
+    acknowledged.resolve(undefined);
+    await preparing; await closing;
+    expect(fixture.update).toHaveBeenCalledTimes(1);
+    expect(fixture.update).toHaveBeenCalledWith(expect.any(Object), { state: "failed", sdkSessionId: "sdk", cleanupVerified: true });
+  });
+
+  it("settles a clean interrupted native phase as idle before permitting its next admission", async () => {
+    const fixture = setup();
+    const running = deferred<RuntimeTurn>();
+    fixture.inner.handle.mockImplementationOnce(() => running.promise);
+    fixture.inner.interrupt.mockImplementationOnce(async () => {
+      running.reject(new Error("clean native interruption"));
+      await Promise.resolve();
+      return true;
+    });
+    const pending = fixture.runtime.handle(request());
+    const observed = pending.catch(() => undefined);
+    await vi.waitFor(() => expect(fixture.inner.handle).toHaveBeenCalled());
+    expect(await fixture.runtime.interrupt!("bridge-1", "client-disconnect")).toBe(true);
+    await observed;
+    expect(fixture.inner.cancel).not.toHaveBeenCalled();
+    expect(fixture.releases).toHaveBeenCalledWith(expect.objectContaining({ state: "idle", cleanupVerified: true }));
+    await expect(fixture.runtime.handle(request())).resolves.toMatchObject({ pendingToolIds: [] });
+  });
+
+  it.each([true, false])("requires acknowledged native lease settlement after interrupt, fallback succeeds=%s", async fallbackSucceeds => {
+    const fixture = setup(), running = deferred<RuntimeTurn>();
+    fixture.inner.handle.mockImplementationOnce(() => running.promise);
+    fixture.releases.mockRejectedValue(new Error("release did not persist"));
+    if (!fallbackSucceeds) fixture.update.mockRejectedValue(new Error("fallback did not persist"));
+    fixture.inner.interrupt.mockImplementationOnce(async () => {
+      running.reject(new Error("clean native interruption"));
+      return true;
+    });
+    const pending = fixture.runtime.handle(request()).catch(() => undefined);
+    await vi.waitFor(() => expect(fixture.inner.handle).toHaveBeenCalled());
+    expect(await fixture.runtime.interrupt!("bridge-1", "client-disconnect")).toBe(fallbackSucceeds);
+    await pending;
+    expect(fixture.update).toHaveBeenCalledWith(expect.any(Object), { state: "idle", cleanupVerified: true });
+  });
+
   it("refuses missing trusted identity and a main checkout before model execution", async () => {
     const fixture = setup();
     fixture.options.getBinding = () => undefined;
@@ -55,6 +119,15 @@ describe("Factory model-phase supervision", () => {
     rmSync(join(fixture.cwd, ".git")); mkdirSync(join(fixture.cwd, ".git"));
     await expect(fixture.runtime.handle(request())).rejects.toMatchObject({ code: "desktop_job_workspace" });
     expect(fixture.inner.handle).not.toHaveBeenCalled(); expect(fixture.acquire).not.toHaveBeenCalled();
+  });
+
+  it("refuses native workspace admission without the model-only runtime policy", async () => {
+    const fixture = setup();
+    fixture.binding.workspacePolicy = "factory-native";
+    fixture.binding.subscriptionProfile = "team1";
+    await expect(fixture.runtime.handle(request())).rejects.toMatchObject({ code: "desktop_workspace_policy" });
+    expect(fixture.acquire).not.toHaveBeenCalled();
+    expect(fixture.inner.handle).not.toHaveBeenCalled();
   });
 
   it("preserves Factory request/tools and releases active inference capacity while waiting for host tools", async () => {
@@ -114,6 +187,22 @@ describe("Factory model-phase supervision", () => {
     await Promise.resolve(); await Promise.resolve(); expect(fixture.releases).not.toHaveBeenCalled();
     cleanup.resolve(undefined); await Promise.all([running, cancellation]);
     expect(fixture.releases).toHaveBeenCalledWith(expect.objectContaining({ state: "cancelled", cleanupVerified: true }));
+  });
+
+  it("reports queued and running phases per account and lane with recent admission delay", async () => {
+    vi.useFakeTimers(); const fixture = setup(); const gate = deferred<DesktopJobLease>();
+    fixture.options.acquireLease = () => gate.promise;
+    fixture.binding.subscriptionProfile = "team3";
+    const running = fixture.runtime.handle(request());
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(fixture.runtime.describe()).toMatchObject({ desktopJobs: { maxRunning: 3, workerSlots: 2, controllerSlots: 1,
+      queue: { queuedPhases: 1, runningPhases: 0, oldestQueuedMs: 1_500, recentAdmissions: { count: 0, medianDelayMs: null, maxDelayMs: null } },
+      accounts: { team3: { workerQueued: 1, workerRunning: 0, controllerQueued: 0, controllerRunning: 0 } } } });
+    gate.resolve({ jobId: "job-1", release: fixture.releases }); await running;
+    const status = fixture.runtime.describe() as { desktopJobs: Record<string, unknown> };
+    expect(status.desktopJobs).toMatchObject({ queue: { queuedPhases: 0, runningPhases: 0, oldestQueuedMs: null,
+      recentAdmissions: { count: 1, medianDelayMs: 1_500, maxDelayMs: 1_500 } }, accounts: {} });
+    expect(JSON.stringify(status)).not.toContain("private prompt");
   });
 
   it("records uncertain cleanup and does not claim native error cleanup succeeded", async () => {
@@ -244,6 +333,72 @@ describe("explicit host-directory controllers", () => {
       expect(second.inner.handle).toHaveBeenCalledOnce();
     } finally {
       await Promise.allSettled([first.runtime.close(), second.runtime.close()]);
+    }
+  });
+
+  it("Factory-native Task releases the parent reservation so its same-folder child can infer", async () => {
+    const first = hostFixture(), second = hostFixture();
+    const stateRoot = join(first.root, "native-state");
+    for (const fixture of [first, second]) {
+      fixture.options.factoryNative = true;
+      fixture.options.runtimePackagePath = resolve("native-runtime");
+      fixture.options.stateRoot = stateRoot;
+      fixture.options.admissionTimeoutMs = 5_000;
+      fixture.options.releaseTimeoutMs = 2_000;
+      fixture.options.acquireLease = undefined;
+      fixture.options.updateRecord = undefined;
+    }
+    second.binding.sessionId = "factory-child";
+    second.binding.cwd = first.cwd;
+    second.binding.subscriptionProfile = "team2";
+    second.input.session.bridgeSessionId = "bridge-child";
+    first.inner.handle.mockResolvedValueOnce(hostTurn("pending-task", "Task"));
+    try {
+      await first.runtime.handle(first.input);
+      expect(first.runtime.describe()).toMatchObject({ desktopJobs: { heldHostActions: 0 } });
+      await second.runtime.handle(second.input);
+      expect(second.inner.handle).toHaveBeenCalledOnce();
+      await first.runtime.handle(withResult(first.input, "pending-task"));
+      expect(first.inner.handle).toHaveBeenCalledTimes(2);
+    } finally {
+      await Promise.allSettled([first.runtime.close(), second.runtime.close()]);
+    }
+  });
+
+  it("keeps the native orchestrator responsive while its same-folder agent is generating", async () => {
+    const parent = hostFixture(), agent = hostFixture(), finishAgent = deferred<RuntimeTurn>();
+    for (const fixture of [parent, agent]) {
+      fixture.options.factoryNative = true;
+      fixture.binding.workspacePolicy = "factory-native";
+      fixture.options.runtimePackagePath = resolve("native-runtime");
+      fixture.options.stateRoot = join(parent.root, "native-state");
+      fixture.options.admissionTimeoutMs = 5_000;
+      fixture.options.releaseTimeoutMs = 2_000;
+      fixture.options.acquireLease = undefined;
+      fixture.options.updateRecord = undefined;
+    }
+    agent.binding.sessionId = "native-agent";
+    agent.binding.cwd = parent.cwd;
+    agent.binding.subscriptionProfile = "team2";
+    agent.input.role = "worker";
+    agent.input.session.bridgeSessionId = "native-agent-bridge";
+    const began = deferred<void>();
+    agent.inner.handle.mockImplementationOnce(async () => { began.resolve(); return finishAgent.promise; });
+    parent.inner.handle.mockResolvedValueOnce(hostTurn("native-send", "SendMessage"));
+    let running: Promise<RuntimeTurn> | undefined;
+    try {
+      await parent.runtime.handle(parent.input);
+      running = agent.runtime.handle(agent.input);
+      await began.promise;
+      // The child retains inference. The parent must still be able to think
+      // and publish InterruptAgent rather than waiting for child completion.
+      await parent.runtime.handle(withResult(parent.input, "native-send"));
+      expect(parent.inner.handle).toHaveBeenCalledTimes(2);
+      expect(agent.inner.handle).toHaveBeenCalledOnce();
+    } finally {
+      finishAgent.resolve(turn());
+      if (running) await running;
+      await Promise.allSettled([parent.runtime.close(), agent.runtime.close()]);
     }
   });
 

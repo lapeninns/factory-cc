@@ -1,3 +1,6 @@
+import { sameToolInput } from "./compaction.js";
+import { hostAllowsAnyTools } from "../runtime/native-tool-policy.js";
+import { matchesSettledHostResult } from "../runtime/host-recovery.js";
 import { createHash } from "node:crypto";
 import { header } from "../security/auth.js";
 import { asBlocks, canonicalToolUseId, collectToolResults } from "../protocol/content.js";
@@ -5,7 +8,7 @@ import type { ContentBlock, Message, MessagesRequest, RoleTag } from "../types.j
 import { BridgeError } from "../types.js";
 import { providerFromModelId, type ModelProvider } from "../models.js";
 import { droidReasoningLevel, requestAtReasoningLevel, requestWithoutReasoningLevel } from "../runtime/reasoning.js";
-import { isEnded, type SessionRecord } from "./state.js";
+import { isEnded, nativePurpose, type SessionRecord } from "./state.js";
 import { canonicalWorkspacePath, resolveRequestCwd } from "../workspace.js";
 
 type Headers = Record<string, string | string[] | undefined>;
@@ -77,7 +80,8 @@ export function resolveSession(
   sessions: SessionRecord[],
   headers: Headers,
   request: MessagesRequest,
-  options: { cwd?: string; hostSessionId?: string; allowModelSwitch?: boolean; continueIdenticalTranscripts?: boolean; provider?: ModelProvider; claudeProfile?: string } = {},
+  options: { cwd?: string; hostSessionId?: string; allowModelSwitch?: boolean; continueIdenticalTranscripts?: boolean;
+    provider?: ModelProvider; claudeProfile?: string; auxiliaryRetry?: { match: SessionRecord; reason: string } } = {},
 ): { match?: SessionRecord; reason: string } {
   const explicit = explicitSessionId(headers, request);
   const requestProvider = options.provider ?? providerFromModelId(request.model);
@@ -139,7 +143,7 @@ export function resolveSession(
     && session.factorySessionId === options.hostSessionId && session.factoryCwd !== undefined
     && canonicalWorkspacePath(session.factoryCwd) === workspace
     && session.role === roleFromHeaders(headers)
-    && session.toolNames.length > 0 && Boolean(request.tools?.length);
+    && nativePurpose(session) === "interactive" && Boolean(request.tools?.length);
   const canChangeHostThinking = (session: SessionRecord): boolean => switchingModel(session) && sameExecutionScope(session);
   // Same-model selector changes are a different field from an arbitrary thinking
   // blob. The previous level's hash must still match, so model, role, directory
@@ -155,7 +159,7 @@ export function resolveSession(
   const canChangeReasoningLevel = (session: SessionRecord): boolean => {
     if (switchingModel(session) || session.model !== request.model || !session.contextHash || !hostAgrees(session)) return false;
     if (sessionProvider(session) !== requestProvider || session.role !== roleFromHeaders(headers)) return false;
-    if (session.toolNames.length === 0 || !request.tools?.length) return false;
+    if (nativePurpose(session) !== "interactive" || !request.tools?.length) return false;
     const current = droidReasoningLevel(request);
     if ((session.reasoning ?? undefined) === current) return false;
     const previous = session.reasoning
@@ -188,10 +192,56 @@ export function resolveSession(
       && !asBlocks(tailMessages[2].content).some((block) => block.type === "tool_result")
       && session.factorySessionId === options.hostSessionId && session.factoryCwd !== undefined
       && canonicalWorkspacePath(session.factoryCwd) === workspace
-      && session.sdkSessionId && session.toolNames.length > 0
+      && session.sdkSessionId && nativePurpose(session) === "interactive"
       && completed !== undefined && completed.length >= 2
       && session.requestMessageHashes?.at(-1) === completed.at(-2)
       && completed.at(-2) === tail[0] && completed.at(-1) === tail[1]);
+  };
+
+  const lastAssistant = request.messages.map(message => message.role).lastIndexOf("assistant");
+  const userSuffix = request.messages.slice(lastAssistant + 1);
+  const separator = sameToolInput(request.messages[lastAssistant]?.content, [{ type: "text", text: "---" }]);
+  const separatorResult = request.messages[lastAssistant - 1];
+  const separatorResultBlocks = separatorResult ? asBlocks(separatorResult.content) : [];
+  const hasHealthyCheckpointTail = (session: SessionRecord): boolean => {
+    const completed = session.historyMessageHashes;
+    return Boolean(sameExecutionScope(session) && hostAllowsAnyTools(request)
+      && session.model === request.model && session.contextHash === contextHash
+      && session.state === "IDLE" && session.sdkSessionId && session.claudeAccount
+      && !session.cancelRequested && !session.cancellation && !session.checkpointRetryBlocked
+      && (session.hostEnded === undefined || session.hostEnded === "resumable")
+      && !session.pendingToolIds.length && !session.endedToolIds?.length && !session.hostCompletionReceipts?.length
+      && !session.pendingHostRecovery && !session.retainedCheckpoint
+      && completed && completed.length >= 2 && session.requestMessageHashes?.at(-1) === completed.at(-2)
+      && lastAssistant >= 1 && request.messages[lastAssistant - 1]?.role === "user"
+      && completed.at(-2) === incoming[lastAssistant - 1] && completed.at(-1) === incoming[lastAssistant]
+      && userSuffix.length && userSuffix.every(message => message.role === "user"
+        && asBlocks(message.content).length > 0 && asBlocks(message.content).every(block => block.type === "text")));
+  };
+  const hasRetainedCheckpointTail = (session: SessionRecord): boolean => {
+    const proof = session.retainedCheckpoint, completed = session.historyMessageHashes;
+    return Boolean(sameExecutionScope(session) && hostAllowsAnyTools(request) && session.model === request.model && session.contextHash === contextHash
+      && session.state === "IDLE" && !session.cancelRequested && !session.cancellation
+      && (session.hostEnded === undefined || session.hostEnded === "resumable")
+      && session.pendingToolIds.length === 0 && !session.endedToolIds?.length && !session.hostCompletionReceipts?.length
+      && !session.pendingHostRecovery && !session.checkpointRetryBlocked && session.retryableRequestKind === "native-upstream"
+      && proof && Boolean(session.sdkSessionId) && Boolean(session.claudeAccount)
+      && proof.sdkSessionId === session.sdkSessionId && proof.account === session.claudeAccount
+      && ["clean-upstream", "operator-restored"].includes(proof.origin) && /^[a-f0-9]{64}$/.test(proof.checkpointSha256)
+      && Number.isSafeInteger(proof.sourceGeneration) && proof.sourceGeneration >= 0
+      && Number.isSafeInteger(session.nativeGeneration) && session.nativeGeneration! <= 1_000_000 && session.nativeGeneration! > proof.sourceGeneration
+      && completed && completed.length >= 2 && userSuffix.length > 0
+      && (lastAssistant >= 1 && request.messages[lastAssistant - 1]?.role === "user"
+        && completed.at(-2) === incoming[lastAssistant - 1] && completed.at(-1) === incoming[lastAssistant]
+        && verifiedRetainedSuffix(userSuffix, proof.settledToolResults ?? [])
+        // Factory inserts this exact boundary after consumed results when a
+        // new visible user turn follows. It carries no new assistant work.
+        || separator && lastAssistant >= 3 && request.messages[lastAssistant - 3]?.role === "user"
+        && completed.at(-2) === incoming[lastAssistant - 3] && completed.at(-1) === incoming[lastAssistant - 2]
+        && separatorResult?.role === "user" && separatorResultBlocks.length > 0
+        && separatorResultBlocks.every(block => block.type === "tool_result")
+        && userSuffix.every(message => message.role === "user" && asBlocks(message.content).every(block => block.type === "text"))
+        && verifiedRetainedSuffix([separatorResult, ...userSuffix], proof.settledToolResults ?? [])));
   };
 
   if (explicit) {
@@ -210,14 +260,22 @@ export function resolveSession(
     return { reason: "new-explicit-session" };
   }
 
+  const auxiliaryOnly = Boolean(options.hostSessionId) && !hostAllowsAnyTools(request);
+  const implicitSessions = auxiliaryOnly ? sessions.filter(session => nativePurpose(session) === "auxiliary") : sessions;
   if (owners.length > 1) throw ambiguous("tool results belong to multiple sessions");
   if (owners[0]) {
+    if (auxiliaryOnly && nativePurpose(owners[0]) !== "auxiliary") {
+      throw new BridgeError(409, "explicit_session_required", "Supply the owning session ID to return an interactive tool result without advertising tools.");
+    }
     assertHostScope(owners[0]);
     assertSelectedContext(owners[0]);
     return { match: owners[0], reason: "tool-use-id" };
   }
 
-  const candidates = sessions.filter((session) => {
+  // Ownership checks above also protect retries of tool-free requests.
+  if (auxiliaryOnly && options.auxiliaryRetry && implicitSessions.includes(options.auxiliaryRetry.match)) return options.auxiliaryRetry;
+
+  const candidates = implicitSessions.filter((session) => {
     if (!inHostScope(session)) return false;
     if (isEnded(session)) return false;
     if (!historyContextMatches(session)) return false;
@@ -235,21 +293,26 @@ export function resolveSession(
   // Reuse native history only with both authenticated host ownership and an
   // exact user/assistant tail, followed by exactly one new user message. Neither
   // a summary-looking prompt nor a host ID alone can establish continuity.
+  // Healthy native checkpoints also accept queued text-only context after that
+  // exact pair. Retained checkpoints use their validated native proof when a
+  // failed request overwrote the last successful request fingerprint.
   // Tool-free auxiliary requests remain independent, even if they copy context.
-  const authenticatedTail = sessions.filter((session) => {
-      return hasAuthenticatedTail(session) && historyContextMatches(session)
+  const authenticatedTail = hostAllowsAnyTools(request) ? implicitSessions.filter((session) => {
+      return (hasAuthenticatedTail(session) || hasRetainedCheckpointTail(session) || hasHealthyCheckpointTail(session)) && historyContextMatches(session)
         // Identify a genuine model-switch continuation before rejecting busy
         // state; filtering it out would silently fork the native conversation.
         && (switchingModel(session) || canChangeReasoningLevel(session) || (session.state === "IDLE" && !session.cancelRequested && session.pendingToolIds.length === 0))
         && !isEnded(session);
-    });
+    }) : [];
   if (authenticatedTail.length > 1) throw ambiguous("multiple authenticated Factory transcripts match the retained turn; supply X-Bridge-Session");
   if (authenticatedTail[0]) {
     assertSelectedContext(authenticatedTail[0], canChangeHostThinking(authenticatedTail[0]) || canChangeReasoningLevel(authenticatedTail[0]));
-    return { match: authenticatedTail[0], reason: "authenticated-history-tail" };
+    return { match: authenticatedTail[0], reason: hasRetainedCheckpointTail(authenticatedTail[0])
+      ? "authenticated-retained-checkpoint-tail" : hasHealthyCheckpointTail(authenticatedTail[0])
+        ? "authenticated-healthy-checkpoint-tail" : "authenticated-history-tail" };
   }
 
-  const activeDuplicates = sessions.filter((session) => {
+  const activeDuplicates = implicitSessions.filter((session) => {
     if (!inHostScope(session)) return false;
     if (session.state !== "NEW" && session.state !== "GENERATING" && session.state !== "RESUMING") return false;
     if (session.contextHash && session.contextHash !== compatibleContextHash(session)) return false;
@@ -264,7 +327,7 @@ export function resolveSession(
   // Cursor can be handed the same completed tool-result body again a few seconds
   // later. That retry is not a new conversation. Claude keeps the old behavior.
   if (requestProvider === "cursor") {
-    const replays = sessions.filter((session) => {
+    const replays = implicitSessions.filter((session) => {
       if (!inHostScope(session) || isEnded(session) || !historyContextMatches(session)) return false;
       // Idle: the turn already finished. Waiting: the turn parked a tool and Droid
       // repeated that same request body. A busy generating session is not a replay.
@@ -309,6 +372,17 @@ function assertContext(session: SessionRecord, contextHash: string, headers: Hea
   if (legacyMismatch || (session.contextHash && session.contextHash !== contextHash)) {
     throw new BridgeError(409, "session_context_changed", "model, role, workspace or execution settings changed; start a new session");
   }
+}
+
+function verifiedRetainedSuffix(messages: Message[], receipts: readonly { toolUseId: string; resultSha256: string }[]): boolean {
+  const blocks = messages.flatMap(message => asBlocks(message.content));
+  const resultBlocks = blocks.filter(block => block.type === "tool_result");
+  const results = collectToolResults(messages);
+  return messages.every(message => message.role === "user")
+    && blocks.every(block => block.type === "text" || block.type === "tool_result")
+    && resultBlocks.every(block => "tool_use_id" in block && typeof block.tool_use_id === "string" && block.tool_use_id.length > 0)
+    && results.length === resultBlocks.length && new Set(results.map(result => result.tool_use_id)).size === results.length
+    && results.every(result => !result.is_error && matchesSettledHostResult(result, receipts));
 }
 
 function holdsToolId(ids: readonly string[] | undefined, toolUseId: string): boolean {

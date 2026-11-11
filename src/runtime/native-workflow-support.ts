@@ -39,6 +39,8 @@ export function assertNativeWorkflowSupport(): NativeWorkflowSupport {
     // the bridge process remains running. Never reuse an earlier verification.
     return Object.freeze({ executable, sdkVersion: sdk.version, cliVersion: sdk.claudeCodeVersion, sha256 });
   } catch (error) {
-    throw new BridgeError(503, "workflow_runtime_unverified", `Native workflows remain disabled: ${error instanceof Error ? error.message : "runtime verification failed"}`);
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    throw new BridgeError(503, "workflow_runtime_unverified", `Native workflows remain disabled: ${error instanceof Error ? error.message : "runtime verification failed"}`,
+      { runtime_missing: code === "ENOENT" || code === "MODULE_NOT_FOUND" });
   }
 }

@@ -1,6 +1,8 @@
 import type { ContentBlock, MessagesRequest, MessagesResponse, RoleTag } from "../types.js";
 import type { SessionRecord } from "../sessions/state.js";
 
+export interface NativeWorkstreamIdentity { workstreamId: string; role: "orchestrator" | "agent" }
+
 export interface RuntimeRequest {
   request: MessagesRequest;
   role: RoleTag;
@@ -9,7 +11,7 @@ export interface RuntimeRequest {
   /** Trusted host policy supplied by the controller, never raw Messages metadata. */
   factoryPermissionMode?: string;
   /** Bound by ControlBroker from its live opaque marker, never raw request metadata. */
-  factorySession?: { sessionId: string; cwd: string; launchId?: string; desktopLifecycle: boolean };
+  factorySession?: { sessionId: string; cwd: string; launchId?: string; desktopLifecycle: boolean; nativeWorkstream?: NativeWorkstreamIdentity };
   /** Trusted HTTP retry receipt. Prior results become reference history, never callbacks. */
   recovery?: "cold-import";
 }
@@ -23,6 +25,9 @@ export interface RuntimeTurn {
   sdkBillingUsage?: Record<string, unknown>;
   events?: RuntimeEvent[];
   notes?: string[];
+  /** The reconciliation-only native turn ended without dispatching new host work. */
+  reconciledHostOperationId?: string;
+  reconciledLineageOperationId?: string;
 }
 
 export interface StreamSink {
@@ -114,8 +119,12 @@ export interface BridgeRuntime {
   describe?(): Record<string, unknown>;
   protectedSessionIds?(): string[];
   isSessionUsable?(sessionId: string): boolean;
+  /** This process holds the session's current durable lease identity. */
+  ownsNativeSession?(sessionId: string): boolean;
   /** Retire a failed, side-effect-free native generation only after verified cleanup. */
   prepareColdRetry?(sessionId: string): Promise<void>;
+  /** Retire a clean upstream failure while retaining its exact native checkpoint. */
+  prepareCheckpointRetry?(sessionId: string, sdkSessionId: string): Promise<void>;
   /** Drop only inactive retained metadata after its durable session was pruned. */
   forget?(session: RetiredSession): Promise<void>;
   close?(): Promise<void>;

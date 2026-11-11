@@ -157,6 +157,9 @@ def parser():
         command.add_argument('--json', action='store_true')
         if name not in ('status', 'report'):
             command.add_argument('--profile', choices=sorted(auth.PROFILES))
+        if name == 'report':
+            command.add_argument('--max-running', type=int, choices=range(1, 9), metavar='1..8',
+                                 help="The worker-lane limit the bridge passes to the lease helper.")
     for name in ('show', 'cancel'):
         sub.add_parser(name).add_argument('job')
     check = sub.add_parser('check')
@@ -198,7 +201,7 @@ def main(argv=None):
             if args.command == 'status':
                 list_jobs(config)  # Reconcile with actual process identities first.
             from .reporting import report_jobs
-            emit(report_jobs(config.state_root))
+            emit(report_jobs(config.state_root, max_running=getattr(args, 'max_running', None)))
         elif args.command == 'show':
             from .telemetry import extract_usage
             job = get_job(config, args.job)

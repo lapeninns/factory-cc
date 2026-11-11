@@ -7,6 +7,7 @@ import time
 
 from .telemetry import extract_usage, _safe_path
 from .core import RuntimeRefused, matches, process_table
+from .supervisor import CONTROLLER_SLOTS, SUBSCRIPTION_PROFILES, execution_lane, occupies_compute
 
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 STATES = frozenset(("preparing", "queued", "waiting_slot", "starting", "running", "idle", "waiting_host", "completed", "failed", "cancelled", "interrupted", "cleanup_blocked", "orphaned", "unknown"))
@@ -125,7 +126,65 @@ def _cleanup_observation(job):
     return {"independentlyVerified": value if isinstance(value, bool) else None}
 
 
-def report_jobs(state_root, observe_processes=True):
+UNCERTAIN = frozenset(("unknown", "orphaned", "cleanup_blocked"))
+RECENT_ADMISSIONS = 50
+
+
+def _blocked_by_account(job, occupied):
+    """Mirror of the admission account rule, from recorded states only."""
+    if job.get("profile") == "factory-api":
+        return False
+    lane = execution_lane(job)
+    return any(item.get("profile") == job.get("profile")
+               and (execution_lane(item) == lane or item.get("state") in UNCERTAIN) for item in occupied)
+
+
+def capacity_view(jobs, max_running=None, at=None):
+    """Admission occupancy and queue delay derived from the shared lease ledger.
+
+    The worker-lane limit is the value the bridge passes to the lease helper.
+    It is not stored in the ledger, so it is reported only when supplied.
+    """
+    if max_running is not None and (isinstance(max_running, bool) or not isinstance(max_running, int)
+                                    or not 1 <= max_running <= 8):
+        raise RuntimeRefused("The worker-lane limit must be 1..8.")
+    at = time.time() if at is None else at
+    occupied = [job for job in jobs if occupies_compute(job)]
+    waiting = [job for job in jobs if job.get("state") == "waiting_slot"]
+    lanes = {}
+    for lane, limit in (("controller", CONTROLLER_SLOTS), ("worker", max_running)):
+        used = sum(execution_lane(job) == lane for job in occupied)
+        queued = [job for job in waiting if execution_lane(job) == lane]
+        lanes[lane] = {"limit": limit, "occupied": used, "free": None if limit is None else max(0, limit - used),
+                       "waiting": len(queued), "waitingBlockedByAccount": sum(_blocked_by_account(job, occupied) for job in queued)}
+    accounts = {}
+    for profile in sorted(SUBSCRIPTION_PROFILES, key=lambda name: int(name[4:])):
+        mine = [job for job in occupied if job.get("profile") == profile]
+        uncertain = sum(job.get("state") in UNCERTAIN for job in mine)
+        view = {"waiting": sum(job.get("profile") == profile for job in waiting), "uncertain": uncertain}
+        for lane in ("controller", "worker"):
+            busy = sum(execution_lane(job) == lane for job in mine)
+            view[lane + "Occupied"] = busy
+            view[lane + "Lane"] = "excluded_until_cleanup_verified" if uncertain else "busy" if busy else "free"
+        accounts[profile] = view
+    ages = [at - queued for queued in (_time(job.get("queuedAt")) for job in waiting) if queued is not None]
+    delays = []
+    for job in jobs:
+        queued, admitted = _time(job.get("queuedAt")), _time(job.get("admittedAt"))
+        if queued is not None and admitted is not None and admitted >= queued:
+            delays.append((admitted, admitted - queued))
+    recent = sorted(delay for _, delay in sorted(delays, reverse=True)[:RECENT_ADMISSIONS])
+    return {"source": "recorded lease states; the admission helper alone reconciles owner liveness",
+            "meaning": "admission capacity only; not service health, login, successful inference or remaining provider allowance",
+            "workerLimitSource": "supplied" if max_running is not None else "unknown: pass the lease helper's --max-running value",
+            "perAccountPerLane": 1, "lanes": lanes, "accounts": accounts,
+            "queue": {"waiting": len(waiting), "oldestWaitSeconds": round(max(ages), 3) if ages else None,
+                      "recentAdmissions": {"count": len(recent),
+                                           "medianDelaySeconds": round(recent[len(recent) // 2], 3) if recent else None,
+                                           "maxDelaySeconds": round(recent[-1], 3) if recent else None}}}
+
+
+def report_jobs(state_root, observe_processes=True, max_running=None):
     """Return current evidence without changing job, process or telemetry state."""
     root = Path(state_root)
     if not root.is_absolute():
@@ -149,10 +208,14 @@ def report_jobs(state_root, observe_processes=True):
             result["warnings"].append("Process identities could not be observed; liveness is unknown.")
     result["processSnapshotAvailable"] = table is not None
     paths = sorted((root / "jobs").glob("*.json"))
+    # Admission reads every retained record, so capacity does too; the cap below
+    # limits only the detailed job list.
+    records = [(path, _read_object(path, root)) for path in paths]
+    ledger = [job for _, job in records if job]
+    unreadable = len(records) - len(ledger)
     if len(paths) > 1000:
         result["warnings"].append("Job report limited to 1000 records.")
-    for path in paths[:1000]:
-        job = _read_object(path, root)
+    for path, job in records[:1000]:
         if not job or job.get("id") != path.stem or not NAME.fullmatch(path.stem):
             result["warnings"].append("Unreadable or invalid job record omitted.")
             continue
@@ -195,4 +258,11 @@ def report_jobs(state_root, observe_processes=True):
         if telemetry["tokens"] is not None:
             result["totals"]["reportedTokens"] += telemetry["tokens"]["total"]
             result["totals"]["jobsWithTokenEvidence"] += 1
+    if unreadable:
+        # An unreadable record may be an occupied or uncertain lease; never report its account as free.
+        result["capacity"] = {"complete": False, "unreadableRecords": unreadable, "records": len(records),
+                              "meaning": "occupancy cannot be established while a job record is unreadable",
+                              "lanes": None, "accounts": None, "queue": None}
+    else:
+        result["capacity"] = {"complete": True, "records": len(records), **capacity_view(ledger, max_running, now)}
     return result

@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildDynamicUserPrompt, buildDynamicUserContent, buildHostContext, buildInitialUserContent, buildPresetSystemPrompt, STABLE_DROID_APPEND } from "../../src/runtime/system-prompt.js";
+import { buildDynamicUserPrompt, buildDynamicUserContent, buildHostContext, buildInitialUserContent, buildPresetSystemPrompt, coldImportStats, STABLE_DROID_APPEND } from "../../src/runtime/system-prompt.js";
 import type { RuntimeRequest } from "../../src/runtime/types.js";
 
 function request(overrides: Partial<RuntimeRequest> = {}): RuntimeRequest {
@@ -171,6 +171,50 @@ describe("T3-style system prompt", () => {
     expect(content.some((block) => block.type === "image")).toBe(true);
     expect(content.some((block) => block.type === "tool_use" || block.type === "tool_result")).toBe(false);
     expect(JSON.stringify(content)).toContain("What port are we using?");
+  });
+
+  it("pairs imported tool calls with their results by id and marks unanswered or failed calls", () => {
+    const input = request();
+    input.request.messages = [
+      { role: "user", content: "write two files" },
+      { role: "assistant", content: [
+        { type: "tool_use", id: "first", name: "Write", input: { file_path: "/work/a" } },
+        { type: "tool_use", id: "second", name: "Write", input: { file_path: "/work/b" } },
+      ] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "first", content: "permission denied", is_error: true }] },
+      { role: "assistant", content: "One write failed and the other was interrupted." },
+      { role: "user", content: "continue" },
+    ];
+    const text = buildInitialUserContent(input, "/work").flatMap((block) => block.type === "text" && typeof block.text === "string" ? [block.text] : []);
+    expect(text).toContain('Historical tool call first Write: {"file_path":"/work/a"}');
+    expect(text).toContain("Historical tool result first (error):");
+    expect(text.find((line) => line.startsWith("Historical tool call second Write:"))).toMatch(/no result was recorded; its outcome is unknown/);
+    expect(coldImportStats(input.request.messages)).toEqual({ messages: 5, historyMessages: 4, images: 0, documents: 0, toolCalls: 2,
+      toolResults: 1, erroredToolResults: 1, unansweredToolCalls: 1, unmatchedToolResults: 0 });
+  });
+
+  it("pairs a call with its result when Droid returns the call id in its normalized form", () => {
+    const input = request();
+    const callId = "call-0b7f2c1e-1\nfc_9d3a6b40_0";
+    input.request.messages = [
+      { role: "user", content: "read the file" },
+      { role: "assistant", content: [{ type: "tool_use", id: callId, name: "Read", input: { file_path: "/work/a" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call-0b7f2c1e-1_fc_9d3a6b40_0", content: "contents" }] },
+      { role: "assistant", content: "Read it." },
+      { role: "user", content: "continue" },
+    ];
+    const text = buildInitialUserContent(input, "/work").flatMap((block) => block.type === "text" && typeof block.text === "string" ? [block.text] : []);
+    expect(text).toContain('Historical tool call call-0b7f2c1e-1_fc_9d3a6b40_0 Read: {"file_path":"/work/a"}');
+    expect(text).toContain("Historical tool result call-0b7f2c1e-1_fc_9d3a6b40_0:");
+    expect(text.join("\n")).not.toContain("no result was recorded");
+    expect(coldImportStats(input.request.messages)).toMatchObject({ toolCalls: 1, toolResults: 1, unansweredToolCalls: 0, unmatchedToolResults: 0 });
+  });
+
+  it("leaves a short first turn as the plain current message", () => {
+    const input = request();
+    input.request.messages = [{ role: "user", content: "hello" }];
+    expect(buildInitialUserContent(input, "/work")).toEqual(buildDynamicUserContent(input, "/work"));
+    expect(coldImportStats(input.request.messages)).toMatchObject({ messages: 1, historyMessages: 0, toolCalls: 0 });
   });
 
   it("delivers every user message after the last reply, including a prompt Droid follows with a reminder", () => {

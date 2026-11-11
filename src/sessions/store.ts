@@ -42,6 +42,7 @@ export class SessionStore {
     role: RoleTag;
     model: string;
     provider?: ModelProvider;
+    nativePurpose?: SessionRecord["nativePurpose"];
     claudeAccount?: string;
     nativeGeneration?: number;
     controllerWorkspacePolicy?: SessionRecord["controllerWorkspacePolicy"];
@@ -61,6 +62,7 @@ export class SessionStore {
       state: "NEW",
       model: input.model,
       ...(input.provider ? { provider: input.provider } : {}),
+      ...(input.nativePurpose ? { nativePurpose: input.nativePurpose } : {}),
       ...(input.claudeAccount ? { claudeAccount: input.claudeAccount } : {}),
       ...(input.nativeGeneration === undefined ? {} : { nativeGeneration: input.nativeGeneration }),
       ...(input.controllerWorkspacePolicy === undefined ? {} : { controllerWorkspacePolicy: input.controllerWorkspacePolicy }),
@@ -91,13 +93,34 @@ export class SessionStore {
   }
 
   update(id: string, patch: Partial<SessionRecord>): SessionRecord {
+    return this.applyUpdate(id, patch);
+  }
+
+  /** Roll back only changes that have not reached the authoritative journal. */
+  updateAtomic(id: string, patch: Partial<SessionRecord>): SessionRecord {
     const record = this.require(id);
+    const before = structuredClone(record);
+    let committed = false;
+    try { return this.applyUpdate(id, patch, () => { committed = true; }); }
+    catch (error) {
+      if (!committed) {
+        for (const key of Object.keys(record)) delete (record as unknown as Record<string, unknown>)[key];
+        Object.assign(record, before);
+      }
+      throw error;
+    }
+  }
+
+  private applyUpdate(id: string, patch: Partial<SessionRecord>, committed?: () => void): SessionRecord {
+    const record = this.require(id);
+    // Restoring an earlier request snapshot must not demote an admitted owner.
+    const purpose = record.nativePurpose === "interactive" ? "interactive" : patch.nativePurpose ?? record.nativePurpose;
     if (patch.state && !isActive(record.state) && isActive(patch.state)) this.requireCapacity();
-    Object.assign(record, patch, { updatedAt: new Date().toISOString() });
+    Object.assign(record, patch, { updatedAt: new Date().toISOString(), ...(purpose ? { nativePurpose: purpose } : {}) });
     // A host ending (hostEnded) ends the session just as a terminal state does.
     retirePendingTools(record);
     this.sessions.set(id, record);
-    this.flush(record);
+    this.flush(record, committed);
     return record;
   }
 
@@ -163,7 +186,10 @@ export class SessionStore {
 
   /** Never prune active work, callbacks, or a session pinned by the HTTP/control layer. */
   prune(protectedIds: ReadonlySet<string> = new Set(), now = Date.now()): string[] {
-    const eligible = this.list().filter((record) => !protectedIds.has(record.bridgeSessionId) && !isActive(record.state) && !record.pendingToolIds.length)
+    const lineageReferences = new Set(this.list().flatMap(record => record.nativeLineageSelection
+      ? [record.bridgeSessionId, ...record.nativeLineageSelection.scopeInventory.map(item => item.bridgeSessionId)] : []));
+    const eligible = this.list().filter((record) => !protectedIds.has(record.bridgeSessionId) && !lineageReferences.has(record.bridgeSessionId) && !isActive(record.state) && !record.pendingToolIds.length
+      && !Object.values(record.accountCooldowns ?? {}).some(until => Date.parse(until) > now))
       .sort((a, b) => Date.parse(a.updatedAt) - Date.parse(b.updatedAt));
     const removed: string[] = [];
     for (const record of eligible) {
@@ -175,11 +201,22 @@ export class SessionStore {
     return removed;
   }
 
-  private flush(record: SessionRecord): void {
+  private flush(record: SessionRecord, committed?: () => void): void {
     record.notes = record.notes.slice(-128);
-    if (!this.persist) return;
-    this.terminateLastLine();
-    appendFileSync(this.file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    if (!this.persist) { committed?.(); return; }
+    if (committed) {
+      let previous: Buffer;
+      try { previous = readFileSync(this.file); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        previous = Buffer.alloc(0);
+      }
+      const separator = previous.length && previous.at(-1) !== 0x0a ? Buffer.from("\n") : Buffer.alloc(0);
+      atomicWrite(this.file, Buffer.concat([previous, separator, Buffer.from(`${JSON.stringify(record)}\n`)]), committed);
+    } else {
+      this.terminateLastLine();
+      appendFileSync(this.file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    }
     this.writes++;
     if (this.writes >= 256 || statSync(this.file).size >= this.retention.journalMaxBytes) this.compact();
     else this.snapshot();
@@ -259,11 +296,16 @@ export class SessionStore {
 }
 
 /** Write a private file that readers see either complete or not at all. */
-function atomicWrite(path: string, data: string): void {
+function atomicWrite(path: string, data: string | Buffer, committed?: () => void): void {
   const temporary = `${path}.${randomUUID()}.tmp`;
   try {
     writeFileSync(temporary, data, { mode: 0o600, flag: "wx" });
+    if (committed) {
+      const fd = openSync(temporary, "r");
+      try { fsyncSync(fd); } finally { closeSync(fd); }
+    }
     renameSync(temporary, path);
+    committed?.();
   } finally {
     rmSync(temporary, { force: true });
   }

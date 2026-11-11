@@ -1,4 +1,4 @@
-import { asBlocks, systemText, textFromBlocks } from "../protocol/content.js";
+import { asBlocks, canonicalToolUseId, systemText, textFromBlocks } from "../protocol/content.js";
 import type { RuntimeRequest } from "./types.js";
 import { orchestratorAppendix, roleAppendix } from "./mission-tools.js";
 import { BridgeError, type ContentBlock } from "../types.js";
@@ -26,11 +26,11 @@ export interface PresetSystemPrompt {
   append: string;
 }
 
-export function buildPresetSystemPrompt(desktopProfile = false, nativeWorkflows = false): PresetSystemPrompt {
+export function buildPresetSystemPrompt(desktopProfile = false, nativeWorkflows = false, factoryNative = false): PresetSystemPrompt {
   return {
     type: "preset",
     preset: "claude_code",
-    append: STABLE_DROID_APPEND + (nativeWorkflows ? " Explicit API workflow mode: native Workflow may orchestrate bounded local children after approval. Native Agent/Task registries and all native side effects remain forbidden. Children must use the advertised Factory MCP tools for all mutations and Factory-owned operations, and must respect the current Factory mode. Native reads remain limited to the current host-authorized equivalents. Do not request remote execution, named workflows or script-path workflows." : "") + (desktopProfile ? (nativeWorkflows ? " Desktop profile: native Workflow is the approved orchestration exception; all mutations and Factory-owned operations use the advertised mcp__droid__ tools. Droid owns approvals and spec mode." : " Desktop profile: all changes, commands, background jobs, planning approvals and subagents MUST use the advertised mcp__droid__ tools. Droid owns approvals and autonomy, including spec mode. Native tools are read-only and may be denied; never work around that denial.") : ""),
+    append: (factoryNative ? "Factory owns this session, all tool execution, skills, approvals, Workstream agents and subagents. This bridge supplies the model connection only. Use advertised mcp__droid__ tools for every operation, including reads. Never execute Claude Code built-in tools or start native Claude agents, workflows or workers. Use Factory SpawnAgent for Workstream agents and Factory Task for custom Droid subagents when advertised. Follow Factory system instructions and return host actions to Factory for execution." : STABLE_DROID_APPEND) + (nativeWorkflows ? " Explicit API workflow mode: native Workflow may orchestrate bounded local children after approval. Native Agent/Task registries and all native side effects remain forbidden. Children must use the advertised Factory MCP tools for all mutations and Factory-owned operations, and must respect the current Factory mode. Native reads remain limited to the current host-authorized equivalents. Do not request remote execution, named workflows or script-path workflows." : "") + (desktopProfile && !factoryNative ? (nativeWorkflows ? " Desktop profile: native Workflow is the approved orchestration exception; all mutations and Factory-owned operations use the advertised mcp__droid__ tools. Droid owns approvals and spec mode." : " Desktop profile: all changes, commands, background jobs, planning approvals and subagents MUST use the advertised mcp__droid__ tools. Droid owns approvals and autonomy, including spec mode. Native tools are read-only and may be denied; never work around that denial.") : ""),
   };
 }
 
@@ -50,7 +50,7 @@ export function buildWorkspaceAppendix(cwd: string, missionDir?: string): string
 }
 
 /** This context belongs in user input, never in the native system/tool prefix. */
-export function buildHostContext(input: RuntimeRequest, cwd?: string): string {
+export function buildHostContext(input: RuntimeRequest, cwd?: string, factoryNative = false): string {
   const host = systemText(input.request.system);
   const header = input.headers["x-bridge-mission-dir"];
   const missionDir = Array.isArray(header) ? header[0] : header;
@@ -65,7 +65,7 @@ export function buildHostContext(input: RuntimeRequest, cwd?: string): string {
     ];
   return [
     ...roleContext,
-    `Allowed native tool equivalents for this host request: ${allowedNativeToolNames(input.request, input.factoryPermissionMode).join(", ") || "none"}. All other advertised host tools execute through the current Factory MCP catalog. Native Agent, Task, Skill and unrelated plugin tools do not inherit Factory registry authority.`,
+    `Allowed native tool equivalents for this host request: ${factoryNative ? "none" : allowedNativeToolNames(input.request, input.factoryPermissionMode).join(", ") || "none"}. All other advertised host tools execute through the current Factory MCP catalog. Native Agent, Task, Skill and unrelated plugin tools do not inherit Factory registry authority.`,
     cwd ? buildWorkspaceAppendix(cwd, missionDir) : "",
   ]
     .filter(Boolean)
@@ -97,10 +97,10 @@ export function trailingUserMessages(messages: RuntimeRequest["request"]["messag
 export function buildDynamicUserContent(
   input: RuntimeRequest,
   cwd?: string,
-  options: { includeContext?: boolean } = {},
+  options: { includeContext?: boolean; factoryNative?: boolean } = {},
 ): ContentBlock[] {
   const blocks = trailingUserMessages(input.request.messages).flatMap((message) => userBlocks(message.content));
-  const context = options.includeContext === false ? "" : buildHostContext(input, cwd);
+  const context = options.includeContext === false ? "" : buildHostContext(input, cwd, options.factoryNative);
   if (!context) return blocks;
   // Claude Code recognizes native slash commands only in the last text block.
   // Preserve that protocol when the host context is introduced or changes.
@@ -115,10 +115,12 @@ export function buildDynamicUserContent(
  * Cold imports have no native session to resume. Preserve their supplied history as
  * reference material, not executable tool messages or a fabricated SDK transcript.
  */
-export function buildInitialUserContent(input: RuntimeRequest, cwd?: string): ContentBlock[] {
+export function buildInitialUserContent(input: RuntimeRequest, cwd?: string, factoryNative = false): ContentBlock[] {
   const messages = input.request.messages;
   const current = messages.length - trailingUserMessages(messages).length;
-  if (current === 0) return buildDynamicUserContent(input, cwd);
+  if (current === 0) return buildDynamicUserContent(input, cwd, { factoryNative });
+  const answered = new Set(messages.flatMap((message) => asBlocks(message.content))
+    .flatMap((block) => block.type === "tool_result" && typeof block.tool_use_id === "string" ? [canonicalToolUseId(block.tool_use_id)] : []));
   const blocks: ContentBlock[] = [{
     type: "text",
     text: "Imported conversation history follows as reference context. Previous tool calls are historical records, not requests to execute them again. The final user messages are the current task.",
@@ -130,10 +132,13 @@ export function buildInitialUserContent(input: RuntimeRequest, cwd?: string): Co
       if (block.type === "text" || block.type === "image" || block.type === "document") {
         blocks.push(...userBlocks([block]));
       } else if (block.type === "tool_result") {
-        blocks.push({ type: "text", text: `Historical tool result ${block.tool_use_id}:` });
+        blocks.push({ type: "text", text: `Historical tool result ${block.tool_use_id}${block.is_error ? " (error)" : ""}:` });
         blocks.push(...userBlocks((block.content as string | ContentBlock[] | undefined) ?? ""));
       } else if (block.type === "tool_use") {
-        blocks.push({ type: "text", text: `Historical tool call ${block.name}: ${JSON.stringify(block.input)}` });
+        // The id pairs a call with its result, in the form Droid echoes. A call without one may or may not have run.
+        const id = canonicalToolUseId(String(block.id));
+        const outcome = answered.has(id) ? "" : " (no result was recorded; its outcome is unknown, so check the current state instead of repeating it)";
+        blocks.push({ type: "text", text: `Historical tool call ${id} ${block.name}: ${JSON.stringify(block.input)}${outcome}` });
       } else {
         // Signed thinking cannot be recreated in a different provider/session.
         blocks.push({ type: "text", text: `[Prior ${block.type} block omitted from the imported reference.]` });
@@ -144,12 +149,44 @@ export function buildInitialUserContent(input: RuntimeRequest, cwd?: string): Co
   // (an interrupted tool call); keep them as reference rather than dropping them.
   for (const block of messages.slice(current).flatMap((message) => asBlocks(message.content))) {
     if (block.type !== "tool_result") continue;
-    blocks.push({ type: "text", text: `Historical tool result ${block.tool_use_id}:` });
+    blocks.push({ type: "text", text: `Historical tool result ${block.tool_use_id}${block.is_error ? " (error)" : ""}:` });
     blocks.push(...userBlocks((block.content as string | ContentBlock[] | undefined) ?? ""));
   }
   blocks.push({ type: "text", text: "Current user message:" });
-  blocks.push(...buildDynamicUserContent(input, cwd));
+  blocks.push(...buildDynamicUserContent(input, cwd, { factoryNative }));
   return blocks;
+}
+
+/** Counts describing a cold import. Never carries message content. */
+export interface ColdImportStats {
+  messages: number;
+  historyMessages: number;
+  images: number;
+  documents: number;
+  toolCalls: number;
+  toolResults: number;
+  erroredToolResults: number;
+  unansweredToolCalls: number;
+  unmatchedToolResults: number;
+}
+
+export function coldImportStats(messages: RuntimeRequest["request"]["messages"]): ColdImportStats {
+  const blocks = messages.flatMap((message) => asBlocks(message.content));
+  const nested = blocks.flatMap((block) => block.type === "tool_result" && Array.isArray(block.content) ? block.content as ContentBlock[] : []);
+  const calls = new Set(blocks.flatMap((block) => block.type === "tool_use" ? [canonicalToolUseId(String(block.id))] : []));
+  const results = blocks.flatMap((block) => block.type === "tool_result" ? [block] : []);
+  const answered = new Set(results.map((block) => canonicalToolUseId(String(block.tool_use_id))));
+  return {
+    messages: messages.length,
+    historyMessages: messages.length - trailingUserMessages(messages).length,
+    images: [...blocks, ...nested].filter((block) => block.type === "image").length,
+    documents: [...blocks, ...nested].filter((block) => block.type === "document").length,
+    toolCalls: calls.size,
+    toolResults: results.length,
+    erroredToolResults: results.filter((block) => block.is_error === true).length,
+    unansweredToolCalls: [...calls].filter((id) => !answered.has(id)).length,
+    unmatchedToolResults: [...answered].filter((id) => !calls.has(id)).length,
+  };
 }
 
 /** Text-only compatibility helper for diagnostics and mock fixtures. */

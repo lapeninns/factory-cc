@@ -19,7 +19,7 @@ import { appendLogLine, type Logger } from "../logging.js";
 import { claudeToolTraceDetail, isDroidMcpName, selectDroidMcpTools } from "./droid-tools.js";
 import { DroidMcpCatalog, StableDroidToolNames } from "./droid-mcp-catalog.js";
 import { hostAllowsAnyTools, nativeToolAllowed } from "./native-tool-policy.js";
-import { buildDynamicUserContent, buildHostContext, buildInitialUserContent, buildPresetSystemPrompt, describePromptLayout, trailingUserMessages } from "./system-prompt.js";
+import { buildDynamicUserContent, buildHostContext, buildInitialUserContent, buildPresetSystemPrompt, coldImportStats, describePromptLayout, trailingUserMessages, type ColdImportStats } from "./system-prompt.js";
 import { UsageLedger } from "./usage.js";
 import { INTERRUPT_GRACE_MS, TurnWatchdog } from "./turn-watchdog.js";
 import type { BridgeRuntime, RuntimeApprovalRequest, RuntimeControl, RuntimeEvent, RuntimeHostCall, RuntimeHostCompletion, RuntimeHostEnd, RuntimePermissionDecision, RuntimeRequest, RuntimeTurn, StreamSink } from "./types.js";
@@ -33,6 +33,7 @@ import { OwnedProcesses } from "./owned-processes.js";
 import { hostActionNeedsWorkspaceReservation } from "./desktop-jobs.js";
 import { upstreamError } from "./upstream-error.js";
 import { redactValue } from "../security/redact.js";
+import { historicalHostResult, hostReceiptContent, matchesSettledHostResult, mcpResultContent as mcpContent, RECOVERY_ONLY_DENIAL, recoveredHostContext, lineageReconciliationContext } from "./host-recovery.js";
 
 type ModelRoute = ReturnType<typeof resolveRequestModel>;
 
@@ -175,6 +176,8 @@ interface LiveSdk {
   hostResultConsumptions: Map<string, HostResultConsumption>;
   hostCompletionFingerprints: Map<string, string>;
   recordedHostCompletions: Map<string, RuntimeHostCompletion>;
+  /** Historical successes may suppress exact replays only during the recovery turn. */
+  recoveryReceipts?: RuntimeHostCompletion[];
   approvals: Set<AbortController>;
   desktopApprovals: Map<string, DesktopApprovalReceipt>;
   hostEnding?: string;
@@ -197,7 +200,24 @@ interface LiveSdk {
   windDown?: () => void;
   /** Wind down the previous native response before delivering queued user input. */
   turnHandoff?: TurnHandoff;
+  /** Lifecycle position of the current request, kept for the terminal failure record. */
+  phase?: "startup" | "prompted" | "continuation" | "responding" | "waiting_host";
+  queryStartedAt?: number;
+  /** Counts only. Present while the current request is a cold import. */
+  importStats?: ColdImportStats & { contentBytes?: number };
+  /** Allowlisted SDK failure fields of the current request. Never message text. */
+  failure?: SdkFailure;
 }
+
+interface SdkFailure { terminalReason?: string; apiErrorStatus?: number; resultSubtype?: string; assistantError?: string }
+
+const TERMINAL_REASONS = new Set(["blocking_limit", "rapid_refill_breaker", "prompt_too_long", "image_error", "model_error", "api_error",
+  "malformed_tool_use_exhausted", "aborted_streaming", "aborted_tools", "stop_hook_prevented", "hook_stopped", "tool_deferred", "max_turns",
+  "background_requested", "completed", "budget_exhausted", "structured_output_retry_exhausted", "tool_deferred_unavailable", "turn_setup_failed"]);
+const ASSISTANT_ERRORS = new Set(["authentication_failed", "oauth_org_not_allowed", "account_on_hold", "verification_required", "billing_error",
+  "rate_limit", "overloaded", "invalid_request", "model_not_found", "server_error", "unknown", "max_output_tokens", "cloud_credential_error"]);
+/** Claude Code's fixed text for an over-window prompt, used by producers without terminal_reason. */
+const PROMPT_TOO_LONG_TEXT = /^Prompt is too long\b/;
 
 /**
  * The HTTP layer enforces the idle and maximum limits and interrupts cleanly
@@ -462,7 +482,45 @@ export class SdkRuntime implements BridgeRuntime {
       const earlier = live.pending.size ? collectToolResults(input.request.messages
         .slice(0, input.request.messages.length - trailing.length).filter((message) => message.role === "user"))
         .filter((result) => live.pending.has(result.tool_use_id)) : [];
-      let results = [...earlier, ...latestToolResults(input, live.active || live.pending.size > 0)];
+      const retained = input.session.retainedCheckpoint;
+      const retainedResume = Boolean(retained && input.session.retryableRequestKind === "native-upstream"
+        && retained.sdkSessionId === input.session.sdkSessionId && retained.account === input.session.claudeAccount
+        && live.sdkSessionId === retained.sdkSessionId && !live.query && !live.active && !live.pending.size && !live.sentUserTurns);
+      let results = [...earlier, ...latestToolResults(input, live.active || live.pending.size > 0 || retainedResume)];
+      const lineage = input.session.pendingLineageReconciliation ? input.session.nativeLineageSelection : undefined;
+      if (input.session.pendingLineageReconciliation && (!lineage || lineage.operationId !== input.session.pendingLineageReconciliation)) {
+        throw new BridgeError(409, "lineage_reconciliation_missing", "The selected lineage outcomes are unavailable.");
+      }
+      if (lineage) {
+        if (live.active || live.pending.size) throw new BridgeError(409, "lineage_reconciliation_busy", "Native work must settle before lineage reconciliation.");
+        live.recoveryReceipts = [];
+        const rawResults = trailing.flatMap(message => asBlocks(message.content)).filter(block => block.type === "tool_result");
+        if (rawResults.some(block => !("tool_use_id" in block) || typeof block.tool_use_id !== "string" || !block.tool_use_id)
+            || new Set(results.map(result => result.tool_use_id)).size !== results.length
+            || rawResults.length !== results.length) throw new BridgeError(409, "conflicting_settled_result", "Cross-lineage result identities are incomplete or ambiguous.");
+        const settled = lineage.sources.length ? lineage.sources.flatMap(source => source.checkpoint.settledToolResults)
+          : retainedResume ? retained?.settledToolResults ?? [] : [];
+        results = results.filter(result => {
+          if (!matchesSettledHostResult(result, settled)) throw new BridgeError(409, "conflicting_settled_result", "A cross-lineage result is not proven by the selection audit.");
+          return false;
+        });
+      }
+      const recovery = input.session.pendingHostRecovery;
+      const recovered = recovery && input.session.completedHostRecoveries?.find(item => item.operationId === recovery.operationId);
+      if (recovery && !recovered) throw new BridgeError(409, "recovery_receipt_missing", "The recovered host actions are unavailable; do not replay them.");
+      if (recovered && !recovery.notified && !live.active && !live.pending.size) {
+        live.recoveryReceipts = structuredClone(recovered.receipts);
+        const settled = new Set(recovered.receipts.map(receipt => receipt.toolUseId));
+        results = results.filter(result => !settled.has(result.tool_use_id));
+      }
+      if (retainedResume && retained?.settledToolResults?.length) {
+        results = results.filter(result => {
+          const settled = retained.settledToolResults!.find(item => item.toolUseId === result.tool_use_id);
+          if (!settled) return true;
+          if (!matchesSettledHostResult(result, retained.settledToolResults!)) throw new BridgeError(409, "conflicting_settled_result", "A previously consumed tool result changed.");
+          return false;
+        });
+      }
       // Hook receipts are authenticated independently of a model continuation.
       // Their representation may differ from Droid's display wrapper. Deliver
       // the recorded content once, under this phase's admission permit.
@@ -500,7 +558,7 @@ export class SdkRuntime implements BridgeRuntime {
       }
       if (modelRoute) await this.selectModel(live, modelRoute, results.length > 0);
       await this.selectReasoning(live, input, results.length > 0);
-      const context = buildHostContext(input, resolveCwd(input, this.config));
+      const context = buildHostContext(input, resolveCwd(input, this.config), this.config.factoryNative);
       // A cancellation or an assistant separator ends Droid's previous response.
       // Keep subsequent user input separate from the completed tool result.
       const cancelled = results.some((result) => isUserCancellation(result) && !live.resultFingerprints.has(result.tool_use_id));
@@ -517,6 +575,9 @@ export class SdkRuntime implements BridgeRuntime {
       if (continuation.length) mcpContent(continuation);
       live.current = input;
       live.nativeCallsThisRequest = false;
+      live.failure = undefined;
+      live.importStats = undefined;
+      live.phase = results.length ? "continuation" : live.phase;
       waiting = this.waitForTurn(live);
       // Attach rejection handling before startup awaits, including startup timeouts.
       void waiting.catch(() => undefined);
@@ -535,12 +596,18 @@ export class SdkRuntime implements BridgeRuntime {
         const coldImport = !live.sentUserTurns && !live.sdkSessionId;
         const queryReused = Boolean(live.query);
         live.active = true;
+        live.importStats = coldImport && trailingUserMessages(input.request.messages).length < input.request.messages.length
+          ? coldImportStats(input.request.messages) : undefined;
         if (!live.query) await this.startQuery(input, live);
         if (live.terminal) throw live.terminal;
         const cwd = resolveCwd(input, this.config);
         const content = coldImport
-          ? buildInitialUserContent(input, cwd)
-          : buildDynamicUserContent(input, cwd, { includeContext: live.lastHostContext !== context });
+          ? buildInitialUserContent(input, cwd, this.config.factoryNative)
+          : buildDynamicUserContent(input, cwd, { includeContext: live.lastHostContext !== context, factoryNative: this.config.factoryNative });
+        if (lineage) content.push({ type: "text", text: lineageReconciliationContext(lineage) });
+        if (recovered && !recovery.notified) content.push({ type: "text", text: recoveredHostContext(recovered.receipts) });
+        if (live.importStats) live.importStats.contentBytes = Buffer.byteLength(JSON.stringify(content));
+        live.phase = "prompted";
         live.lastHostContext = context;
         live.sentUserTurns++;
         live.inputs.push({
@@ -551,11 +618,19 @@ export class SdkRuntime implements BridgeRuntime {
           importedMessages: coldImport ? input.request.messages.length : 0, contentBytes: Buffer.byteLength(JSON.stringify(content)), preparationMs: Date.now() - preparationStarted });
       }
       const reply = await waiting;
+      if (!reply.pendingToolIds.length) {
+        if (recovered) reply.reconciledHostOperationId = recovered.operationId;
+        if (lineage && reply.response.stop_reason === "end_turn") reply.reconciledLineageOperationId = lineage.operationId;
+        live.recoveryReceipts = undefined;
+      }
       live.lastRequestKey = requestKey;
       live.lastReply = reply;
       return reply;
     } catch (error) {
-      if (waiting) await this.stop(live, this.sdkError(error));
+      if (waiting) {
+        live.recoveryReceipts = undefined;
+        await this.stop(live, this.sdkError(error));
+      }
       throw live.terminal ?? this.sdkError(error);
     } finally {
       live.busy = false;
@@ -607,6 +682,17 @@ export class SdkRuntime implements BridgeRuntime {
   }
 
   async prepareColdRetry(sessionId: string): Promise<void> {
+    return this.prepareRetry(sessionId);
+  }
+
+  async prepareCheckpointRetry(sessionId: string, sdkSessionId: string): Promise<void> {
+    if (!this.config.persistSessions || this.lives.get(sessionId)?.sdkSessionId !== sdkSessionId) {
+      throw new BridgeError(409, "native_checkpoint_mismatch", "The failed query does not own the retained native checkpoint.");
+    }
+    return this.prepareRetry(sessionId);
+  }
+
+  private async prepareRetry(sessionId: string): Promise<void> {
     const live = this.lives.get(sessionId);
     if (!live?.terminal) {
       throw new BridgeError(409, "native_retry_unsafe", "This native generation is not safe to import as history.");
@@ -740,7 +826,7 @@ export class SdkRuntime implements BridgeRuntime {
     const blocks = trailingUserMessages(input.request.messages).flatMap((message) => asBlocks(message.content)).filter((block) => block.type !== "tool_result");
     if (!blocks.length) return [];
     return buildDynamicUserContent({ ...input, request: { ...input.request, messages: [{ role: "user", content: blocks }] } },
-      resolveCwd(input, this.config), { includeContext: context !== live.lastHostContext });
+      resolveCwd(input, this.config), { includeContext: context !== live.lastHostContext, factoryNative: this.config.factoryNative });
   }
 
   private submitResults(live: LiveSdk, results: DroidResult[], continuation: ContentBlock[] = [], handoff?: TurnHandoff): Array<"accepted" | "duplicate"> {
@@ -786,7 +872,7 @@ export class SdkRuntime implements BridgeRuntime {
   private async updateCatalog(live: LiveSdk, input: RuntimeRequest): Promise<void> {
     const started = Date.now();
     if (!live.catalog) throw new BridgeError(503, "dynamic_tools_unavailable", "The live SDK session has no mutable Droid MCP catalog");
-    if (await live.catalog.update(selectDroidMcpTools(input.request.tools, this.config.desktopProfile)
+    if (await live.catalog.update(selectDroidMcpTools(input.request.tools, this.config.desktopProfile, this.config.factoryNative)
       .filter((tool) => controllerHostToolAllowed(this.config, tool.name)))) {
       await this.waitForCatalogVisibility(live);
       live.events.push({ at: now(), type: "droid_catalog_updated", data: {
@@ -824,6 +910,8 @@ export class SdkRuntime implements BridgeRuntime {
     if (live.retiring) await live.retiring;
     // Reserve synchronously, before capacity eviction or SDK import can yield.
     live.starting = true;
+    live.phase = "startup";
+    live.queryStartedAt = Date.now();
     try {
       await this.ensureQueryCapacity(live);
       if (live.terminal || this.closing) throw live.terminal ?? new BridgeError(503, "bridge_shutting_down", "Bridge is shutting down");
@@ -915,7 +1003,7 @@ export class SdkRuntime implements BridgeRuntime {
     const selection = route ? route.selection : await this.ensureSelection();
     if (selection) this.selection = selection;
     if (live.terminal) throw live.terminal;
-    const droidTools = (input.request.tools !== undefined ? selectDroidMcpTools(input.request.tools, this.config.desktopProfile) : live.catalog?.definitions() ?? [])
+    const droidTools = (input.request.tools !== undefined ? selectDroidMcpTools(input.request.tools, this.config.desktopProfile, this.config.factoryNative) : live.catalog?.definitions() ?? [])
       .filter((tool) => controllerHostToolAllowed(this.config, tool.name));
     const names = live.names ?? new StableDroidToolNames();
     live.names = names;
@@ -948,6 +1036,19 @@ export class SdkRuntime implements BridgeRuntime {
           if (live.retiredCandidates.has(call.id)) throw new BridgeError(409, "sdk_tool_rejected", "The native SDK already completed this tool invocation");
           if (!controllerHostToolAllowed(this.config, original)) throw new BridgeError(403, "controller_tool_denied", "The read-only Factory controller cannot invoke this tool.");
           if (!live.catalog?.has(original)) throw new BridgeError(409, "tool_not_advertised", `Droid no longer advertises ${original}`);
+          if (live.recoveryReceipts) {
+            const recovered = live.recoveryReceipts.find(receipt => receipt.toolName === original
+              && canonicalJson(receipt.input) === canonicalJson(call.input));
+            const content: ContentBlock[] = recovered ? historicalHostResult(recovered) : [{ type: "text", text: RECOVERY_ONLY_DENIAL }];
+            live.events.push({ at: now(), type: recovered ? "recovered_host_receipt" : "recovery_action_denied",
+              data: { ...(recovered ? { originalToolUseId: recovered.toolUseId } : {}), toolUseId: call.id, toolName: original } });
+            // Complete the local callback through normal mailbox bookkeeping.
+            // Nothing is published to Factory, including for a reformulated action.
+            live.mailbox.registerCall({ callId: call.id, originalName: original, mcpName: mcpName ?? names.toMcp(original), input: call.input });
+            this.submitResults(live, [{ tool_use_id: call.id, content, is_error: !recovered }]);
+            await live.mailbox.wait(call.id, this.config.toolWaitMs);
+            return { content: mcpContent(content), isError: !recovered };
+          }
           if (this.config.controllerHostTools && controllerHostAction(original, this.config)) {
             // Preserve the exact reviewed action even if a caller retains and
             // mutates its input object while the human question is pending.
@@ -1037,9 +1138,11 @@ export class SdkRuntime implements BridgeRuntime {
       allowedTools: ["mcp__droid__*"],
       env, permissionMode: this.config.desktopProfile || this.config.permissionMode === "ask" ? "default" : "bypassPermissions",
       allowDangerouslySkipPermissions: !this.config.desktopProfile && this.config.permissionMode !== "ask", abortController: abort,
-      systemPrompt: { ...buildPresetSystemPrompt(this.config.desktopProfile, this.config.nativeWorkflows),
-        append: buildPresetSystemPrompt(this.config.desktopProfile, this.config.nativeWorkflows).append + desktopJobPolicy(this.config)
-          + (this.config.controllerHostTools
+      systemPrompt: { ...buildPresetSystemPrompt(this.config.desktopProfile, this.config.nativeWorkflows, this.config.factoryNative),
+        append: buildPresetSystemPrompt(this.config.desktopProfile, this.config.nativeWorkflows, this.config.factoryNative).append + (this.config.factoryNative ? "" : desktopJobPolicy(this.config))
+          + (this.config.factoryNative
+            ? "\nUse Factory SpawnAgent, SendMessage, ListAgents and InterruptAgent for native Workstream coordination, and Factory Task for custom Droid subagents when advertised. All actual tools run in Factory. Never delegate through factory_worker_start or other bridge worker tools. Each native Droid agent must use the configured bridge-backed custom model; never assume model inheritance or silently select a hosted model. Report blocked model configuration to the user. Give concurrent writers separate ownership and follow Factory instructions for workspaces and integration."
+            : this.config.controllerHostTools
             ? "\nThis Factory controller supports ordinary folders and repositories. Use the allowed host read tools for inspection. "
               + (this.config.controllerApprovalPolicy === "bypass"
                 ? "The operator disabled this bridge's extra confirmation for Factory Execute, Create and Edit. Use those advertised host tools within the user's task scope; Factory's own permissions still apply. "
@@ -1054,12 +1157,12 @@ export class SdkRuntime implements BridgeRuntime {
               + "For an ordinary folder or a workspace the worker cannot isolate, use authorized Factory host tools. Keep all actions within the user's task and current Factory permission mode."
             : this.config.controllerReadOnly ? "\nThis Factory controller is read-only. Inspect with the allowed read tools, discover only allowed tools with ToolSearch, and use AskUser for essential missing information or new permissions. Delegate all implementation to the configured supervised worker tools. Never use Execute, Create, Edit, Task, SpawnAgent, unrelated MCP tools or native side effects." : "")
           + (this.config.desktopProfile || this.config.desktopJobs ? "\n\n" + WORKSTREAM_DECISION_POLICY
-            + "\nWhen a worker returns a blocked handoff, its completed attempt does not complete the user task. Collect essential answers or new permissions with AskUser and provide the actual answer in a new worker assignment." : "") },
+            + (this.config.factoryNative ? "\nUse Factory native messaging to steer agents and collect blocked handoffs; a finished agent turn does not by itself complete the user task." : "\nWhen a worker returns a blocked handoff, its completed attempt does not complete the user task. Collect essential answers or new permissions with AskUser and provide the actual answer in a new worker assignment.") : "") },
       canUseTool: async (name: string, toolInput: Record<string, unknown>, context?: NativePermissionContext) => live.queryEpoch === epoch
         ? this.canUseTool(live, name, toolInput, context)
         : { behavior: "deny", message: "This native query has been retired." },
     };
-    if (this.config.desktopProfile || this.config.nativeWorkflows || this.config.controllerReadOnly) options.disallowedTools = DESKTOP_DISALLOWED_TOOLS.filter(name => !(this.config.nativeWorkflows && !this.config.controllerReadOnly && name === "Workflow"));
+    if (this.config.desktopProfile || this.config.nativeWorkflows || this.config.controllerReadOnly) options.disallowedTools = [...(this.config.factoryNative ? ["Read", "LS", "Grep", "Glob"] : []), ...DESKTOP_DISALLOWED_TOOLS].filter(name => !(this.config.nativeWorkflows && !this.config.controllerReadOnly && name === "Workflow"));
     if (this.config.nativeWorkflows) {
       options.maxBudgetUsd = this.config.workflowMaxBudgetUsd;
       env.CLAUDE_CONFIG_DIR = join(this.config.dataDir, "native-workflow-config");
@@ -1086,6 +1189,8 @@ export class SdkRuntime implements BridgeRuntime {
     options.hooks = { PreToolUse: [{ hooks: [async (hook: { tool_name?: string; tool_use_id?: string; tool_input?: unknown }) => {
         if (live.queryEpoch !== epoch) return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "This native query has been retired." } };
         if (live.terminal) return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "The host session has ended." } };
+        if (recoveryActionDenied(live, hook.tool_name, hook.tool_input)) return { hookSpecificOutput: {
+          hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: RECOVERY_ONLY_DENIAL } };
         if (this.config.controllerReadOnly && (!hook.tool_name || !isDroidMcpName(hook.tool_name) && !["Read", "Glob", "Grep", "LS"].includes(hook.tool_name))) {
           return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "The Factory controller is read-only; delegate implementation to its supervised workers." } };
         }
@@ -1280,6 +1385,7 @@ export class SdkRuntime implements BridgeRuntime {
   }
 
   private async canUseTool(live: LiveSdk, name: string, input: Record<string, unknown>, context: NativePermissionContext = {}): Promise<RuntimePermissionDecision> {
+    if (recoveryActionDenied(live, name, input)) return { behavior: "deny", message: RECOVERY_ONLY_DENIAL };
     if (this.config.controllerReadOnly && !isDroidMcpName(name) && !["Read", "Glob", "Grep", "LS"].includes(name)) {
       return { behavior: "deny", message: "The Factory controller is read-only; delegate implementation to its supervised workers." };
     }
@@ -1378,7 +1484,7 @@ export class SdkRuntime implements BridgeRuntime {
     const current = (): boolean => !approval.signal.aborted && !live.terminal && !live.hostEnding && !live.turnHandoff
       && live.queryEpoch === epoch && this.control === control && !!live.current
       && resolveCwd(live.current, this.config) === cwd
-      && (control.factoryPermissionMode?.(live.current.session.bridgeSessionId) ?? live.current.factoryPermissionMode) !== "spec"
+      && (this.config.factoryNative || (control.factoryPermissionMode?.(live.current.session.bridgeSessionId) ?? live.current.factoryPermissionMode) !== "spec")
       && !this.toolAccessDenial(live, `mcp__droid__${mcpName}`, control.factoryPermissionMode?.(live.current.session.bridgeSessionId));
     if (this.config.controllerApprovalPolicy === "bypass") {
       // Bypass only this bridge-owned question. Factory still receives the
@@ -1578,10 +1684,11 @@ export class SdkRuntime implements BridgeRuntime {
   }
 
   private toolAccessDenial(live: LiveSdk, name: string | undefined, factoryPermissionMode?: string): string | undefined {
+    if (this.config.factoryNative && !name?.startsWith("mcp__droid__")) return "BRIDGE_FACTORY_NATIVE: All tools execute in Factory. Use the advertised Factory MCP tools, including for reads.";
     if (this.config.controllerReadOnly) {
       const original = name?.startsWith("mcp__droid__") ? live.names?.toOriginal(name.slice("mcp__droid__".length)) : name;
       if (!original || !controllerHostToolAllowed(this.config, original)) return "BRIDGE_CONTROLLER_READ_ONLY: This tool is outside the controller's read-only and supervised-worker allowlist.";
-      if (this.config.controllerHostTools && !["Read", "LS", "Grep", "Glob", "ToolSearch", "AskUser", "ExitSpecMode"].includes(original)
+      if (this.config.controllerHostTools && !this.config.factoryNative && !["Read", "LS", "Grep", "Glob", "ToolSearch", "AskUser", "ExitSpecMode"].includes(original)
           && (factoryPermissionMode ?? live.current?.factoryPermissionMode) === "spec") {
         return "BRIDGE_FACTORY_SPEC_READ_ONLY: Leave Factory spec mode before authorizing a mutating host action.";
       }
@@ -1654,6 +1761,9 @@ export class SdkRuntime implements BridgeRuntime {
             throw new BridgeError(mapped.status, mapped.code, mapped.message, retryAfter === undefined ? {} : { retry_after: retryAfter });
           }
         } else live.upstreamBackoff = undefined;
+        if (message.type === "assistant" && !message.parent_tool_use_id && typeof message.error === "string" && ASSISTANT_ERRORS.has(message.error)) {
+          live.failure = { ...live.failure, assistantError: message.error };
+        }
         if (message.type === "assistant" && message.error) {
           const mapped = upstreamError(message.error === "rate_limit" ? "rate_limit_error" : message.error === "overloaded" ? "overloaded_error" : extractText(message));
           if (mapped) throw message.error === "rate_limit" ? usageLimitError(mapped, extractText(message)) : mapped;
@@ -1688,6 +1798,7 @@ export class SdkRuntime implements BridgeRuntime {
             live.workflowDeferredResult = undefined;
           }
         }
+        if ((message.type === "stream_event" || (message.type === "assistant" && !message.error)) && !message.parent_tool_use_id && live.active) live.phase = "responding";
         if (message.type === "stream_event") {
           if (message.parent_tool_use_id) continue;
           this.trackAssistantTurn(live, message);
@@ -1758,8 +1869,13 @@ export class SdkRuntime implements BridgeRuntime {
             continue;
           }
           if (message.is_error === true || (typeof message.subtype === "string" && message.subtype !== "success")) {
+            live.failure = { ...live.failure, ...resultFailure(message) };
             const errors = Array.isArray(message.errors) ? message.errors.filter((item): item is string => typeof item === "string").join("; ") : "";
-            throw new BridgeError(502, "sdk_execution_error", errors || extractText(message) || String(message.subtype ?? "SDK execution failed"));
+            const detail = errors || extractText(message) || String(message.subtype ?? "SDK execution failed");
+            if (live.failure.terminalReason === "prompt_too_long" || (!live.failure.terminalReason && PROMPT_TOO_LONG_TEXT.test(detail))) {
+              throw promptTooLong(live);
+            }
+            throw new BridgeError(502, "sdk_execution_error", detail, live.failure.terminalReason ? { sdk_terminal_reason: live.failure.terminalReason } : {});
           }
           if (!live.active) continue;
           if (this.config.nativeWorkflows && (live.backgroundTasks.size || live.pending.size || live.workflowPermits?.pending)) { live.workflowDeferredResult = message; continue; }
@@ -1822,6 +1938,9 @@ export class SdkRuntime implements BridgeRuntime {
     const content: ContentBlock[] = text ? [{ type: "text", text }, ...extra] : [...live.blocks, ...extra];
     if (!content.length) content.push({ type: "text", text: "" });
     const usage = live.usage.drainTurnUsage() as Usage;
+    // A published reply ends this request's import and startup evidence.
+    live.phase = stop === "tool_use" ? "waiting_host" : undefined;
+    live.importStats = undefined;
     const turn: RuntimeTurn = {
       response: assistantMessage(live.current!.request.model, content, stop, usage),
       pendingToolIds: [...live.pending.keys()], sdkSessionId: live.sdkSessionId,
@@ -1895,6 +2014,8 @@ export class SdkRuntime implements BridgeRuntime {
       error = new BridgeError(error.status, error.code, error.message, { ...error.extra, retry_from_history: true });
     }
     live.terminal = error;
+    live.recoveryReceipts = undefined;
+    this.recordTerminal(live, error);
     if (live.workflowTimer) clearTimeout(live.workflowTimer);
     live.workflowTimer = undefined;
     live.workflowDeferredResult = undefined;
@@ -1931,6 +2052,30 @@ export class SdkRuntime implements BridgeRuntime {
     live.backgroundTasks.clear();
     live.usage = new UsageLedger();
     return live.cleanup;
+  }
+
+  /**
+   * One bounded record per stopped native generation. Codes, phase and counts
+   * only: the message, prompts, CLI output and credentials never reach it.
+   * Best effort: stop() has already set the terminal state, so a throwing log
+   * write here would skip teardown and leave the waiter and process unresolved.
+   */
+  private recordTerminal(live: LiveSdk, error: BridgeError): void {
+    try {
+      const session = live.current?.session;
+      const account = live.subscriptionAccount?.profile ?? session?.claudeAccount;
+      const data = {
+        sessionId: session?.bridgeSessionId, sdkSessionId: live.sdkSessionId, status: error.status, code: error.code,
+        phase: live.phase ?? "idle", ...live.failure, retryFromHistory: error.extra.retry_from_history === true,
+        ...(session?.nativeGeneration !== undefined ? { nativeGeneration: session.nativeGeneration } : {}),
+        ...(account ? { claudeProfile: account } : {}),
+        ...(live.importStats ? { coldImport: { ...live.importStats } } : {}),
+        ...(live.queryStartedAt !== undefined ? { queryAgeMs: Date.now() - live.queryStartedAt } : {}),
+        sentUserTurns: live.sentUserTurns,
+      };
+      if (error.code === "cancelled" || error.code === "host_session_ended") this.logger.info("sdk_session_stopped", data);
+      else this.logger.warn("sdk_session_failed", data);
+    } catch { /* Diagnostics never block teardown. */ }
   }
 
   private coldImportSafe(live: LiveSdk): boolean {
@@ -1991,34 +2136,22 @@ function hostCompletionFingerprint(completion: RuntimeHostCompletion): string {
   return createHash("sha256").update(canonicalJson({ ...completion, isError: Boolean(completion.isError), terminal: Boolean(completion.terminal) })).digest("hex");
 }
 
-function hostReceiptContent(content: RuntimeHostCompletion["content"]): RuntimeHostCompletion["content"] {
-  const strip = (text: string) => text.replace(/\[factory-cc-session:[a-f0-9]{64}\]/g, "");
-  if (typeof content === "string") return strip(content);
-  return content.map(block => block.type === "text" && typeof block.text === "string" ? { ...block, text: strip(block.text) } : block);
-}
-
-function mcpContent(content: string | ContentBlock[]): Record<string, unknown>[] {
-  if (typeof content === "string") return [{ type: "text", text: content }];
-  return content.map((block) => {
-    if (block.type === "text") return { type: "text", text: block.text };
-    if (block.type === "image") {
-      const source = (block as { source?: unknown }).source as { type?: string; data?: string; media_type?: string; url?: string };
-      if (source?.type === "base64") return { type: "image", data: source.data, mimeType: source.media_type };
-      if (source?.type === "url") return { type: "resource_link", uri: source.url, name: "Droid image" };
-    }
-    if (["resource", "resource_link", "audio"].includes(block.type)) return { ...block };
-    throw new BridgeError(422, "unsupported_tool_result_content", `Cannot preserve tool result block ${block.type} in MCP`);
-  });
+function recoveryActionDenied(live: LiveSdk, name: string | undefined, input: unknown): boolean {
+  if (!live.recoveryReceipts) return false;
+  const original = name?.startsWith("mcp__droid__") ? live.names?.toOriginal(name.slice("mcp__droid__".length)) : undefined;
+  return !original || !live.recoveryReceipts.some(receipt => receipt.toolName === original && canonicalJson(receipt.input) === canonicalJson(input));
 }
 
 function queryPolicy(input: RuntimeRequest, config: BridgeConfig): string {
   return JSON.stringify({ ...(config.models === undefined ? { model: input.request.model } : {}), role: input.role, cwd: resolveCwd(input, config), permission: config.permissionMode,
     controllerReadOnly: config.controllerReadOnly === true, controllerHostTools: config.controllerHostTools === true,
     ...(config.controllerSpawnAgents ? { controllerSpawnAgents: true } : {}),
+    ...(config.factoryNative ? { factoryNative: true } : {}),
     ...(config.controllerReadOnly ? { workerMcpPrefix: config.workerMcpPrefix } : {}),
     ...(config.controllerPool ? { subscriptionAccount: input.session.claudeAccount, nativeGeneration: input.session.nativeGeneration } : {}) });
 }
 function controllerHostToolAllowed(config: BridgeConfig, name: string): boolean {
+  if (config.factoryNative) return !/(?:^|___|__)factory_worker_/.test(name);
   if (!config.controllerReadOnly) return true;
   if (config.controllerHostTools) return name !== "Task" && (name !== "SpawnAgent" || config.controllerSpawnAgents === true);
   if (["Read", "LS", "Grep", "Glob", "ToolSearch", "AskUser"].includes(name)) return true;
@@ -2082,6 +2215,29 @@ function summarizeSdk(message: Record<string, unknown>): Record<string, unknown>
   return { type: message.type, subtype: message.subtype, session_id: message.session_id,
     ...(message.subtype === "compact_boundary" ? { compact_metadata: structuredClone(message.compact_metadata) } : {}) };
 }
+function resultFailure(message: Record<string, unknown>): SdkFailure {
+  const failure: SdkFailure = {};
+  if (typeof message.terminal_reason === "string" && TERMINAL_REASONS.has(message.terminal_reason)) failure.terminalReason = message.terminal_reason;
+  if (Number.isSafeInteger(message.api_error_status) && (message.api_error_status as number) >= 100 && (message.api_error_status as number) <= 599) {
+    failure.apiErrorStatus = message.api_error_status as number;
+  }
+  if (typeof message.subtype === "string" && /^[a-z_]{1,48}$/.test(message.subtype)) failure.resultSubtype = message.subtype;
+  return failure;
+}
+
+/**
+ * The same request cannot fit on retry or on another account. Report it the way
+ * the Messages API does, so the host classifies it as a context overflow and
+ * does not replay it, and name the recovery the operator or host must take.
+ */
+function promptTooLong(live: LiveSdk): BridgeError {
+  const stats = live.importStats;
+  return new BridgeError(400, "invalid_request_error",
+    "Prompt is too long for the model context window. Retrying the same request will fail again; compact this conversation, or continue in a new session from a summary.",
+    { sdk_terminal_reason: "prompt_too_long", recovery_action: "compact_conversation", retry_from_history: false,
+      ...(stats ? { cold_import: true, imported_messages: stats.messages, ...(stats.contentBytes !== undefined ? { imported_bytes: stats.contentBytes } : {}) } : {}) });
+}
+
 function asBridgeError(error: unknown): BridgeError {
   if (error instanceof BridgeError) return error;
   const message = error instanceof Error ? error.message : String(error);

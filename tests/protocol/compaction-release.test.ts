@@ -126,6 +126,26 @@ describe("a conversation Droid compacted away while it waited on a tool", () => 
     expect(released(config.logDir)).toEqual([{ sessionId: old.sessionId, toolUseIds: [old.toolUseId] }]);
   });
 
+  it("keeps a parked owner when an authenticated auxiliary request copies the summary", async () => {
+    const { app, token, config } = await startTestBridge({ desktopLifecycle: true, sdkCwd: process.cwd() }); apps.push(app);
+    const old = await parkOrchestrator(app, token, "auxiliary-summary");
+    await compact(app, token);
+    const started = await fetch(`${app.url}/internal/host-events`, { method: "POST",
+      headers: { authorization: `Bearer ${config.hookToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ eventId: "auxiliary-test-start", desktopLifecycle: true,
+        event: { hook_event_name: "SessionStart", session_id: "00000000-0000-4000-8000-000000000100", cwd: process.cwd() } }) });
+    expect(started.status).toBe(200);
+    const binding = await started.json() as { additionalContext: string };
+    const request = continuation(); request.messages[0]!.content[1]!.text = `${binding.additionalContext} Continue.`;
+    for (const headers of [{}, { "x-bridge-session": "new-auxiliary-summary" }] as Record<string, string>[]) {
+      expect((await postMessages(app.url, token, { ...request, tools: [] }, headers)).status).toBe(200);
+    }
+    expect(runtime.cancel).not.toHaveBeenCalled();
+    expect(app.store.require(old.sessionId).pendingToolIds).toEqual([old.toolUseId]);
+    expect((await postMessages(app.url, token, request)).status).toBe(200);
+    expect(runtime.cancel).toHaveBeenCalledExactlyOnceWith(old.sessionId, "compacted-by-droid");
+  });
+
   it("is kept when the continuation quotes some other summary", async () => {
     const { app, token } = await bridge();
     const old = await parkOrchestrator(app, token, "old");

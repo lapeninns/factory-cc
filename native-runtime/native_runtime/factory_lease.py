@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import random
 import re
 import select
 import stat
@@ -16,7 +17,7 @@ import sys
 import time
 
 from .core import (RuntimeConfig, RuntimeRefused, matches, now, process_identity,
-                   read_job, state_lock, write_job)
+                   process_table, read_job, state_lock, write_job)
 from .supervisor import (CONTROLLER_SLOTS, OCCUPIED, TERMINAL, _all_jobs,
                          _host_workspace_conflict, _reconcile_locked,
                          execution_lane, holds_workspace, occupies_compute,
@@ -29,6 +30,11 @@ RELEASE_STATES = frozenset(("waiting_host", "idle", "completed", "failed", "canc
 UPDATE_STATES = frozenset(("idle", "waiting_host", "unknown", "completed", "failed", "cancelled", "interrupted"))
 TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 SUBSCRIPTION_PROFILES = frozenset("team" + str(number) for number in range(1, 9))
+# Bridge conversation identity plus its durable native lease generation.
+GENERATION = re.compile(r"^(?P<base>.+):g(?P<generation>0|[1-9][0-9]{0,6})$")
+LINEAGE_REFUSALS = frozenset(("lease_binding_mismatch", "terminal_session_cannot_reacquire", "stale_native_generation",
+                              "native_predecessor_unresolved", "native_checkpoint_mismatch"))
+MAX_INSPECTED_GENERATIONS = 64
 
 
 class ProtocolError(RuntimeRefused):
@@ -43,7 +49,7 @@ def _identifier(value):
 
 def validate_worktree(value, workspace_policy=None):
     """Workers require linked worktrees; explicit host controllers may use folders."""
-    if workspace_policy not in (None, "controller-readonly", "controller-host"):
+    if workspace_policy not in (None, "controller-readonly", "controller-host", "factory-native"):
         raise ProtocolError("invalid_workspace_policy")
     if not isinstance(value, str) or not Path(value).is_absolute():
         raise ProtocolError("absolute_worktree_required")
@@ -54,7 +60,7 @@ def validate_worktree(value, workspace_policy=None):
         info = path.stat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
             raise ProtocolError("owned_worktree_required")
-        if workspace_policy == "controller-host":
+        if workspace_policy in ("controller-host", "factory-native"):
             # A folder is not a repository. Do not invent Git provenance or run
             # Git against an ancestor repository for a general host operation.
             return {"worktree": str(path), "workspaceKind": "directory",
@@ -84,6 +90,8 @@ def _base_request(request, operation):
     if not isinstance(request, dict) or request.get("op") != operation:
         raise ProtocolError("invalid_operation")
     allowed = {"op", "factorySessionId", "bridgeSessionId", "cwd", "role", "subscriptionProfile", "workspacePolicy"}
+    if operation == "acquire":
+        allowed |= {"resumeSessionId"}
     if operation == "update":
         allowed |= {"state", "usage", "sdkSessionId", "cleanupVerified", "hostActionReservation"}
     if set(request) - allowed:
@@ -96,10 +104,13 @@ def _base_request(request, operation):
                                                or subscription_profile not in SUBSCRIPTION_PROFILES):
         raise ProtocolError("invalid_subscription_profile")
     policy = request.get("workspacePolicy")
-    if "workspacePolicy" in request and (policy not in ("controller-readonly", "controller-host") or subscription_profile is None
-                                           or role in ("worker", "validator")
-                                           or (policy == "controller-host" and role not in ("chat", "orchestrator"))):
-        raise ProtocolError("invalid_controller_policy")
+    if "workspacePolicy" in request:
+        allowed_role = (role in ("chat", "orchestrator", "worker", "validator") if policy == "factory-native"
+                        else role not in ("worker", "validator")
+                        and (policy != "controller-host" or role in ("chat", "orchestrator")))
+        if (policy not in ("controller-readonly", "controller-host", "factory-native")
+                or subscription_profile is None or not allowed_role):
+            raise ProtocolError("invalid_controller_policy")
     workspace = validate_worktree(request.get("cwd"), policy)
     if policy is not None:
         workspace["workspacePolicy"] = policy
@@ -137,12 +148,64 @@ def _verify_binding(job, factory, bridge, workspace, owner, subscription_profile
         raise ProtocolError("lease_binding_mismatch")
 
 
+def _lineage(bridge):
+    match = GENERATION.fullmatch(bridge) if isinstance(bridge, str) else None
+    return (match["base"], int(match["generation"])) if match else None
+
+
+def _generations(jobs, base):
+    """Every lease of one bridge conversation, across Factory sessions and accounts."""
+    found = []
+    for job in jobs:
+        lineage = _lineage(job.get("bridgeSessionId")) if job.get("kind") == "factory-session" else None
+        if lineage and lineage[0] == base:
+            found.append((lineage[1], job))
+    return found
+
+
+def _predecessor_unresolved(job, owner):
+    if job.get("externalCleanupRequired") or job.get("hostActionReservation") is True:
+        return True
+    state = job.get("state")
+    if state in TERMINAL:
+        return False
+    if state not in ("idle", "waiting_host"):
+        return True
+    # A released phase is not executing, but its controller may still hold the
+    # parked native process. Only that controller may continue beside it; an
+    # idle phase whose controller exited has nothing left to continue.
+    lease_owner = job.get("leaseOwnerIdentity")
+    if lease_owner == owner:
+        return False
+    return state == "waiting_host" or matches(lease_owner)
+
+
+def _check_lineage(jobs, job_id, bridge, owner, resume_session_id, first_use):
+    lineage = _lineage(bridge)
+    if not lineage:
+        return
+    others = [(number, job) for number, job in _generations(jobs, lineage[0]) if job.get("id") != job_id]
+    if any(number > lineage[1] for number, _ in others):
+        raise ProtocolError("stale_native_generation")
+    if not first_use:
+        return
+    if any(_predecessor_unresolved(job, owner) for _, job in others):
+        raise ProtocolError("native_predecessor_unresolved")
+    recorded = [(number, job["sessionId"]) for number, job in others if job.get("sessionId")]
+    if resume_session_id is not None and recorded and max(recorded, key=lambda item: item[0])[1] != resume_session_id:
+        raise ProtocolError("native_checkpoint_mismatch")
+
+
 def create_or_resume(config, request):
     factory, bridge, role, workspace, job_id, subscription_profile = _base_request(request, "acquire")
+    resume_session_id = request.get("resumeSessionId")
+    if resume_session_id is not None:
+        _identifier(resume_session_id)
     owner, supervisor = _owner()
     with state_lock(config):
         jobs = _reconcile_locked(config)
         existing = next((job for job in jobs if job.get("id") == job_id), None)
+        _check_lineage(jobs, job_id, bridge, owner, resume_session_id, existing is None)
         if existing:
             _verify_binding(existing, factory, bridge, workspace, owner, subscription_profile)
             if existing.get("state") in TERMINAL:
@@ -178,6 +241,8 @@ def create_or_resume(config, request):
 
 
 def _workspace_conflict(left, right):
+    if left.get("workspacePolicy") == right.get("workspacePolicy") == "factory-native":
+        return False  # Pure model phases; Factory owns all workspace tools.
     if "controller-host" in (left.get("workspacePolicy"), right.get("workspacePolicy")):
         return _host_workspace_conflict(left, right)
     if left.get("worktree") != right.get("worktree"):
@@ -307,6 +372,70 @@ def update(config, request):
         return job
 
 
+def _inspection_binding(job, factory, profile, cwd, policy):
+    if policy not in ("controller-readonly", "controller-host", "factory-native"):
+        return False
+    try:
+        workspace = validate_worktree(cwd, policy)
+    except ProtocolError:
+        return False
+    return (job.get("factorySessionId") == factory and job.get("worktree") == workspace["worktree"]
+            and job.get("workspacePolicy") == policy and job.get("subscriptionProfile") == profile
+            and job.get("profile") == profile and job.get("authMode") == "subscription")
+
+
+def inspect(config, request):
+    """Read-only lineage evidence for an operator recovery; never changes a lease."""
+    if not isinstance(request, dict) or request.get("op") != "inspect":
+        raise ProtocolError("invalid_operation")
+    if set(request) - {"op", "factorySessionId", "bridgeSessionId", "cwd", "subscriptionProfile", "workspacePolicy",
+                       "sdkSessionId", "useRecordedWorkspacePolicy"}:
+        raise ProtocolError("unexpected_fields")
+    factory = _identifier(request.get("factorySessionId"))
+    bridge = _identifier(request.get("bridgeSessionId"))
+    checkpoint = _identifier(request["sdkSessionId"]) if "sdkSessionId" in request else None
+    lineage = _lineage(bridge)
+    profile = request.get("subscriptionProfile")
+    policy = request.get("workspacePolicy")
+    recorded_policy = request.get("useRecordedWorkspacePolicy", False)
+    if not lineage:
+        raise ProtocolError("invalid_identifier")
+    if not isinstance(profile, str) or profile not in SUBSCRIPTION_PROFILES:
+        raise ProtocolError("invalid_subscription_profile")
+    if (not isinstance(recorded_policy, bool) or (recorded_policy and "workspacePolicy" in request)
+            or (not recorded_policy and policy not in ("controller-readonly", "controller-host", "factory-native"))):
+        raise ProtocolError("invalid_workspace_policy")
+    # Validate the supplied path before reading lease data. Historical policy
+    # and binding fields come from one locked lease snapshot.
+    validate_worktree(request.get("cwd"), "factory-native" if recorded_policy else policy)
+    with state_lock(config):
+        jobs = _generations(_all_jobs(config), lineage[0])
+        if len(jobs) > MAX_INSPECTED_GENERATIONS:
+            raise ProtocolError("lineage_too_large")
+    # Each policy and its binding come from that one lease snapshot. Filesystem
+    # validation can run after releasing the shared admission lock.
+    inspected = [(number, job, _inspection_binding(job, factory, profile, request.get("cwd"),
+                                                   job.get("workspacePolicy") if recorded_policy else policy))
+                 for number, job in jobs]
+    table = process_table()
+    generations = [{
+        "generation": number, "state": str(job.get("state")),
+        "externalCleanupRequired": bool(job.get("externalCleanupRequired")),
+        "hostActionReservation": job.get("hostActionReservation") is True,
+        "ownerAlive": matches(job.get("leaseOwnerIdentity"), table),
+        "supervisorAlive": matches(job.get("supervisorIdentity"), table),
+        "cleanupVerified": job.get("reportedCleanupVerified") is True,
+        "checkpointMatches": (job.get("sessionId") == checkpoint) if checkpoint is not None and job.get("sessionId") else None,
+        "bindingMatches": binding_matches,
+        "endedAt": job.get("endedAt") if isinstance(job.get("endedAt"), str) else None,
+        # A session update is refused while a helper owns an admitted phase.
+        "endedBy": {"bridge_confirmed_session_end": "session_update",
+                    "bridge_confirmed_phase_end": "phase_release"}.get(job.get("reason"), "other"),
+    } for number, job, binding_matches in sorted(inspected, key=lambda item: (item[0], str(item[1].get("id"))))]
+    job_id = "factory-" + hashlib.sha256((factory + "\0" + bridge).encode()).hexdigest()[:32]
+    return job_id, generations
+
+
 class Lines:
     def __init__(self, fd):
         self.fd, self.buffer, self.eof = fd, b"", False
@@ -339,6 +468,10 @@ class Lines:
         return None
 
 
+# Upper bound for a queued helper's scheduling interval, in seconds.
+QUEUED_POLL_MAX = 1.0
+
+
 def emit(event, job=None, **fields):
     value = {"ok": True, "event": event, **fields}
     if job:
@@ -361,8 +494,16 @@ def serve(config, input_fd=0):
             job = update(config, request)
             emit("updated", job, state=job["state"])
             return 0
+        if request.get("op") == "inspect":
+            job_id, generations = inspect(config, request)
+            emit("inspected", {"id": job_id}, generations=generations)
+            return 0
         job = create_or_resume(config, request)
         emit("queued", job)
+        # Each scheduling attempt holds the shared lock while it snapshots
+        # processes and reads every job. Queued helpers back off so that a
+        # burst of them cannot starve admitted helpers that must release.
+        wait = config.poll_interval
         while not admitted:
             message = lines.poll(0)
             if message is not None:
@@ -384,7 +525,8 @@ def serve(config, input_fd=0):
                 admitted = True
                 emit("ready", job)
                 break
-            time.sleep(config.poll_interval)
+            time.sleep(wait * random.uniform(0.75, 1.25))
+            wait = min(max(config.poll_interval, QUEUED_POLL_MAX), wait * 2)
         while True:
             message = lines.poll(config.poll_interval)
             if message is None:
@@ -405,7 +547,7 @@ def serve(config, input_fd=0):
             emit("released", job, state=job["state"])
             return 0
     except (EOFError, ProtocolError, RuntimeRefused, BrokenPipeError) as error:
-        if job and request.get("op") != "update":
+        if job and request.get("op") not in ("update", "inspect"):
             if admitted:
                 uncertain(config, job, "bridge_release_unconfirmed")
             else:
@@ -421,6 +563,10 @@ def serve(config, input_fd=0):
                     response["code"] = "invalid_workspace"
                 elif str(error) in {"invalid_identifier", "invalid_subscription_profile", "invalid_workspace_policy", "invalid_controller_policy"}:
                     response["code"] = "invalid_binding"
+                elif str(error) in LINEAGE_REFUSALS:
+                    # Refused before this attempt wrote or admitted anything.
+                    response["code"] = "native_generation"
+                    response["reason"] = str(error)
             print(json.dumps(response), flush=True)
         except BrokenPipeError:
             pass

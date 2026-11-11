@@ -11,6 +11,7 @@ from unittest import mock
 
 from native_runtime.core import RuntimeConfig, now, process_identity, read_job, state_lock, write_job
 from native_runtime.factory_lease import ProtocolError, validate_worktree
+from native_runtime.reporting import report_jobs
 from native_runtime.supervisor import execution_lane, list_jobs, _reserve as reserve_native
 
 
@@ -581,6 +582,24 @@ class FactoryLeaseTests(unittest.TestCase):
         self.release(other_worker, 'completed', cleanupVerified=True)
         self.release(next_controller, 'completed', cleanupVerified=True)
 
+    def test_factory_native_uses_owned_folders_and_explicit_role_lanes(self):
+        with mock.patch('native_runtime.factory_lease.git', side_effect=AssertionError('native model phases do not require Git')):
+            workspace = validate_worktree(str(self.root), 'factory-native')
+        self.assertEqual(workspace['workspaceKind'], 'directory')
+        self.assertIsNone(workspace['repository'])
+        base = {'kind': 'factory-session', 'authMode': 'subscription', 'profile': 'team1',
+                'subscriptionProfile': 'team1', 'workspacePolicy': 'factory-native'}
+        self.assertEqual(execution_lane({**base, 'role': 'orchestrator'}), 'controller')
+        self.assertEqual(execution_lane({**base, 'role': 'worker'}), 'worker')
+        self.assertEqual(execution_lane({**base, 'role': 'validator'}), 'worker')
+        for role in ('unknown', 'session'):
+            with self.subTest(role=role):
+                child = self.start()
+                self.send(child, self.request(cwd=self.root, role=role, subscriptionProfile='team1',
+                                             workspacePolicy='factory-native'))
+                self.assertFalse(self.receive(child)['ok'])
+                self.assertEqual(child.wait(timeout=3), 2)
+
     def test_reserved_lane_requires_complete_matching_controller_metadata(self):
         controller = {'kind': 'factory-session', 'authMode': 'subscription', 'profile': 'team1',
                       'subscriptionProfile': 'team1', 'workspacePolicy': 'controller-readonly', 'role': 'chat'}
@@ -651,6 +670,43 @@ class FactoryLeaseTests(unittest.TestCase):
                 self.assertFalse(self.receive(child)['ok'])
                 self.assertEqual(child.wait(timeout=3), 2)
         self.assertEqual(list((self.state / 'jobs').glob('*.json')), [])
+
+    def test_eight_seat_ceiling_keeps_controller_progress_and_skips_an_account_blocked_queue_head(self):
+        def acquire(suffix, profile, role='worker'):
+            child = self.start(max_running=8)
+            self.send(child, self.request(suffix, self.root, role=role, subscriptionProfile=profile,
+                                          workspacePolicy='factory-native'))
+            self.assertEqual(self.receive(child)['event'], 'queued')
+            return child
+
+        workers = {}
+        for number in range(1, 9):
+            child = acquire('seat-' + str(number), 'team' + str(number))
+            self.assertEqual(self.receive(child)['event'], 'ready')
+            workers[number] = child
+        controller = acquire('controller', 'team1', role='orchestrator')
+        self.assertEqual(self.receive(controller)['event'], 'ready')
+        older = acquire('older-team1', 'team1')
+        self.assertIsNone(self.receive(older, .2))
+        capacity = report_jobs(self.state, observe_processes=False, max_running=8)['capacity']
+        self.assertEqual(capacity['lanes']['worker'], {'limit': 8, 'occupied': 8, 'free': 0, 'waiting': 1, 'waitingBlockedByAccount': 1})
+        self.assertEqual(capacity['lanes']['controller']['occupied'], 1)
+        self.assertEqual(capacity['accounts']['team1']['workerLane'], 'busy')
+
+        self.release(workers.pop(2), 'completed', cleanupVerified=True)
+        self.assertIsNone(self.receive(older, .2))
+        younger = acquire('younger-team2', 'team2')
+        self.assertEqual(self.receive(younger)['event'], 'ready')
+        self.assertIsNone(self.receive(older, .1))
+
+        self.release(workers.pop(1), 'completed', cleanupVerified=True)
+        self.release(younger, 'completed', cleanupVerified=True)
+        self.assertEqual(self.receive(older)['event'], 'ready')
+        for child in [*workers.values(), controller, older]:
+            self.release(child, 'completed', cleanupVerified=True)
+        settled = report_jobs(self.state, observe_processes=False, max_running=8)['capacity']
+        self.assertEqual((settled['lanes']['worker']['occupied'], settled['lanes']['controller']['occupied'], settled['queue']['waiting']), (0, 0, 0))
+        self.assertEqual(settled['queue']['recentAdmissions']['count'], 11)
 
     def test_all_eight_fixed_profiles_are_admitted_without_rotation(self):
         for number in range(1, 9):
@@ -790,6 +846,31 @@ class FactoryLeaseTests(unittest.TestCase):
         self.assertEqual(job['ownedProcesses'], [])
         self.assertEqual(job['leaseOwnerIdentity'], process_identity(os.getpid()))
 
+    def test_owner_update_frees_account_after_release_acknowledgement_is_missed(self):
+        # The bridge stops a helper whose release is not acknowledged in time.
+        first, job_id = self.admitted('missed-release', subscriptionProfile='team4')
+        self.git(self.repo, 'worktree', 'add', '-qb', 'factory-other', str(self.root / 'other'))
+        waiter = self.start()
+        self.send(waiter, self.request('next-worker', self.root / 'other', subscriptionProfile='team4'))
+        first.terminate()
+        first.wait(timeout=3)
+        self.assertEqual(self.receive(waiter)['event'], 'queued')
+        # Polling has backed off to its ceiling by now, so the release below
+        # also shows that a queued waiter is admitted promptly afterwards.
+        self.assertIsNone(self.receive(waiter, 1.5))
+        self.assertEqual(read_job(self.config, job_id)['state'], 'unknown')
+
+        confirm = self.start()
+        self.send(confirm, self.request('missed-release', op='update', subscriptionProfile='team4',
+                                        state='completed', cleanupVerified=True))
+        self.assertEqual(self.receive(confirm)['event'], 'updated')
+        self.assertEqual(confirm.wait(timeout=3), 0)
+        job = read_job(self.config, job_id)
+        self.assertEqual(job['state'], 'completed')
+        self.assertFalse(job['externalCleanupRequired'])
+        self.assertEqual(self.receive(waiter, 2.5)['event'], 'ready')
+        self.release(waiter, 'completed', cleanupVerified=True)
+
     def test_invalid_or_sensitive_fields_are_not_persisted_or_echoed(self):
         child, job_id = self.admitted()
         self.send(child, {'op': 'release', 'state': 'idle', 'usage': {'secret-token': 'never-copy-this'}})
@@ -799,6 +880,211 @@ class FactoryLeaseTests(unittest.TestCase):
         self.assertNotIn('never-copy-this', json.dumps(result))
         self.assertNotIn('never-copy-this', (self.state / 'jobs' / (job_id + '.json')).read_text())
         self.assertTrue(read_job(self.config, job_id)['externalCleanupRequired'])
+
+    def lineage(self, generation, op='acquire', factory='factory-lineage', **extra):
+        return {'op': op, 'factorySessionId': factory, 'bridgeSessionId': 'bridge-lineage:g%d' % generation,
+                'cwd': str(self.root), 'role': 'orchestrator', 'subscriptionProfile': 'team1',
+                'workspacePolicy': 'factory-native', **extra}
+
+    def closed_generation(self, generation=0, checkpoint='checkpoint-a'):
+        child = self.start()
+        self.send(child, self.lineage(generation))
+        self.assertEqual(self.receive(child)['event'], 'queued')
+        job_id = self.receive(child)['jobId']
+        self.release(child, 'idle', sdkSessionId=checkpoint, cleanupVerified=False)
+        # An orderly controller close confirms the session ended without an admitted phase.
+        close = self.start()
+        self.send(close, self.lineage(generation, op='update', state='cancelled', cleanupVerified=True))
+        self.assertEqual(self.receive(close)['event'], 'updated')
+        self.assertEqual(close.wait(timeout=3), 0)
+        return job_id
+
+    def refused(self, request):
+        child = self.start()
+        self.send(child, request)
+        result = self.receive(child)
+        self.assertEqual(child.wait(timeout=3), 2)
+        return result
+
+    def jobs_snapshot(self):
+        return {path.name: path.read_bytes() for path in sorted((self.state / 'jobs').glob('*.json'))}
+
+    def test_new_generation_continues_a_closed_predecessor_checkpoint(self):
+        previous_id = self.closed_generation()
+        before = read_job(self.config, previous_id)
+        child, job_id = self.admitted(**{key: value for key, value in self.lineage(1, resumeSessionId='checkpoint-a').items()
+                                         if key != 'op'})
+        self.assertNotEqual(job_id, previous_id)
+        self.assertEqual(read_job(self.config, previous_id), before)
+        self.release(child, 'idle', sdkSessionId='checkpoint-a', cleanupVerified=False)
+        self.assertNotIn('resumeSessionId', read_job(self.config, job_id))
+
+    def test_new_generation_waits_for_unresolved_or_foreign_predecessors(self):
+        sleeper = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+        self.addCleanup(lambda: (sleeper.kill(), sleeper.wait(timeout=3)))
+        foreign = None
+        for _ in range(50):
+            foreign = process_identity(sleeper.pid)
+            if foreign:
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(foreign)
+        dead = dict(process_identity(os.getpid()), start='an exited controller')
+        previous_id = self.closed_generation()
+        cases = {
+            'running': {'state': 'running', 'externalCleanupRequired': True},
+            'unknown': {'state': 'unknown', 'externalCleanupRequired': True},
+            'waiting_host_exited_owner': {'state': 'waiting_host', 'leaseOwnerIdentity': dead},
+            'waiting_host_live_foreign_owner': {'state': 'waiting_host', 'leaseOwnerIdentity': foreign},
+            'host_reservation': {'state': 'cancelled', 'hostActionReservation': True},
+            'idle_live_foreign_owner': {'state': 'idle', 'leaseOwnerIdentity': foreign},
+        }
+        original = read_job(self.config, previous_id)
+        for name, patch in cases.items():
+            with self.subTest(name=name):
+                with state_lock(self.config):
+                    write_job(self.config, {**original, **patch})
+                before = self.jobs_snapshot()
+                result = self.refused(self.lineage(1, resumeSessionId='checkpoint-a'))
+                self.assertEqual(result, {'ok': False, 'error': 'factory_lease_refused', 'code': 'native_generation',
+                                          'reason': 'native_predecessor_unresolved'})
+                after = self.jobs_snapshot()
+                self.assertEqual(set(after), set(before))
+        # The same controller may continue beside its own released phase, for
+        # example after a Factory compact handoff to a new session ID.
+        with state_lock(self.config):
+            write_job(self.config, {**original, 'state': 'waiting_host'})
+        child, sibling_id = self.admitted(**{key: value for key, value in self.lineage(0, factory='factory-handoff').items() if key != 'op'})
+        self.release(child, 'idle', cleanupVerified=False)
+        with state_lock(self.config):
+            write_job(self.config, {**read_job(self.config, sibling_id), 'state': 'cancelled'})
+        # A released idle phase whose controller exited is not executing.
+        with state_lock(self.config):
+            write_job(self.config, {**original, 'state': 'idle', 'leaseOwnerIdentity': dead})
+        child, _ = self.admitted(**{key: value for key, value in self.lineage(1).items() if key != 'op'})
+        self.release(child, 'idle', cleanupVerified=False)
+
+    def test_stale_generation_and_checkpoint_mismatch_are_refused_before_any_write(self):
+        self.closed_generation(checkpoint='checkpoint-a')
+        before = self.jobs_snapshot()
+        mismatch = self.refused(self.lineage(1, resumeSessionId='checkpoint-b'))
+        self.assertEqual(mismatch.get('reason'), 'native_checkpoint_mismatch')
+        self.assertEqual(self.jobs_snapshot(), before)
+        child, _ = self.admitted(**{key: value for key, value in self.lineage(1, resumeSessionId='checkpoint-a').items()
+                                    if key != 'op'})
+        self.release(child, 'idle', sdkSessionId='checkpoint-a', cleanupVerified=False)
+        before = self.jobs_snapshot()
+        for request in (self.lineage(0), self.lineage(0, factory='factory-other')):
+            with self.subTest(factory=request['factorySessionId']):
+                self.assertEqual(self.refused(request).get('reason'), 'stale_native_generation')
+                self.assertEqual(self.jobs_snapshot(), before)
+
+    def test_inherited_lease_identity_is_refused_with_a_fixed_category(self):
+        job_id = self.closed_generation()
+        with state_lock(self.config):
+            job = read_job(self.config, job_id)
+            job['leaseOwnerIdentity'] = dict(job['leaseOwnerIdentity'], start='an exited controller')
+            write_job(self.config, job)
+        before = self.jobs_snapshot()
+        result = self.refused(self.lineage(0, resumeSessionId='checkpoint-a'))
+        self.assertEqual(result, {'ok': False, 'error': 'factory_lease_refused', 'code': 'native_generation',
+                                  'reason': 'lease_binding_mismatch'})
+        self.assertEqual(self.jobs_snapshot(), before)
+
+    def test_inspect_reports_sanitized_lineage_without_changing_leases(self):
+        self.closed_generation(checkpoint='checkpoint-a')
+        before = self.jobs_snapshot()
+        child = self.start()
+        request = {key: value for key, value in self.lineage(0, op='inspect', sdkSessionId='checkpoint-a').items() if key != 'role'}
+        self.send(child, request)
+        result = self.receive(child)
+        self.assertEqual(child.wait(timeout=3), 0)
+        self.assertEqual(result['event'], 'inspected')
+        [generation] = result['generations']
+        self.assertEqual({key: value for key, value in generation.items() if key != 'endedAt'}, {
+            'generation': 0, 'state': 'cancelled', 'externalCleanupRequired': False, 'hostActionReservation': False,
+            'ownerAlive': True, 'supervisorAlive': False, 'cleanupVerified': True, 'checkpointMatches': True,
+            'bindingMatches': True, 'endedBy': 'session_update'})
+        self.assertNotIn(str(self.root), json.dumps(result))
+        self.assertEqual(self.jobs_snapshot(), before)
+        for patch, field, expected in (({'sdkSessionId': 'checkpoint-b'}, 'checkpointMatches', False),
+                                       ({'subscriptionProfile': 'team2'}, 'bindingMatches', False),
+                                       ({'factorySessionId': 'factory-other'}, 'bindingMatches', False)):
+            with self.subTest(field=field, patch=patch):
+                child = self.start()
+                self.send(child, {**request, **patch})
+                self.assertIs(self.receive(child)['generations'][0][field], expected)
+                self.assertEqual(child.wait(timeout=3), 0)
+        settlement_request = {key: value for key, value in request.items() if key != 'sdkSessionId'}
+        child = self.start()
+        self.send(child, settlement_request)
+        settlement = self.receive(child)['generations'][0]
+        self.assertIsNone(settlement['checkpointMatches'])
+        self.assertTrue(settlement['bindingMatches'])
+        self.assertTrue(settlement['cleanupVerified'])
+        self.assertEqual(child.wait(timeout=3), 0)
+        for extra in ({'role': 'orchestrator'}, {'bridgeSessionId': 'bridge-lineage'}, {'sdkSessionId': None}):
+            with self.subTest(extra=extra):
+                self.assertFalse(self.refused({**request, **extra})['ok'])
+        self.assertEqual(self.jobs_snapshot(), before)
+
+    def test_historical_inspection_validates_each_recorded_policy_without_changing_leases(self):
+        policies = ('factory-native', 'controller-host', 'controller-readonly')
+        job_ids = []
+        for generation, policy in enumerate(policies):
+            request = self.lineage(generation, cwd=str(self.repo), workspacePolicy=policy)
+            child, job_id = self.admitted(**{key: value for key, value in request.items() if key != 'op'})
+            self.release(child, 'failed', sdkSessionId='checkpoint-a', cleanupVerified=True)
+            job_ids.append(job_id)
+        exact = {key: value for key, value in self.lineage(2, op='inspect', cwd=str(self.repo),
+                 sdkSessionId='checkpoint-a').items() if key != 'role'}
+        historical = {key: value for key, value in exact.items() if key != 'workspacePolicy'}
+        historical['useRecordedWorkspacePolicy'] = True
+
+        def inspect_unchanged(request):
+            before = self.jobs_snapshot()
+            child = self.start()
+            self.send(child, request)
+            result = self.receive(child)
+            self.assertEqual(child.wait(timeout=3), 0)
+            self.assertEqual(self.jobs_snapshot(), before)
+            return result['generations']
+
+        self.assertEqual([item['bindingMatches'] for item in inspect_unchanged(exact)], [True, False, False])
+        observed = inspect_unchanged(historical)
+        self.assertTrue(all(item['bindingMatches'] and item['checkpointMatches'] for item in observed))
+        for patch in ({'factorySessionId': 'other-factory'}, {'subscriptionProfile': 'team2'},
+                      {'cwd': str(self.worktree)}):
+            with self.subTest(patch=patch):
+                self.assertFalse(any(item['bindingMatches'] for item in inspect_unchanged({**historical, **patch})))
+        self.assertFalse(any(item['checkpointMatches'] for item in inspect_unchanged({**historical, 'sdkSessionId': 'other-checkpoint'})))
+
+        original = read_job(self.config, job_ids[1])
+        for policy in (None, 'unknown-policy'):
+            with self.subTest(policy=policy):
+                changed = dict(original)
+                if policy is None:
+                    changed.pop('workspacePolicy')
+                else:
+                    changed['workspacePolicy'] = policy
+                with state_lock(self.config):
+                    write_job(self.config, changed)
+                observed = inspect_unchanged(historical)
+                self.assertEqual([item['bindingMatches'] for item in observed], [True, False, True])
+        with state_lock(self.config):
+            write_job(self.config, original)
+
+        before = self.jobs_snapshot()
+        for patch in ({'workspacePolicy': 'factory-native'}, {'workspacePolicy': None},
+                      {'useRecordedWorkspacePolicy': 'true'}):
+            with self.subTest(conflict=patch):
+                self.assertFalse(self.refused({**historical, **patch})['ok'])
+        for operation in ('acquire', 'update'):
+            request = self.lineage(2, op=operation, cwd=str(self.repo), useRecordedWorkspacePolicy=True)
+            if operation == 'update':
+                request.update(state='cancelled', cleanupVerified=True)
+            self.assertFalse(self.refused(request)['ok'])
+        self.assertEqual(self.jobs_snapshot(), before)
 
     def test_update_requires_the_original_parent_identity(self):
         child, job_id = self.admitted()

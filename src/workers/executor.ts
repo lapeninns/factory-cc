@@ -124,14 +124,64 @@ function alive(receipt: ExecutorReceipt): boolean {
   return !!current && current.group === receipt.group && current.started === receipt.started;
 }
 
+/** Accept only a terminal shared receipt for the exact departed executor. No writes or replay. */
+function reconciledLeaseView(value: WorkerView, receipt: ExecutorReceipt, sharedStateRoot: string): WorkerView | undefined {
+  if (value.state !== "unknown" || value.reason !== "shared_lease_release_unproven"
+      || value.cleanupVerified !== true || value.leaseReleased !== false || !value.resultState
+      || !terminal.has(value.resultState) || value.authentication !== "subscription"
+      || !/^team[1-8]$/.test(value.subscriptionProfile ?? "")) return;
+  if (!isAbsolute(sharedStateRoot) || realpathSync(sharedStateRoot) !== resolve(sharedStateRoot)) return;
+  for (const directory of [sharedStateRoot, join(sharedStateRoot, "jobs")]) {
+    const stat = lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== process.getuid?.() || stat.mode & 0o077) return;
+  }
+  const jobId = "factory-" + digest(value.id + "\0" + value.id).slice(0, 32);
+  const job = JSON.parse(readPrivate(join(sharedStateRoot, "jobs", jobId + ".json")));
+  const owner = job.leaseOwnerIdentity;
+  if (job.version !== 1 || job.id !== jobId || job.kind !== "factory-session" || job.role !== "worker"
+      || job.factorySessionId !== value.id || job.bridgeSessionId !== value.id || job.worktree !== value.worktree
+      || job.subscriptionProfile !== value.subscriptionProfile || job.profile !== value.subscriptionProfile
+      || job.authMode !== "subscription" || job.workspacePolicy != null || job.state !== value.resultState
+      || job.externalCleanupRequired !== false || job.hostActionReservation === true
+      || job.cleanupVerified === false || !Array.isArray(job.ownedProcesses) || job.ownedProcesses.length
+      || !owner || owner.pid !== receipt.pid || owner.pgid !== receipt.group || owner.start !== receipt.started
+      || owner.uid !== process.getuid?.() || !Number.isSafeInteger(job.supervisorIdentity?.pid) || job.supervisorIdentity.pid <= 1
+      || job.supervisorIdentity.uid !== process.getuid?.() || !Number.isSafeInteger(job.supervisorIdentity.pgid)
+      || job.supervisorIdentity.pgid <= 1 || typeof job.supervisorIdentity.start !== "string" || !job.supervisorIdentity.start
+      || !value.endedAt || !Number.isFinite(Date.parse(value.endedAt)) || !Number.isFinite(Date.parse(job.endedAt))
+      || Date.parse(job.endedAt) < Date.parse(value.endedAt)) return;
+  // Observe the complete process group, not just a possibly reused/departed PID.
+  // Unlike ordinary status, observation failures must never mean "exited" here.
+  const table = execFileSync("/bin/ps", ["-axo", "pid=,pgid=,stat="], {
+    encoding: "utf8", timeout: 2000, maxBuffer: 4 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"],
+    env: { PATH: "/usr/bin:/bin", LC_ALL: "C" },
+  });
+  if (!table.trim()) return;
+  for (const line of table.trim().split("\n")) {
+    const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s*$/.exec(line);
+    if (!match) return;
+    if (/^[ZX]/.test(match[3]!)) continue;
+    if (Number(match[1]) === receipt.pid || Number(match[2]) === receipt.group
+        || Number(match[1]) === job.supervisorIdentity.pid) return;
+  }
+  return { ...value, state: value.resultState, leaseReleased: true, settledAt: job.endedAt,
+    reason: "shared_lease_settlement_reconciled", pendingApprovalCount: 0, approvals: [] };
+}
+
 /** Reads private snapshots only. A stale process identity never authorizes control of a reused PID. */
-export function workerExecutorStatus(root: string, id: string): WorkerView | undefined {
+export function workerExecutorStatus(root: string, id: string, options: { sharedStateRoot?: string } = {}): WorkerView | undefined {
   try {
     const receipt = readReceipt(root, id);
     if (!receipt) return;
     const value = JSON.parse(readPrivate(paths(root, id).view)) as WorkerView;
     if (value.id !== id || !Array.isArray(value.approvals)) return;
     if (terminal.has(value.state) && value.cleanupVerified === true && value.leaseReleased !== false) return value;
+    if (options.sharedStateRoot) {
+      try {
+        const recovered = reconciledLeaseView(value, receipt, options.sharedStateRoot);
+        if (recovered) return recovered;
+      } catch { /* Missing, unsafe or unobservable evidence retains the reservation. */ }
+    }
     if (alive(receipt)) return value;
     return { ...value, state: "unknown", reason: "executor_process_unavailable", cleanupVerified: null, pendingApprovalCount: 0, approvals: [] };
   } catch { return; }

@@ -39,7 +39,10 @@ export function lastSummarizedToolCall(request: MessagesRequest): SummarizedTool
   }
 }
 
-/** The text of a compacted conversation's leading summary block, or undefined. */
+/** The leading legacy summary used by the parked-session release path. A
+ * same-session summary can precede a workspace reminder without releasing its
+ * existing session.
+ */
 export function compactedSummaryText(request: MessagesRequest): string | undefined {
   const first = request.messages.find((message) => message.role === "user");
   const block = first ? asBlocks(first.content)[0] : undefined;

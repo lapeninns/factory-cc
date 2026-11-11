@@ -1,7 +1,8 @@
-import { appendFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { nativePurpose } from "../../src/sessions/state.js";
 import { SessionStore } from "../../src/sessions/store.js";
 import { historyMessageHashes, resolveSession, sessionContextHash } from "../../src/sessions/correlate.js";
 import type { Message, MessagesRequest } from "../../src/types.js";
@@ -16,6 +17,58 @@ const input = { role: "chat" as const, model: "test-model", toolNames: [] };
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe("session capacity and durable identity", () => {
+  it("persists purpose and never demotes an interactive owner with a later empty catalog", () => {
+    const dir = temporaryDir(), store = new SessionStore(dir, true, 4);
+    const auxiliary = store.create({ ...input, nativePurpose: "auxiliary" });
+    store.update(auxiliary.bridgeSessionId, { nativePurpose: "interactive", state: "IDLE" });
+    store.update(auxiliary.bridgeSessionId, { nativePurpose: "auxiliary", toolNames: [] });
+    expect(nativePurpose(auxiliary)).toBe("interactive");
+    expect(nativePurpose(new SessionStore(dir, true, 4).require(auxiliary.bridgeSessionId))).toBe("interactive");
+    const legacy = store.create(input);
+    expect(nativePurpose(legacy)).toBe("unknown");
+    expect(nativePurpose({ ...legacy, toolNames: ["Read"] })).toBe("interactive");
+  });
+
+  it("rolls back an atomic update when the persistent journal cannot be appended", () => {
+    const dir = temporaryDir(), store = new SessionStore(dir, true, 2);
+    const record = store.create(input);
+    store.update(record.bridgeSessionId, { state: "IDLE" });
+    const before = structuredClone(record), journal = join(dir, "sessions.jsonl"), saved = journal + ".saved";
+    renameSync(journal, saved); mkdirSync(journal);
+    expect(() => store.updateAtomic(record.bridgeSessionId, { state: "CANCELLED", cancelRequested: true })).toThrow();
+    expect(record).toEqual(before);
+    rmSync(journal, { recursive: true }); renameSync(saved, journal);
+    expect(new SessionStore(dir, true, 2).require(record.bridgeSessionId)).toEqual(before);
+  });
+
+  it.each(["snapshot", "compact"])("keeps live and reloaded atomic state equal after post-append %s failure", phase => {
+    const dir = temporaryDir(), store = new SessionStore(dir, true, 2);
+    const record = store.create(input);
+    store.update(record.bridgeSessionId, { state: "IDLE" });
+    if (phase === "compact") {
+      const internals = store as unknown as { writes: number; compact(): void };
+      internals.writes = 255;
+      vi.spyOn(internals, "compact").mockImplementationOnce(() => { throw new Error("synthetic compaction failure"); });
+    } else vi.spyOn(store, "snapshot").mockImplementationOnce(() => { throw new Error("synthetic snapshot failure"); });
+    expect(() => store.updateAtomic(record.bridgeSessionId, { state: "CANCELLED", cancelRequested: true, notes: ["committed"] })).toThrow(/synthetic/);
+    expect(record).toMatchObject({ state: "CANCELLED", cancelRequested: true, notes: ["committed"] });
+    const journalRows = readFileSync(join(dir, "sessions.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(journalRows.at(-1)).toEqual(record);
+    expect(new SessionStore(dir, true, 2).require(record.bridgeSessionId)).toEqual(record);
+  });
+
+  it("retains unexpired account cooldown evidence through pruning and restart", () => {
+    const dir = temporaryDir();
+    const store = new SessionStore(dir, true, 2, undefined, { maxRecords: 0, maxAgeMs: 0, journalMaxBytes: 1024 * 1024 });
+    const record = store.create(input);
+    const now = Date.now();
+    store.update(record.bridgeSessionId, { state: "IDLE", accountCooldowns: { team5: new Date(now + 120_000).toISOString() } });
+    expect(store.prune(new Set(), now + 60_000)).toEqual([]);
+    const restarted = new SessionStore(dir, true, 2, undefined, { maxRecords: 0, maxAgeMs: 0, journalMaxBytes: 1024 * 1024 });
+    expect(restarted.require(record.bridgeSessionId).accountCooldowns).toEqual(record.accountCooldowns);
+    expect(restarted.prune(new Set(), now + 120_001)).toEqual([record.bridgeSessionId]);
+  });
+
   it("supports more than 16 completed conversations without exhausting active capacity", () => {
     const store = new SessionStore(temporaryDir(), false, 1);
     for (let i = 0; i < 20; i += 1) {

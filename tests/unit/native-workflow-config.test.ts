@@ -7,7 +7,8 @@ import { selectionFromConfig } from "../../src/upstream/providers.js";
 import { loadConfig, type BridgeConfig } from "../../src/config.js";
 import { parseApiWorkflowArgs, runApiWorkflows } from "../../scripts/api-workflows.js";
 
-vi.mock("../../src/runtime/native-workflow-support.js", () => ({
+vi.mock("../../src/runtime/native-workflow-support.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../src/runtime/native-workflow-support.js")>(),
   assertNativeWorkflowSupport: () => ({ executable: "/fixture/claude", sdkVersion: "0.3.300", cliVersion: "2.1.300", sha256: "fixture-digest" }),
 }));
 

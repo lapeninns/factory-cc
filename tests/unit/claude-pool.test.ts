@@ -2,6 +2,17 @@ import { describe, expect, it } from "vitest";
 import { ClaudePool, parseClaudePool } from "../../src/upstream/claude-pool.js";
 
 describe("Claude account pool", () => {
+  it("restores absolute cooldown floors without shortening a later wait", () => {
+    let clock = 0;
+    const pool = new ClaudePool([{ id: "team5", weight: 1 }], () => clock);
+    pool.restoreCooldown("team5", new Date(600_000).toISOString());
+    pool.restoreCooldown("team5", new Date(60_000).toISOString());
+    pool.restoreCooldown("unknown", new Date(900_000).toISOString());
+    expect(pool.status()).toEqual([{ id: "team5", weight: 1, coolingUntil: new Date(600_000).toISOString() }]);
+    clock = 600_001;
+    expect(pool.pick()).toBe("team5");
+  });
+
   it("spreads one-at-a-time sessions across accounts in proportion to weight", () => {
     const pool = new ClaudePool([{ id: "personal", weight: 10 }, { id: "pro", weight: 5 }, { id: "std", weight: 1 }]);
     const picks = Array.from({ length: 32 }, () => pool.pick());

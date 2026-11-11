@@ -31,10 +31,11 @@ export class ClaudePool {
 
   constructor(readonly members: readonly PoolMember[], private readonly now: () => number = Date.now) {}
 
-  pick(): string {
+  pick(eligible?: ReadonlySet<string>): string {
     const at = this.now();
-    const ready = this.members.filter((member) => (this.coolUntil.get(member.id) ?? 0) <= at);
+    const ready = this.members.filter((member) => (this.coolUntil.get(member.id) ?? 0) <= at && (!eligible || eligible.has(member.id)));
     if (!ready.length) {
+      if (eligible && this.members.some(member => !this.isCooling(member.id))) throw new BridgeError(503, "pool_selection_unavailable", "No eligible configured account can take this assignment.");
       const earliest = Math.min(...this.members.map(member => this.coolUntil.get(member.id) ?? at));
       throw new BridgeError(429, "rate_limit_error", "All configured accounts are cooling. Retry after the earliest recovery.",
         { retry_after: Math.max(1, Math.ceil((earliest - at) / 1000)), usage_limit: true });
@@ -55,6 +56,13 @@ export class ClaudePool {
 
   cool(id: string, seconds: number): void {
     this.coolUntil.set(id, Math.max(this.coolUntil.get(id) ?? 0, this.now() + seconds * 1000));
+  }
+
+  /** Restore an observed deadline without shortening any current provider wait. */
+  restoreCooldown(id: string, until: string): void {
+    const at = Date.parse(until);
+    if (!this.members.some(member => member.id === id) || !Number.isFinite(at)) return;
+    this.coolUntil.set(id, Math.max(this.coolUntil.get(id) ?? 0, at));
   }
 
   status(): Array<PoolMember & { coolingUntil?: string }> {

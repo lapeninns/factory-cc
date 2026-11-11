@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { request as httpRequest } from "node:http";
 import * as runtimeFactory from "../../src/runtime/factory.js";
 import { assistantMessage } from "../../src/protocol/messages.js";
 import { BridgeError } from "../../src/types.js";
@@ -20,6 +21,14 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   return { promise, resolve };
 }
 const never = () => new Promise<RuntimeTurn>(() => undefined);
+
+function disconnectedRequest(url: string, token: string, sessionId: string) {
+  const client = httpRequest(`${url}/v1/messages`, { method: "POST", headers: { authorization: `Bearer ${token}`,
+    "content-type": "application/json", "x-bridge-session": sessionId } });
+  client.on("error", () => undefined);
+  client.end(JSON.stringify({ ...body, stream: true }));
+  return client;
+}
 
 beforeEach(() => {
   runtime = {
@@ -243,5 +252,58 @@ describe("SSE keepalive end to end", () => {
     expect(raw).toContain("event: message_stop");
     await reader.read();
     expect(vi.getTimerCount()).toBe(maintenanceTimers);
+  });
+});
+
+describe("transport loss and explicit cancellation", () => {
+  it("interrupts a known clean checkpoint on disconnect and leaves it resumable", async () => {
+    const first = result(); first.sdkSessionId = "retained-checkpoint";
+    vi.mocked(runtime.handle).mockResolvedValueOnce(first).mockImplementationOnce(() => never());
+    runtime.interrupt = vi.fn(async () => true);
+    const { app, token } = await bridge();
+    const accepted = await postMessages(app.url, token, body, { "x-bridge-session": "transport-owner" });
+    const client = disconnectedRequest(app.url, token, "transport-owner");
+    await vi.waitFor(() => expect(runtime.handle).toHaveBeenCalledTimes(2));
+    client.destroy();
+    await vi.waitFor(() => expect(runtime.interrupt).toHaveBeenCalledWith(accepted.session, "client-disconnect"));
+    await vi.waitFor(() => expect(app.store.require(accepted.session!).state).toBe("IDLE"));
+    expect(app.store.require(accepted.session!)).toMatchObject({ cancelRequested: false, sdkSessionId: "retained-checkpoint",
+      notes: expect.arrayContaining(["client-disconnect-interrupted"]) });
+    expect(runtime.cancel).not.toHaveBeenCalled();
+  });
+
+  it("preserves unresolved receipts and records transport cancellation without guessing a clean boundary", async () => {
+    const first = result(); first.sdkSessionId = "retained-checkpoint"; first.pendingToolIds = ["write-call"];
+    vi.mocked(runtime.handle).mockResolvedValueOnce(first).mockImplementationOnce(() => never());
+    runtime.interrupt = vi.fn(async () => true);
+    const { app, token } = await bridge();
+    const accepted = await postMessages(app.url, token, body, { "x-bridge-session": "receipt-owner" });
+    app.store.recordHostCompletion(accepted.session!, { toolUseId: "write-call", toolName: "Script", input: {}, content: "done" });
+    const client = disconnectedRequest(app.url, token, "receipt-owner");
+    await vi.waitFor(() => expect(runtime.handle).toHaveBeenCalledTimes(2));
+    client.destroy();
+    await vi.waitFor(() => expect(app.store.require(accepted.session!).state).toBe("CANCELLED"));
+    expect(app.store.require(accepted.session!)).toMatchObject({ cancelRequested: true, endedToolIds: ["write-call"],
+      hostCompletionReceipts: [expect.objectContaining({ toolUseId: "write-call" })], cancellation: { source: "client-disconnect" } });
+    expect(runtime.interrupt).not.toHaveBeenCalled();
+  });
+
+  it("never promotes an explicit admin cancellation after a pending disconnect interrupt", async () => {
+    const first = result(); first.sdkSessionId = "retained-checkpoint";
+    const interrupted = deferred<boolean>();
+    vi.mocked(runtime.handle).mockResolvedValueOnce(first).mockImplementationOnce(() => never());
+    runtime.interrupt = vi.fn(() => interrupted.promise);
+    const { app, token, config } = await bridge();
+    const accepted = await postMessages(app.url, token, body, { "x-bridge-session": "cancel-owner" });
+    const client = disconnectedRequest(app.url, token, "cancel-owner");
+    await vi.waitFor(() => expect(runtime.handle).toHaveBeenCalledTimes(2));
+    client.destroy();
+    await vi.waitFor(() => expect(runtime.interrupt).toHaveBeenCalled());
+    const cancelled = await fetch(`${app.url}/internal/cancel`, { method: "POST", headers: {
+      authorization: `Bearer ${config.adminToken}`, "content-type": "application/json" }, body: JSON.stringify({ sessionId: accepted.session }) });
+    expect(cancelled.status).toBe(200);
+    interrupted.resolve(true);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(app.store.require(accepted.session!)).toMatchObject({ state: "CANCELLED", cancelRequested: true, cancellation: { source: "admin" } });
   });
 });

@@ -13,12 +13,12 @@ import type { MessagesRequest } from "../../src/types.js";
 
 const directories: string[] = [];
 afterEach(() => { for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
-function fixture(enabled = true) {
+function fixture(enabled = true, factoryNative = false) {
   const cwd = realpathSync(mkdtempSync(join(tmpdir(), "desktop-hook-binding-"))); directories.push(cwd);
   const store = new SessionStore(cwd, false, 16);
   const runtime: BridgeRuntime = { kind: "sdk", handle: vi.fn(), deliverResults: vi.fn(), cancel: vi.fn(async () => {}),
     endHostSession: vi.fn(async () => ({ resumable: true })) };
-  const broker = new ControlBroker(runtime, store, 1000, { desktopLifecycle: enabled });
+  const broker = new ControlBroker(runtime, store, 1000, { desktopLifecycle: enabled, factoryNative });
   const event = (name = "SessionStart", extra: Record<string, unknown> = {}) => ({ hook_event_name: name, session_id: "desktop-a", cwd, ...extra });
   const start = (extra: Record<string, unknown> = {}, envelope: Record<string, unknown> = {}) => broker.hostEvent({ eventId: randomUUID(), event: event("SessionStart", extra), desktopLifecycle: true, ...envelope });
   return { cwd, broker, runtime, event, start };
@@ -41,6 +41,18 @@ describe("opt-in Desktop lifecycle binding", () => {
     const same = await f.start();
     expect(same.bindingToken).toBe(token);
     await expect(f.start({}, { bindingToken: "wrong-generation" })).rejects.toMatchObject({ code: "stale_host_event" });
+  });
+
+  it("pins native role metadata to its authenticated lifecycle generation", async () => {
+    const f = fixture(true, true), native = { role: "agent", workstreamId: "00000000-0000-0000-0000-000000000001" };
+    const started = await f.start({ bridgeNativeWorkstream: native });
+    expect(f.broker.hostIdentity(started.bindingToken as string)).toMatchObject({ nativeWorkstream: native });
+    await expect(f.broker.hostEvent({ eventId: randomUUID(), bindingToken: started.bindingToken,
+      event: f.event("UserPromptSubmit", { bridgeNativeWorkstream: { ...native, role: "orchestrator" } }) }))
+      .rejects.toMatchObject({ code: "native_workstream_conflict" });
+    expect(f.broker.hostIdentity(started.bindingToken as string)).toMatchObject({ nativeWorkstream: native });
+    const legacy = fixture(); const legacyStart = await legacy.start({ bridgeNativeWorkstream: native });
+    expect(legacy.broker.hostIdentity(legacyStart.bindingToken as string)).not.toHaveProperty("nativeWorkstream");
   });
 
   it("keeps receipt replay idempotent and rejects changed content", async () => {

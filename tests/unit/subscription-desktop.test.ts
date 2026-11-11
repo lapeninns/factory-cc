@@ -98,6 +98,23 @@ describe("subscription Desktop launcher", () => {
     expect(() => parseSubscriptionDesktop([...pooledArgs(), "--controller-pool", "--host-tools", "--spawn-agents", "--spawn-agents"])).toThrow(/Duplicate spawn-agents/);
   });
 
+  it("requires explicit native-agent policy and Factory-owned approvals", async () => {
+    const host = [...pooledArgs(), "--controller-pool", "--host-tools"];
+    expect(() => parseSubscriptionDesktop([...host, "--factory-native"])).toThrow(/requires --host-tools and --spawn-agents/);
+    const native = [...host, "--spawn-agents", "--factory-native"];
+    expect(parseSubscriptionDesktop(native)).toMatchObject({ factoryNative: true, spawnAgents: true, approvalPolicy: "bypass" });
+    expect(() => parseSubscriptionDesktop([...native, "--factory-native"])).toThrow(/Duplicate factory-native/);
+    expect(() => parseSubscriptionDesktop([...native, "--approval-policy", "ask"])).toThrow(/delegates approvals to Factory/);
+    await runSubscriptionDesktop(native);
+    expect(vi.mocked(createBridgeApp).mock.calls[0]![0]).toMatchObject({ factoryNative: true, controllerSpawnAgents: true });
+    const marker = JSON.parse(readFileSync(join(data, "subscription-desktop.json"), "utf8"));
+    expect(marker.factoryNative).toBe(true);
+    vi.mocked(prepareSubscription).mockClear();
+    await expect(runSubscriptionDesktop([...host, "--check"])).rejects.toThrow(/another worker connection or pool policy/);
+    expect(prepareSubscription).not.toHaveBeenCalled();
+    await runSubscriptionDesktop([...native, "--check"]);
+  });
+
   it("refuses changing an existing pooled marker into host-tools mode", async () => {
     ownedState();
     writeFileSync(join(data, "subscription-desktop.json"), JSON.stringify({ profile: "team1", project,
