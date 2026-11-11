@@ -4,12 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createBridgeApp, listen, type BridgeApp } from "../../src/http/app.js";
-import type { BridgeRuntime, RuntimeRequest } from "../../src/runtime/types.js";
+import { assistantMessage } from "../../src/protocol/messages.js";
+import type { BridgeRuntime, RuntimeRequest, RuntimeTurn } from "../../src/runtime/types.js";
 import { BridgeError } from "../../src/types.js";
 import { continuation, firstTurn, hostStart, restartConfig } from "../helpers/native-restart.js";
 import { postMessages } from "../helpers/server.js";
 import { hostResultDigest, mcpResultContent } from "../../src/runtime/host-recovery.js";
-import { COMPACTION_SUMMARY } from "../../src/workspace.js";
+import { COMPACTION_SUMMARY, SAME_SESSION_COMPACTION_SUMMARY } from "../../src/workspace.js";
 
 const roots: string[] = [], apps: BridgeApp[] = [];
 afterEach(async () => {
@@ -26,7 +27,7 @@ async function fixture() {
   const config = { ...base, desktopJobs: false, subscriptionAccounts: base.subscriptionAccounts!.map(account => ({ ...account,
     env: { ...account.env, CLAUDE_CONFIG_DIR: join(root, account.profile) } })) };
   const observed: Array<{ account?: string; sdk?: string; recovery?: string; generation?: number }> = [];
-  const handle = vi.fn(async (input: RuntimeRequest) => {
+  const handle = vi.fn(async (input: RuntimeRequest): Promise<RuntimeTurn> => {
     observed.push({ account: input.session.claudeAccount, sdk: input.session.sdkSessionId, recovery: input.recovery, generation: input.session.nativeGeneration });
     return { response: { id: randomUUID(), type: "message" as const, role: "assistant" as const, model: "opus", content: [{ type: "text" as const, text: "Planned." }],
       stop_reason: "end_turn" as const, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } }, pendingToolIds: [], sdkSessionId };
@@ -264,6 +265,48 @@ describe("established native upstream retry", () => {
     f.runtime.handle.mockRejectedValueOnce(new BridgeError(529, "overloaded_error", "limit", { retry_from_history: true }));
     expect((await postMessages(f.app.url, "client", f.next)).status).toBe(529);
     expect(f.record.retainedCheckpoint?.settledToolResults).toEqual([{ toolUseId: receipt.toolUseId, resultSha256: hostResultDigest(receipt.content, true) }]);
+  });
+
+  it("keeps the same checkpoint when a clean upstream failure follows an authenticated compacted tool result", async () => {
+    const f = await fixture();
+    const cwd = join(f.root, "workspace");
+    const tool = { type: "tool_use" as const, id: "compacted-read", name: "Read", input: { path: "one.txt" } };
+    const content = "read once";
+    f.runtime.pendingHostCalls = () => [{ toolUseId: tool.id, toolName: tool.name, input: tool.input }];
+    f.runtime.recordHostToolCompletion = async () => "accepted";
+    f.runtime.handle.mockResolvedValueOnce({ response: assistantMessage("opus", [tool], "tool_use"),
+      pendingToolIds: [tool.id], sdkSessionId: f.sdkSessionId });
+    expect((await postMessages(f.app.url, "client", f.next)).status).toBe(200);
+    const hook = await fetch(`${f.app.url}/internal/host-events`, { method: "POST",
+      headers: { authorization: "Bearer hook", "content-type": "application/json" },
+      body: JSON.stringify({ eventId: randomUUID(), bindingToken: f.token, event: { hook_event_name: "PostToolUse",
+        session_id: f.record.factorySessionId, cwd, tool_name: tool.name, tool_input: tool.input, tool_response: content } }) });
+    expect(hook.status).toBe(200);
+    const { additionalContext } = await hook.json() as { additionalContext?: string };
+    expect(additionalContext).toMatch(/^\[factory-cc-continuation:[a-f0-9]{64}\]$/);
+
+    writeFileSync(f.file, [
+      { sessionId: f.sdkSessionId, message: { role: "assistant", content: [{ ...tool, name: "mcp__droid__Read" }] } },
+      { sessionId: f.sdkSessionId, message: { role: "user", content: [{ type: "tool_result", tool_use_id: tool.id, content: mcpResultContent(content) }] } },
+    ].map(row => JSON.stringify(row)).join("\n") + "\n");
+    f.runtime.handle.mockRejectedValueOnce(new BridgeError(529, "overloaded_error", "limit", { retry_from_history: true }));
+    const failed = await postMessages(f.app.url, "client", { ...firstTurn(f.token), messages: [
+      { role: "user", content: [
+        { type: "text", text: `${SAME_SESSION_COMPACTION_SUMMARY}\nRewritten prefix` },
+        { type: "text", text: `<system-reminder>\n\nUser system info (fixture)\n\n% pwd\n${cwd}\n\n</system-reminder>` },
+      ] },
+      { role: "assistant", content: [tool] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: tool.id, content }] },
+      { role: "user", content: additionalContext },
+    ] });
+    expect(failed.status, failed.raw).toBe(529);
+    expect(failed.json.error).toMatchObject({ checkpoint_retained: true, retry_mode: "native_checkpoint", retry_from_history: false,
+      factory_binding_refresh_required: true, message: expect.stringContaining("send a fresh message from the existing Factory Workstream") });
+    expect(f.record).toMatchObject({ state: "IDLE", sdkSessionId: f.sdkSessionId, nativeGeneration: 1, retryableRequestKind: "native-upstream" });
+    expect(f.record.retainedCheckpoint?.settledToolResults).toEqual([{ toolUseId: tool.id, resultSha256: hostResultDigest(content, false) }]);
+    expect(f.runtime.prepareCheckpointRetry).toHaveBeenCalledWith(f.record.bridgeSessionId, f.sdkSessionId);
+    expect(f.runtime.prepareColdRetry).not.toHaveBeenCalled();
+    expect(f.runtime.cancel).not.toHaveBeenCalled();
   });
 
   it.each([429, 529])("retains checkpoint and account after %s, then resumes without cold import", async status => {

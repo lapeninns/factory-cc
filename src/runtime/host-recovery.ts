@@ -8,7 +8,7 @@ export const MAX_LINEAGE_CONTEXT_BYTES = 128 * 1024;
 export const RECOVERY_ONLY_DENIAL = "This native turn only reconciles previously completed actions. No new action was executed. Finish the reconciliation response, then continue ordinary work in the next user turn.";
 
 export function hostReceiptContent(content: RuntimeHostCompletion["content"]): RuntimeHostCompletion["content"] {
-  const strip = (text: string) => text.replace(/\[factory-cc-session:[a-f0-9]{64}\]/g, "");
+  const strip = (text: string) => text.replace(/\[factory-cc-(?:session|continuation):[a-f0-9]{64}\]/g, "");
   if (typeof content === "string") return strip(content);
   return content.map(block => block.type === "text" && typeof block.text === "string" ? { ...block, text: strip(block.text) } : block);
 }

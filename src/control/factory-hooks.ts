@@ -237,10 +237,16 @@ export async function forwardFactoryHook(
       const result: unknown = await response.json();
       if (!object(result) || result.ok !== true || (result.additionalContext !== undefined && typeof result.additionalContext !== "string")) throw new HookRejectedError();
       if (result.bindingToken !== undefined && (typeof result.bindingToken !== "string" || !/^[a-f0-9]{64}$/.test(result.bindingToken))) throw new HookRejectedError();
-      return event.hook_event_name === "SessionStart"
-        ? { ...(typeof result.additionalContext === "string" ? { additionalContext: result.additionalContext } : {}), ...(typeof result.bindingToken === "string" ? { bindingToken: result.bindingToken } : {}) }
-        : event.hook_event_name === "UserPromptSubmit" && typeof result.additionalContext === "string"
-          ? { additionalContext: result.additionalContext } : {};
+      const { additionalContext, bindingToken } = result;
+      if (event.hook_event_name === "SessionStart") {
+        return { ...(typeof additionalContext === "string" ? { additionalContext } : {}),
+          ...(typeof bindingToken === "string" ? { bindingToken } : {}) };
+      }
+      if (typeof additionalContext !== "string") return {};
+      if (event.hook_event_name === "UserPromptSubmit") return { additionalContext };
+      if (event.hook_event_name === "PostToolUse" && result.matched === true && result.completionRecorded === true
+          && /^\[factory-cc-continuation:[a-f0-9]{64}\]$/.test(additionalContext)) return { additionalContext };
+      return {};
     } catch (error) {
       if (error instanceof HookRejectedError || attempt === 2) throw new Error("Factory lifecycle event was not accepted by the bridge");
     }

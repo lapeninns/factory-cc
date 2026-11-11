@@ -182,6 +182,21 @@ describe("Factory hook forwarding", () => {
     await expect(forwardFactoryHook({ url: "http://localhost:1", hookToken: "token" }, { ...start, hook_event_name: "SessionEnd" }, { fetch: send })).resolves.toEqual({});
   });
 
+  it("forwards only the exact continuation context from a recorded, matched tool completion", async () => {
+    const additionalContext = `[factory-cc-continuation:${"e".repeat(64)}]`;
+    const config = { url: "http://localhost:1", hookToken: "token" };
+    const event = { ...start, hook_event_name: "PostToolUse" };
+    const response = { ok: true, matched: true, completionRecorded: true, additionalContext };
+    const send = vi.fn<typeof fetch>();
+    for (const result of [{ ...response, matched: false }, { ...response, completionRecorded: false },
+      { ...response, additionalContext: `${additionalContext} other context` }]) {
+      send.mockResolvedValueOnce(new Response(JSON.stringify(result)));
+      await expect(forwardFactoryHook(config, event, { fetch: send })).resolves.toEqual({});
+    }
+    send.mockResolvedValueOnce(new Response(JSON.stringify(response)));
+    await expect(forwardFactoryHook(config, event, { fetch: send })).resolves.toEqual({ additionalContext });
+  });
+
   it("renews only UserPromptSubmit context without replacing the registered generation", async () => {
     const bindingToken = "b".repeat(64);
     const additionalContext = `[factory-cc-session:${bindingToken}]`;

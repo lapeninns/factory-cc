@@ -597,7 +597,8 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       if (config.mode === "sdk") resolveRequestModel(config, parsed.model);
     }
     const role = roleFromHeaders(headers);
-    const prepared = control.prepareRequest(parsed);
+    const missionDir = header(headers, "x-bridge-mission-dir");
+    const prepared = control.prepareRequest(parsed, undefined, missionDir);
     const factorySession = control.hostIdentity(prepared.binding);
     const cwd = resolveRequestCwd(headers, prepared.request, config, process.env, factorySession?.cwd);
     if (config.desktopJobs && !factorySession?.desktopLifecycle) throw new BridgeError(409, "desktop_binding_required", "Start this session with the configured Factory Desktop lifecycle hooks before using the supervised model.");
@@ -653,6 +654,9 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         // Droid desktop has no conversation ID header or hooks to disambiguate.
         continueIdenticalTranscripts: config.desktopProfile, auxiliaryRetry: retry,
       });
+    if (prepared.continuationSessionId && resolved.match?.bridgeSessionId !== prepared.continuationSessionId) {
+      throw new BridgeError(409, "factory_continuation_scope_changed", "The Factory tool receipt can only continue its existing native session.");
+    }
     if (historicalReconciliation) {
       const original = selectedOwner.nativeLineageSelection!.selected.record;
       const retrying = selectedOwner.retainedCheckpoint?.origin === "clean-upstream"
@@ -708,7 +712,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       retainedCheckpointVerified = true;
     }
     // Release a replaced slot only after proof checks. Bound tool-free requests leave it parked.
-    if (permitsTools || !factorySession) releaseCompacted(request);
+    if (!prepared.continuationSessionId && (permitsTools || !factorySession)) releaseCompacted(request);
     if (claudeAccount) logger.info("claude_account_assigned", { model: request.model, account: claudeAccount });
     const session = resolved.match
       ?? withSlot(() => store.create({
@@ -740,6 +744,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         const migration = await prepareControllerWorkspaceMigration(config, session, runtime);
         if (migration) { store.update(sessionId, migration); workspaceMigrated = true; retainedCheckpointVerified = false; previous = structuredClone(session); }
       }
+      prepared.assertContinuationCurrent?.();
       if (isEnded(session)) throw new BridgeError(409, "session_unavailable", "this session has ended; start a new session");
       // The state write can be refused (session limit); the binding cannot be
       // undone. So write the state first and bind last, and if only the bind is
@@ -917,7 +922,10 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
             ? { ...recovery, reconciledAt: new Date().toISOString() } : recovery) } : {}),
       });
       store.setState(sessionId, turn.pendingToolIds.length ? "WAITING_DROID_TOOL" : "IDLE");
-      if (turn.pendingToolIds.length) scheduleWorkerEnd(sessionId, turn.pendingToolIds);
+      if (turn.pendingToolIds.length) {
+        if (config.factoryNative) control.rememberContinuationPolicy(prepared.binding, sessionId, request, missionDir);
+        scheduleWorkerEnd(sessionId, turn.pendingToolIds);
+      }
       if (summarized) rememberCompaction(summarized, turn.response.content.map((block) => (block.type === "text" && typeof block.text === "string" ? block.text : "")).join("\n"));
       appendLogLine(turnLog, JSON.stringify(redactJson({
         at: new Date().toISOString(),
@@ -953,7 +961,8 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       const retryableUpstream = error instanceof BridgeError && ([429, 529].includes(error.status) || error.code === "sdk_start_timeout") && error.extra.retry_from_history === true
         && !cancellationRequested && current && !current.cancelRequested && current.hostEnded === undefined
         && (current.state === "GENERATING" || current.state === "RESUMING")
-        && (retainedCheckpointVerified || healthyTailVerified || (previous.historyMessageHashes ?? []).every((hash, index) => incomingHashes[index] === hash));
+        && (retainedCheckpointVerified || healthyTailVerified || prepared.continuationSessionId === sessionId
+          || (previous.historyMessageHashes ?? []).every((hash, index) => incomingHashes[index] === hash));
       // A limited account sits out its cooldown; the conversation continues on another account.
       const limitedAccount = claudePool && error instanceof BridgeError && error.code === "rate_limit_error" && current && provider !== "cursor"
         ? current.claudeAccount ?? listed?.claudeProfile ?? PERSONAL_ACCOUNT : undefined;
@@ -1009,9 +1018,13 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
             retryableRequestHash: requestFingerprint, retryableRequestKind: "native-upstream",
             retainedCheckpoint: { sdkSessionId, account: owningAccount, checkpointSha256, sourceGeneration,
               preparedAt: new Date().toISOString(), coolingUntil, origin: "clean-upstream", settledToolIds, settledToolResults } });
+          const needsFreshFactoryBinding = prepared.continuationSessionId === sessionId;
           error = new BridgeError((error as BridgeError).status, (error as BridgeError).code,
-            "The native checkpoint is retained on its owning account. Retry the continuation after the reported delay.",
-            { ...(error as BridgeError).extra, retry_from_history: false, checkpoint_retained: true, retry_mode: "native_checkpoint" });
+            needsFreshFactoryBinding
+              ? "The native checkpoint is retained on its owning account. After any provider cooldown, send a fresh message from the existing Factory Workstream to reattach. If it cannot reattach, use native checkpoint recovery."
+              : "The native checkpoint is retained on its owning account. Retry the continuation after the reported delay.",
+            { ...(error as BridgeError).extra, retry_from_history: false, checkpoint_retained: true, retry_mode: "native_checkpoint",
+              ...(needsFreshFactoryBinding ? { factory_binding_refresh_required: true } : {}) });
         } catch {
           if (!current.cancelRequested && current.hostEnded === undefined && current.sdkSessionId === sdkSessionId
               && current.claudeAccount === owningAccount && current.nativeGeneration === sourceGeneration
