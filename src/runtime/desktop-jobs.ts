@@ -177,6 +177,7 @@ export class DesktopJobsRuntime implements BridgeRuntime {
   private closed = false;
   readonly interrupt?: BridgeRuntime["interrupt"];
   readonly pendingHostCalls?: BridgeRuntime["pendingHostCalls"];
+  readonly pendingNativeToolName?: BridgeRuntime["pendingNativeToolName"];
   readonly completeHostTool?: BridgeRuntime["completeHostTool"];
   readonly validateHostToolCompletion?: BridgeRuntime["validateHostToolCompletion"];
   readonly recordHostToolCompletion?: BridgeRuntime["recordHostToolCompletion"];
@@ -210,6 +211,7 @@ export class DesktopJobsRuntime implements BridgeRuntime {
       return resumable && phase.outcome === "idle" && phase.cleanup === cleanup && phase.settlementVerified === true;
     };
     if (inner.pendingHostCalls) this.pendingHostCalls = (id) => inner.pendingHostCalls!(id);
+    if (inner.pendingNativeToolName) this.pendingNativeToolName = (id, callId) => inner.pendingNativeToolName!(id, callId);
     if (inner.validateHostToolCompletion) this.validateHostToolCompletion = (...args) => inner.validateHostToolCompletion!(...args);
     if (inner.recordHostToolCompletion) this.recordHostToolCompletion = async (id, completion) => {
       const result = await inner.recordHostToolCompletion!(id, completion);

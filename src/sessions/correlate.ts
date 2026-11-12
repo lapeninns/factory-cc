@@ -8,7 +8,7 @@ import type { ContentBlock, Message, MessagesRequest, RoleTag } from "../types.j
 import { BridgeError } from "../types.js";
 import { providerFromModelId, type ModelProvider } from "../models.js";
 import { droidReasoningLevel, requestAtReasoningLevel, requestWithoutReasoningLevel } from "../runtime/reasoning.js";
-import { isEnded, nativePurpose, type SessionRecord } from "./state.js";
+import { isEnded, nativePurpose, type RetainedCheckpoint, type SessionRecord } from "./state.js";
 import { canonicalWorkspacePath, resolveRequestCwd } from "../workspace.js";
 
 type Headers = Record<string, string | string[] | undefined>;
@@ -231,7 +231,8 @@ export function resolveSession(
       && Number.isSafeInteger(proof.sourceGeneration) && proof.sourceGeneration >= 0
       && Number.isSafeInteger(session.nativeGeneration) && session.nativeGeneration! <= 1_000_000 && session.nativeGeneration! > proof.sourceGeneration
       && completed && completed.length >= 2 && userSuffix.length > 0
-      && (lastAssistant >= 1 && request.messages[lastAssistant - 1]?.role === "user"
+      && (proof.factoryCompactedToolTail ? retainedCompactedResultRange(request.messages, proof) !== undefined
+        : (lastAssistant >= 1 && request.messages[lastAssistant - 1]?.role === "user"
         && completed.at(-2) === incoming[lastAssistant - 1] && completed.at(-1) === incoming[lastAssistant]
         && verifiedRetainedSuffix(userSuffix, proof.settledToolResults ?? [])
         // Factory inserts this exact boundary after consumed results when a
@@ -241,7 +242,7 @@ export function resolveSession(
         && separatorResult?.role === "user" && separatorResultBlocks.length > 0
         && separatorResultBlocks.every(block => block.type === "tool_result")
         && userSuffix.every(message => message.role === "user" && asBlocks(message.content).every(block => block.type === "text"))
-        && verifiedRetainedSuffix([separatorResult, ...userSuffix], proof.settledToolResults ?? [])));
+        && verifiedRetainedSuffix([separatorResult, ...userSuffix], proof.settledToolResults ?? []))));
   };
 
   if (explicit) {
@@ -383,6 +384,35 @@ function verifiedRetainedSuffix(messages: Message[], receipts: readonly { toolUs
     && resultBlocks.every(block => "tool_use_id" in block && typeof block.tool_use_id === "string" && block.tool_use_id.length > 0)
     && results.length === resultBlocks.length && new Set(results.map(result => result.tool_use_id)).size === results.length
     && results.every(result => !result.is_error && matchesSettledHostResult(result, receipts));
+}
+
+/** Locate a previously admitted wire batch before a fresh, bound user prompt.
+ * Its hashes include the rewritten IDs and displayed payloads, while the
+ * checkpoint separately proves the native receipts that were delivered. */
+export function retainedCompactedResultRange(messages: Message[], proof: RetainedCheckpoint): { start: number; end: number } | undefined {
+  const tail = proof.factoryCompactedToolTail;
+  if (proof.origin !== "clean-upstream" || !tail || tail.messageHashes.length < 3 || !tail.nativeToolIds.length
+      || new Set(tail.nativeToolIds).size !== tail.nativeToolIds.length
+      || tail.nativeToolIds.some(id => proof.settledToolResults?.filter(result => result.toolUseId === id).length !== 1)) return;
+  const lastAssistant = messages.map(message => message.role).lastIndexOf("assistant");
+  const separator = sameToolInput(messages[lastAssistant]?.content, [{ type: "text", text: "---" }]);
+  const resultMessageCount = tail.messageHashes.length - 2;
+  const start = separator ? lastAssistant - resultMessageCount : lastAssistant + 1;
+  const end = start + resultMessageCount;
+  if (start < 2 || messages[start - 1]?.role !== "assistant" || end > messages.length) return;
+  const fresh = messages.slice(end + (separator ? 1 : 0));
+  if (!fresh.length || fresh.some(message => message.role !== "user" || asBlocks(message.content).some(block => block.type !== "text"))
+      || !fresh.some(message => asBlocks(message.content).some(block => {
+        if (block.type !== "text" || typeof block.text !== "string") return false;
+        const text = block.text.trim();
+        return text && !(text.startsWith("<system-reminder>") && text.endsWith("</system-reminder>"));
+      }))) return;
+  const resultMessages = messages.slice(start, end);
+  const results = collectToolResults(resultMessages);
+  if (results.length !== tail.nativeToolIds.length
+      || resultMessages.some(message => message.role !== "user" || asBlocks(message.content).some(block => block.type !== "tool_result"))) return;
+  const hashes = historyMessageHashes(messages.slice(start - 2, end));
+  return tail.messageHashes.every((hash, index) => hash === hashes[index]) ? { start, end } : undefined;
 }
 
 function holdsToolId(ids: readonly string[] | undefined, toolUseId: string): boolean {

@@ -169,9 +169,10 @@ export interface ConsumedCheckpoint {
   settledToolResults: SettledToolResult[];
 }
 
-/** Successful host results already present in the native history need no replay. */
+/** Host results already present in the native history need no replay. */
 export function inspectConsumedHostCheckpoint(accounts: readonly SubscriptionAccount[], record: SessionRecord,
-  receipts: RuntimeHostCompletion[], expectedSettledToolIds: readonly string[] = []): ConsumedCheckpoint {
+  receipts: RuntimeHostCompletion[], expectedSettledToolIds: readonly string[] = [],
+  options: { allowFailedReceipts?: boolean; nativeToolNames?: ReadonlyMap<string, string> } = {}): ConsumedCheckpoint {
   let settledToolResults: SettledToolResult[] = [];
   const checkpointSha256 = readCheckpoint(accounts, record, text => {
     const { calls, results } = checkpointActions(text, record.sdkSessionId!);
@@ -181,9 +182,11 @@ export function inspectConsumedHostCheckpoint(accounts: readonly SubscriptionAcc
     const names = new StableDroidToolNames();
     for (const receipt of receipts) {
       const call = calls.get(receipt.toolUseId), result = results.get(receipt.toolUseId);
-      if (receipt.isError || receipt.terminal || !receipt.toolName || receipt.input === undefined) refuse("receipt_not_successful");
-      if (!call || call.name !== `mcp__droid__${names.toMcp(receipt.toolName)}` || !sameToolInput(call.input, receipt.input)) refuse("checkpoint_action_mismatch");
-      if (!result || result.isError || !sameToolInput(result.content, mcpResultContent(hostReceiptContent(receipt.content)))) refuse("checkpoint_result_mismatch");
+      if (receipt.isError && !options.allowFailedReceipts || receipt.terminal || !receipt.toolName || receipt.input === undefined) refuse("receipt_not_successful");
+      const expectedName = options.nativeToolNames?.get(receipt.toolUseId) ?? `mcp__droid__${names.toMcp(receipt.toolName)}`;
+      if (!call || call.name !== expectedName || !sameToolInput(call.input, receipt.input)) refuse("checkpoint_action_mismatch");
+      if (!result || result.isError !== Boolean(receipt.isError)
+          || !sameToolInput(result.content, mcpResultContent(hostReceiptContent(receipt.content)))) refuse("checkpoint_result_mismatch");
     }
     settledToolResults = ids.map(toolUseId => {
       const result = results.get(toolUseId)!;

@@ -117,6 +117,11 @@ export interface RetainedCheckpoint {
   origin: "clean-upstream" | "operator-restored";
   settledToolIds?: string[];
   settledToolResults?: SettledToolResult[];
+  /** Exact sanitized wire tail whose rewritten results were delivered under their native IDs. */
+  factoryCompactedToolTail?: {
+    messageHashes: string[];
+    nativeToolIds: string[];
+  };
 }
 
 export interface UpstreamCheckpointRecovery {

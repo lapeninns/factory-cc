@@ -4,12 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createBridgeApp, listen, type BridgeApp } from "../../src/http/app.js";
+import { collectToolResults } from "../../src/protocol/content.js";
 import { assistantMessage } from "../../src/protocol/messages.js";
 import type { BridgeRuntime, RuntimeRequest, RuntimeTurn } from "../../src/runtime/types.js";
-import { BridgeError } from "../../src/types.js";
+import { BridgeError, type Message } from "../../src/types.js";
 import { continuation, firstTurn, hostStart, restartConfig } from "../helpers/native-restart.js";
 import { postMessages } from "../helpers/server.js";
 import { hostResultDigest, mcpResultContent } from "../../src/runtime/host-recovery.js";
+import { StableDroidToolNames } from "../../src/runtime/droid-mcp-catalog.js";
 import { COMPACTION_SUMMARY, SAME_SESSION_COMPACTION_SUMMARY } from "../../src/workspace.js";
 
 const roots: string[] = [], apps: BridgeApp[] = [];
@@ -267,12 +269,25 @@ describe("established native upstream retry", () => {
     expect(f.record.retainedCheckpoint?.settledToolResults).toEqual([{ toolUseId: receipt.toolUseId, resultSha256: hostResultDigest(receipt.content, true) }]);
   });
 
-  it("keeps the same checkpoint when a clean upstream failure follows an authenticated compacted tool result", async () => {
+  it.each([
+    { name: "original ID", status: 529, rewritten: false, separator: false, receiptError: false },
+    { name: "rewritten ID and separator", status: 529, rewritten: true, separator: true, receiptError: false },
+    { name: "rewritten ID, failed receipt and cooldown", status: 429, rewritten: true, separator: false, receiptError: true },
+    { name: "rewritten ID but wrong native receipt", status: 529, rewritten: true, separator: true, receiptError: false, corruption: "result" },
+    { name: "rewritten ID but wrong native call", status: 529, rewritten: true, separator: true, receiptError: false, corruption: "call" },
+    { name: "rewritten ID and a revised native tool", status: 529, rewritten: true, separator: true, receiptError: false, revised: true },
+    { name: "rewritten ID but a different native tool revision", status: 529, rewritten: true, separator: true, receiptError: false, revised: true, corruption: "revision" },
+  ])("checks clean upstream recovery for $name", async ({ status, rewritten, separator, receiptError, revised, corruption }) => {
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(new Date("2026-11-10T10:00:00Z"));
     const f = await fixture();
     const cwd = join(f.root, "workspace");
     const tool = { type: "tool_use" as const, id: "compacted-read", name: "Read", input: { path: "one.txt" } };
     const content = "read once";
+    const revision = (version: string) => `mcp__droid__${new StableDroidToolNames().revised(tool.name, version)}`;
+    const nativeName = revised ? revision("fixture-current-tool-definition") : `mcp__droid__${tool.name}`;
     f.runtime.pendingHostCalls = () => [{ toolUseId: tool.id, toolName: tool.name, input: tool.input }];
+    if (revised) f.runtime.pendingNativeToolName = (sessionId, toolUseId) =>
+      sessionId === f.record.bridgeSessionId && toolUseId === tool.id ? nativeName : undefined;
     f.runtime.recordHostToolCompletion = async () => "accepted";
     f.runtime.handle.mockResolvedValueOnce({ response: assistantMessage("opus", [tool], "tool_use"),
       pendingToolIds: [tool.id], sdkSessionId: f.sdkSessionId });
@@ -280,33 +295,118 @@ describe("established native upstream retry", () => {
     const hook = await fetch(`${f.app.url}/internal/host-events`, { method: "POST",
       headers: { authorization: "Bearer hook", "content-type": "application/json" },
       body: JSON.stringify({ eventId: randomUUID(), bindingToken: f.token, event: { hook_event_name: "PostToolUse",
-        session_id: f.record.factorySessionId, cwd, tool_name: tool.name, tool_input: tool.input, tool_response: content } }) });
+        session_id: f.record.factorySessionId, cwd, tool_name: tool.name, tool_input: tool.input, tool_response: content, is_error: receiptError } }) });
     expect(hook.status).toBe(200);
     const { additionalContext } = await hook.json() as { additionalContext?: string };
     expect(additionalContext).toMatch(/^\[factory-cc-continuation:[a-f0-9]{64}\]$/);
 
     writeFileSync(f.file, [
-      { sessionId: f.sdkSessionId, message: { role: "assistant", content: [{ ...tool, name: "mcp__droid__Read" }] } },
-      { sessionId: f.sdkSessionId, message: { role: "user", content: [{ type: "tool_result", tool_use_id: tool.id, content: mcpResultContent(content) }] } },
+      { sessionId: f.sdkSessionId, message: { role: "assistant", content: [{ ...tool,
+        name: corruption === "revision" ? revision("different-tool-definition") : nativeName,
+        ...(corruption === "call" ? { input: { path: "different.txt" } } : {}) }] } },
+      { sessionId: f.sdkSessionId, message: { role: "user", content: [
+        { type: "tool_result", tool_use_id: tool.id, content: mcpResultContent(corruption === "result" ? "different native result" : content), is_error: receiptError },
+      ] } },
     ].map(row => JSON.stringify(row)).join("\n") + "\n");
-    f.runtime.handle.mockRejectedValueOnce(new BridgeError(529, "overloaded_error", "limit", { retry_from_history: true }));
-    const failed = await postMessages(f.app.url, "client", { ...firstTurn(f.token), messages: [
+    f.runtime.handle.mockRejectedValueOnce(new BridgeError(status, status === 429 ? "rate_limit_error" : "overloaded_error", "limit",
+      { retry_from_history: true, ...(status === 429 ? { retry_after: 120 } : {}) }));
+    const wireId = rewritten ? "call_AbcD1234_efgh-5670" : tool.id;
+    const displayed = rewritten ? "Droid's different rendered payload" : content;
+    const wireTail = (id = wireId, payload = displayed): Message[] => [
       { role: "user", content: [
         { type: "text", text: `${SAME_SESSION_COMPACTION_SUMMARY}\nRewritten prefix` },
         { type: "text", text: `<system-reminder>\n\nUser system info (fixture)\n\n% pwd\n${cwd}\n\n</system-reminder>` },
       ] },
-      { role: "assistant", content: [tool] },
-      { role: "user", content: [{ type: "tool_result", tool_use_id: tool.id, content }] },
-      { role: "user", content: additionalContext },
+      { role: "assistant", content: [{ ...tool, id }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: payload }] },
+    ];
+    const failed = await postMessages(f.app.url, "client", { ...firstTurn(f.token), messages: [
+      ...wireTail(), { role: "user", content: additionalContext },
     ] });
-    expect(failed.status, failed.raw).toBe(529);
+    if (corruption) {
+      expect(failed.status, failed.raw).toBe(503);
+      expect(failed.json.error).toMatchObject({ type: "native_checkpoint_retry_unavailable" });
+      expect(f.record).toMatchObject({ state: "FAILED", sdkSessionId: f.sdkSessionId, nativeGeneration: 0, checkpointRetryBlocked: true });
+      expect(f.record.retainedCheckpoint).toBeUndefined();
+      return;
+    }
+    expect(failed.status, failed.raw).toBe(status);
     expect(failed.json.error).toMatchObject({ checkpoint_retained: true, retry_mode: "native_checkpoint", retry_from_history: false,
       factory_binding_refresh_required: true, message: expect.stringContaining("send a fresh message from the existing Factory Workstream") });
     expect(f.record).toMatchObject({ state: "IDLE", sdkSessionId: f.sdkSessionId, nativeGeneration: 1, retryableRequestKind: "native-upstream" });
-    expect(f.record.retainedCheckpoint?.settledToolResults).toEqual([{ toolUseId: tool.id, resultSha256: hostResultDigest(content, false) }]);
+    expect(f.record.retainedCheckpoint?.settledToolResults).toEqual([{ toolUseId: tool.id, resultSha256: hostResultDigest(content, receiptError) }]);
     expect(f.runtime.prepareCheckpointRetry).toHaveBeenCalledWith(f.record.bridgeSessionId, f.sdkSessionId);
     expect(f.runtime.prepareColdRetry).not.toHaveBeenCalled();
     expect(f.runtime.cancel).not.toHaveBeenCalled();
+    if (!rewritten) {
+      expect(f.record.retainedCheckpoint?.factoryCompactedToolTail).toBeUndefined();
+      return;
+    }
+    const retained = structuredClone(f.record.retainedCheckpoint);
+    expect(retained?.factoryCompactedToolTail).toMatchObject({ messageHashes: expect.arrayContaining([expect.stringMatching(/^[a-f0-9]{64}$/)]), nativeToolIds: [tool.id] });
+    expect(f.record.hostCompletionReceipts).toEqual([]);
+    const boundRetry = (tail = wireTail(), fresh = `[factory-cc-session:${f.token}] Continue the Workstream`) => ({
+      ...firstTurn(f.token), messages: [...tail,
+        ...(separator ? [{ role: "assistant", content: [{ type: "text", text: "---" }] }] : []),
+        { role: "user", content: fresh },
+      ],
+    });
+    const calls = f.runtime.handle.mock.calls.length;
+    if (status === 429) {
+      expect((await postMessages(f.app.url, "client", boundRetry())).status).toBe(429);
+      vi.setSystemTime(new Date("2026-11-10T10:03:00Z"));
+    }
+    for (const bad of [
+      boundRetry(wireTail("call_AbcD1234_efgh-5671")),
+      boundRetry(wireTail(wireId, "altered displayed result")),
+      boundRetry(wireTail(), `[factory-cc-session:${f.token}]`),
+      boundRetry(wireTail(), `<system-reminder>\n[factory-cc-session:${f.token}]\n</system-reminder>`),
+      boundRetry(wireTail(), "No authenticated binding"),
+    ]) {
+      expect((await postMessages(f.app.url, "client", bad)).status).toBe(409);
+      expect((await postMessages(f.app.url, "client", bad, { "x-bridge-session": f.record.bridgeSessionId })).status).toBe(409);
+    }
+    expect(f.runtime.handle).toHaveBeenCalledTimes(calls);
+    expect(f.record.retainedCheckpoint).toEqual(retained);
+    let retry = boundRetry();
+    let parked: typeof f.record | undefined;
+    if (status === 529) {
+      f.runtime.handle.mockRejectedValueOnce(new BridgeError(529, "overloaded_error", "limit again", { retry_from_history: true }));
+      const failedAgain = await postMessages(f.app.url, "client", boundRetry());
+      expect(failedAgain.status, failedAgain.raw).toBe(529);
+      expect(f.record.retainedCheckpoint?.factoryCompactedToolTail).toEqual(retained?.factoryCompactedToolTail);
+
+      // A legacy summary in the untrusted earlier prefix must not release an
+      // unrelated parked owner when reattaching the proven compacted tail.
+      const otherCall = { toolUseId: "other-parked", toolName: "TaskOutput", input: { task_id: "fixture" } };
+      const other = f.app.store.create({ role: "unknown", model: "opus", toolNames: [otherCall.toolName] });
+      f.app.store.update(other.bridgeSessionId, { state: "WAITING_DROID_TOOL", pendingToolIds: [otherCall.toolUseId] });
+      parked = structuredClone(other);
+      f.runtime.pendingHostCalls = id => id === other.bridgeSessionId ? [otherCall] : [];
+      const summary = "Another conversation's parked task. ".repeat(8);
+      const otherStarted = await fetch(`${f.app.url}/internal/host-events`, { method: "POST",
+        headers: { authorization: "Bearer hook", "content-type": "application/json" },
+        body: JSON.stringify({ eventId: randomUUID(), desktopLifecycle: true, event: { hook_event_name: "SessionStart", session_id: randomUUID(), cwd } }) });
+      const otherBinding = (await otherStarted.json() as { bindingToken: string }).bindingToken;
+      expect(otherStarted.status).toBe(200);
+      f.runtime.handle.mockResolvedValueOnce({ response: assistantMessage("opus", [{ type: "text", text: summary }], "end_turn"), pendingToolIds: [] });
+      const summarized = await postMessages(f.app.url, "client", { model: "opus", max_tokens: 512, messages: [{ role: "user", content:
+        `[factory-cc-session:${otherBinding}]\nASSISTANT: TOOL_CALL: ${otherCall.toolName} input=${JSON.stringify(otherCall.input)}\nTOOL: TOOL_RESULT: finished` }] });
+      expect(summarized.status, summarized.raw).toBe(200);
+      expect(f.app.runtimeStatus().compactionLinks).toBe(1);
+      retry = boundRetry([{ role: "user", content: COMPACTION_SUMMARY + summary }, ...wireTail()]);
+    }
+    const resumed = await postMessages(f.app.url, "client", retry);
+    expect(resumed.status, resumed.raw).toBe(200);
+    expect(resumed.session).toBe(f.record.bridgeSessionId);
+    expect(f.observed.at(-1)).toEqual({ account: f.record.claudeAccount, sdk: f.sdkSessionId, generation: status === 529 ? 2 : 1, recovery: undefined });
+    expect(collectToolResults(f.runtime.handle.mock.calls.at(-1)![0].request.messages)).toEqual([]);
+    expect(f.record.retainedCheckpoint).toBeUndefined();
+    if (parked) {
+      expect(f.app.store.require(parked.bridgeSessionId)).toEqual(parked);
+      expect(f.runtime.cancel).not.toHaveBeenCalled();
+      expect(f.app.runtimeStatus().compactionLinks).toBe(1);
+    }
   });
 
   it.each([429, 529])("retains checkpoint and account after %s, then resumes without cold import", async status => {

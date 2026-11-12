@@ -47,9 +47,16 @@ interface ContinuationTicket {
   expiresAt: number;
 }
 interface ContinuationPolicy { scope: ContinuationScope; hash: string }
+interface VerifiedContinuation {
+  scope: ContinuationScope;
+  receiptHash: string;
+  aliases: ReadonlyMap<string, string>;
+  nativeToolNames: ReadonlyMap<string, string>;
+}
 const MAX_CONTINUATIONS = 256;
 const CONTINUATION_TTL_MS = 10 * 60_000;
 const EXACT_CONTINUATION = /^\[factory-cc-continuation:([a-f0-9]{64})\](?![\s\S])/;
+const DROID_REWRITTEN_TOOL_ID = /^call_[A-Za-z0-9_-]{18}(?![\s\S])/;
 
 interface PendingApproval {
   view: ObjectValue & { id: string; bridgeSessionId: string };
@@ -150,7 +157,9 @@ export class ControlBroker implements RuntimeControl {
 
   /** Only leading host context or an exact, receipted compacted continuation can select a binding. */
   prepareRequest(original: MessagesRequest, cwd?: string, missionDir?: string): {
-    request: MessagesRequest; binding?: string; continuationSessionId?: string; assertContinuationCurrent?: () => void;
+    request: MessagesRequest; binding?: string; continuationSessionId?: string; continuationRequest?: MessagesRequest;
+    continuationNativeToolNames?: ReadonlyMap<string, string>;
+    assertContinuationCurrent?: () => void;
   } {
     const found = new Set<HostBinding>();
     let markers = 0;
@@ -216,15 +225,18 @@ export class ControlBroker implements RuntimeControl {
     });
     const prepared = { request: scrubContinuationMarkers(request), binding: host?.token };
     if (!continuation) return prepared;
-    return { ...prepared, continuationSessionId: continuation.scope.bridgeSessionId, assertContinuationCurrent: () => {
-      // HTTP can await other proofs before admission. Recheck the live ticket
-      // and every pending receipt after those awaits, before changing state.
-      const current = this.findContinuation(original, missionDir);
-      if (!current || !sameContinuationScope(continuation.scope, current.scope)
-          || current.receiptHash !== continuation.receiptHash) {
-        throw new BridgeError(409, "factory_continuation_scope_changed", "The Factory tool receipt no longer belongs to the pending native turn.");
-      }
-    } };
+    return { ...prepared, continuationSessionId: continuation.scope.bridgeSessionId,
+      continuationRequest: continuation.aliases.size ? nativeContinuationRequest(prepared.request, continuation.aliases) : undefined,
+      continuationNativeToolNames: continuation.aliases.size ? continuation.nativeToolNames : undefined,
+      assertContinuationCurrent: () => {
+        // HTTP can await other proofs before admission. Recheck the live ticket
+        // and every pending receipt after those awaits, before changing state.
+        const current = this.findContinuation(original, missionDir);
+        if (!current || !sameContinuationScope(continuation.scope, current.scope)
+            || current.receiptHash !== continuation.receiptHash) {
+          throw new BridgeError(409, "factory_continuation_scope_changed", "The Factory tool receipt no longer belongs to the pending native turn.");
+        }
+      } };
   }
 
   /** Capture the policy that actually exposed the current pending batch. */
@@ -247,7 +259,7 @@ export class ControlBroker implements RuntimeControl {
       account: session.claudeAccount, provider: session.provider };
   }
 
-  private findContinuation(request: MessagesRequest, missionDir?: string): { scope: ContinuationScope; receiptHash: string } | undefined {
+  private findContinuation(request: MessagesRequest, missionDir?: string): VerifiedContinuation | undefined {
     if (!this.options.factoryNative || !this.continuationTickets.size || !hostAllowsAnyTools(request)) return;
     const first = request.messages[0];
     const prelude = first?.role === "user" ? asBlocks(first.content)[0] : undefined;
@@ -258,7 +270,7 @@ export class ControlBroker implements RuntimeControl {
     if (lastAssistant < 1) return;
 
     const ids = new Set<string>();
-    const marked = new Set<string>();
+    const ticketResultGroups = new Map<string, Set<string>>();
     let precedingResults = new Set<string>();
     let scope: ContinuationScope | undefined;
     const now = Date.now();
@@ -271,12 +283,12 @@ export class ControlBroker implements RuntimeControl {
         // No trimming, wrappers, pasted quotes, or mixed content. Multiple
         // PostToolUse messages can follow one parallel group of results.
         const ticket = this.continuationTickets.get(marker[1]!);
-        if (!ticket || ticket.expiresAt <= now || !precedingResults.has(ticket.toolUseId) || marked.has(ticket.toolUseId)
+        if (!ticket || ticket.expiresAt <= now || !precedingResults.size || ticketResultGroups.has(ticket.toolUseId)
             || scope && !sameContinuationScope(scope, ticket.scope)) return;
         scope = ticket.scope;
         const receipt = this.store.get(scope.bridgeSessionId)?.hostCompletionReceipts?.find(item => item.toolUseId === ticket.toolUseId);
         if (!receipt || canonical(receipt) !== ticket.receiptHash) return;
-        marked.add(ticket.toolUseId);
+        ticketResultGroups.set(ticket.toolUseId, precedingResults);
         continue;
       }
       if (!content.length) return;
@@ -299,26 +311,63 @@ export class ControlBroker implements RuntimeControl {
     } catch { return; }
 
     const session = this.store.require(scope.bridgeSessionId);
-    if (ids.size !== session.pendingToolIds.length || session.pendingToolIds.some(id => !ids.has(id))) return;
-    // Historical results are allowed, but a pending callback must appear only
-    // in the authenticated tail; the SDK also reads earlier pending results.
-    const pendingIds = new Set([...ids].map(canonicalToolUseId));
-    if (collectToolResults(request.messages.slice(0, lastAssistant + 1)).some(result => pendingIds.has(canonicalToolUseId(result.tool_use_id)))) return;
+    if (ids.size !== session.pendingToolIds.length) return;
 
     const assistant = request.messages[lastAssistant]!;
     const calls = collectToolUses([assistant]);
     if (calls.length !== ids.size || asBlocks(assistant.content).filter(block => block.type === "tool_use").length !== calls.length) return;
     const receipts = new Map<string, RuntimeHostCompletion>();
+    const wireByNative = new Map<string, string>();
+    const aliases = new Map<string, string>();
+    const pendingIds = new Set(session.pendingToolIds);
     const pending = this.runtime.pendingHostCalls?.(scope.bridgeSessionId) ?? [];
     for (const call of calls) {
-      if (typeof call.id !== "string" || !ids.has(call.id) || receipts.has(call.id) || call.input === undefined) return;
-      const receipt = session.hostCompletionReceipts?.find(item => item.toolUseId === call.id);
-      const nativeCall = pending.find(item => item.toolUseId === call.id);
-      if (!receipt || receipt.terminal || !nativeCall || receipt.toolName !== call.name || nativeCall.toolName !== call.name
-          || canonical(receipt.input) !== canonical(call.input) || canonical(nativeCall.input) !== canonical(call.input)) return;
-      receipts.set(call.id, receipt);
+      if (!ids.has(call.id) || aliases.has(call.id) || call.input === undefined) return;
+      const exact = pendingIds.has(call.id);
+      if (!exact && !DROID_REWRITTEN_TOOL_ID.test(call.id)) return;
+      const inputHash = canonical(call.input);
+      const matching = (item: { toolName: string; input: unknown }): boolean => item.toolName === call.name && canonical(item.input) === inputHash;
+      let nativeCall = pending.find(item => item.toolUseId === call.id);
+      if (!exact) {
+        const matchingCalls = pending.filter(item => pendingIds.has(item.toolUseId) && matching(item));
+        if (matchingCalls.length !== 1) return;
+        nativeCall = matchingCalls[0];
+      }
+      if (!nativeCall || !matching(nativeCall) || receipts.has(nativeCall.toolUseId)) return;
+      const nativeId = nativeCall.toolUseId;
+      const receipt = session.hostCompletionReceipts?.find(item => item.toolUseId === nativeId);
+      if (!receipt || receipt.terminal || !matching(receipt)) return;
+      if (!exact) {
+        // Droid 1.9 can give a retained tool call a new wire ID. Its exact
+        // tool name and input must identify a single live call, and that
+        // call's own receipt ticket must follow the corresponding result.
+        if (!ticketResultGroups.get(nativeId)?.has(call.id)) return;
+        aliases.set(call.id, nativeId);
+      }
+      wireByNative.set(nativeId, call.id);
+      receipts.set(nativeId, receipt);
     }
-    return { scope, receiptHash: canonical([...receipts.values()]) };
+    for (const [nativeId, group] of ticketResultGroups) {
+      const wireId = wireByNative.get(nativeId);
+      if (wireId === undefined || !group.has(wireId)) return;
+    }
+    // Historical results may not answer a pending callback. Check both ID
+    // forms, because the SDK also reads earlier results for live callbacks.
+    const callbackIds = new Set([...ids, ...pendingIds].map(canonicalToolUseId));
+    if (collectToolResults(request.messages.slice(0, lastAssistant + 1)).some(result => callbackIds.has(canonicalToolUseId(result.tool_use_id)))) return;
+    // An alias must not hide an ID already owned by another live session
+    // when the HTTP layer applies its normal pending-tool ownership checks.
+    if (aliases.size && this.store.list().some(record => record.bridgeSessionId !== scope.bridgeSessionId && !isEnded(record)
+        && record.pendingToolIds.some(id => aliases.has(canonicalToolUseId(id))))) return;
+    const nativeToolNames = new Map<string, string>();
+    if (aliases.size) {
+      for (const nativeId of receipts.keys()) {
+        const name = this.runtime.pendingNativeToolName?.(scope.bridgeSessionId, nativeId);
+        if (name) nativeToolNames.set(nativeId, name);
+      }
+    }
+    return { scope, receiptHash: canonical({ receipts: [...receipts.values()], aliases: [...aliases], nativeToolNames: [...nativeToolNames] }),
+      aliases, nativeToolNames };
   }
 
   bind(token: string | undefined, bridgeSessionId: string): void {
@@ -761,6 +810,24 @@ export class ControlBroker implements RuntimeControl {
       restoreIdleDesktopBindings: this.options.restoreIdleDesktopBindings === true, restoredDesktopBindings: this.restoredDesktopBindings,
       pendingApprovals: this.approvals.size, failures: [...this.failures], activeHostSessions: [...this.hosts.values()].filter((host) => !host.ended).length, boundNativeSessions: [...this.hosts.values()].filter((host) => !host.ended).reduce((n, host) => n + host.bridgeSessions.size, 0) };
   }
+}
+
+/** Native ownership and SDK delivery use the original callback IDs. History
+ * retains the sanitized wire IDs so Droid can echo that history next turn. */
+function nativeContinuationRequest(request: MessagesRequest, aliases: ReadonlyMap<string, string>): MessagesRequest {
+  const lastAssistant = request.messages.map(message => message.role).lastIndexOf("assistant");
+  const messages = request.messages.map((message, index) => {
+    if (index < lastAssistant || typeof message.content === "string") return message;
+    const content = message.content.map(block => {
+      if (block.type === "tool_use" && typeof block.id === "string" && aliases.has(block.id)) return { ...block, id: aliases.get(block.id)! };
+      if (block.type === "tool_result" && typeof block.tool_use_id === "string" && aliases.has(block.tool_use_id)) {
+        return { ...block, tool_use_id: aliases.get(block.tool_use_id)! };
+      }
+      return block;
+    });
+    return { ...message, content };
+  });
+  return { ...request, messages };
 }
 
 function setBounded<K, V>(map: Map<K, V>, key: K, value: V): void {

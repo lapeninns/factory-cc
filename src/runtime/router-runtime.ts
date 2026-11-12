@@ -37,6 +37,10 @@ export class RouterRuntime implements BridgeRuntime {
     return this.owner(sessionId).pendingHostCalls?.(sessionId) ?? [];
   }
 
+  pendingNativeToolName(sessionId: string, toolUseId: string): string | undefined {
+    return this.owner(sessionId).pendingNativeToolName?.(sessionId, toolUseId);
+  }
+
   async deliverResults(sessionId: string, results: Array<{ tool_use_id: string; content: string | ContentBlock[]; is_error?: boolean }>): Promise<Array<"accepted" | "duplicate">> {
     return this.owner(sessionId).deliverResults(sessionId, results);
   }
