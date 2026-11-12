@@ -87,6 +87,13 @@ describe("subscription Desktop launcher", () => {
     expect(prepareSubscription).not.toHaveBeenCalled();
   });
 
+  it("admits 80 controller sessions by default and bounds explicit --max-sessions", () => {
+    expect(parseSubscriptionDesktop(args).maxSessions).toBe(80);
+    expect(parseSubscriptionDesktop([...args, "--max-sessions", "120"]).maxSessions).toBe(120);
+    for (const bad of ["0", "257", "1.5", "many"]) expect(() => parseSubscriptionDesktop([...args, "--max-sessions", bad])).toThrow(/Max sessions must be an integer/);
+    expect(() => parseSubscriptionDesktop([...args, "--max-sessions", "80", "--max-sessions", "90"])).toThrow(/Invalid subscription Desktop arguments/);
+  });
+
   it("requires both pools for --host-tools and rejects duplicate opt-in", () => {
     expect(() => parseSubscriptionDesktop([...args, "--host-tools"])).toThrow(/requires? --controller-pool/);
     expect(() => parseSubscriptionDesktop([...pooledArgs(), "--host-tools"])).toThrow(/requires? --controller-pool/);
