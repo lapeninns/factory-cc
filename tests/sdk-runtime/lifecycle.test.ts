@@ -841,20 +841,34 @@ describe("official SDK streaming-input lifecycle (injected offline SDK)", () => 
   });
 
   it("replaces an advertised schema without replacing the query", async () => {
-    const sdk = new FakeSdk(async function* () { yield success("ready"); });
+    const sdk = new FakeSdk(async function* (_input, index, fake) {
+      if (index === 1) {
+        const revision = [...fake.schemas.keys()].find(name => name.startsWith("droid_revision_"))!;
+        yield { type: "assistant", message: { content: [
+          { type: "tool_use", id: "revised-call", name: `mcp__droid__${revision}`, input: { value: 7 } },
+        ] } };
+        await fake.handlers.get(revision)!({ value: 7 }, { toolUseID: "revised-call" });
+      }
+      yield success("ready");
+    });
     const { runtime } = create(sdk);
     const s = session();
     const schema = (type: "string" | "integer") => ({ type: "object" as const, properties: { value: { type } }, required: ["value"], additionalProperties: false });
     await runtime.handle(request(s, "first", { tools: [{ name: "FactoryArgs", input_schema: schema("string") }] }));
     const first = sdk.schemas.get("FactoryArgs") as { safeParse(args: unknown): { success: boolean } };
     expect(first.safeParse({ value: "before" }).success).toBe(true);
-    await runtime.handle(request(s, "second", { tools: [{ name: "FactoryArgs", input_schema: schema("integer") }] }));
+    const revisedTools = [{ name: "FactoryArgs", input_schema: schema("integer") }];
+    const parked = await runtime.handle(request(s, "second", { tools: revisedTools }));
     expect(sdk.schemas.has("FactoryArgs")).toBe(false);
     const revision = [...sdk.schemas.keys()].find((name) => name.startsWith("droid_revision_"))!;
     const second = sdk.schemas.get(revision) as typeof first;
     expect(second.safeParse({ value: 7 }).success).toBe(true);
     expect(second.safeParse({ value: "before" }).success).toBe(false);
     expect(second.safeParse({ value: 7, extra: true }).success).toBe(false);
+    expect(parked.response.content).toContainEqual({ type: "tool_use", id: "revised-call", name: "FactoryArgs", input: { value: 7 } });
+    expect(runtime.pendingNativeToolName(s.bridgeSessionId, "revised-call")).toBe(`mcp__droid__${revision}`);
+    await runtime.handle(request(s, [{ type: "tool_result", tool_use_id: "revised-call", content: "completed" }], { tools: revisedTools }));
+    expect(runtime.pendingNativeToolName(s.bridgeSessionId, "revised-call")).toBeUndefined();
     expect(sdk.calls).toHaveLength(1);
   });
 

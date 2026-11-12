@@ -343,6 +343,12 @@ export class SdkRuntime implements BridgeRuntime {
     return [...live.pending.values()].map((call) => ({ toolUseId: call.id, toolName: call.name, input: structuredClone(call.input) }));
   }
 
+  pendingNativeToolName(sessionId: string, toolUseId: string): string | undefined {
+    const live = this.lives.get(sessionId);
+    const name = live && !live.terminal ? live.pending.get(toolUseId)?.mcpName : undefined;
+    return name ? `mcp__droid__${name}` : undefined;
+  }
+
   validateHostToolCompletion(sessionId: string, completion: RuntimeHostCompletion): void {
     const live = this.lives.get(sessionId);
     if (!live) throw new BridgeError(409, "interrupted_tool_roundtrip", "No live SDK owns this host completion");

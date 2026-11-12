@@ -9,6 +9,10 @@ import { createLogger } from "../src/logging.js";
 import { installShutdownHandlers } from "../src/index.js";
 import { SUBSCRIPTION_PROFILES, validateDesktopJobBinding, type SubscriptionProfile } from "../src/runtime/desktop-jobs.js";
 
+// Concurrent Droid sessions one controller admits before answering 429 session_limit.
+// 80 (5x the earlier 16) keeps parallel Workstreams admitted; idle SDKs are still evicted above the cap.
+export const DEFAULT_CONTROLLER_MAX_SESSIONS = 80, MAX_CONTROLLER_MAX_SESSIONS = 256;
+
 export function parseSubscriptionDesktop(argv: string[]) {
   const values = new Map<string, string>(); let check = false, workerPool = false, controllerPool = false, hostTools = false, spawnAgents = false, factoryNative = false;
   for (let i = 0; i < argv.length; i++) {
@@ -34,7 +38,7 @@ export function parseSubscriptionDesktop(argv: string[]) {
       if (spawnAgents) throw new Error("Duplicate spawn-agents option.");
       spawnAgents = true; continue;
     }
-    if (!["--profile", "--project", "--data-dir", "--port", "--runtime-path", "--state-root", "--worker-control", "--worker-mcp-prefix", "--approval-policy"].includes(name) || values.has(name) || !argv[i + 1] || argv[i + 1]!.startsWith("--")) throw new Error("Invalid subscription Desktop arguments.");
+    if (!["--profile", "--project", "--data-dir", "--port", "--runtime-path", "--state-root", "--worker-control", "--worker-mcp-prefix", "--approval-policy", "--max-sessions"].includes(name) || values.has(name) || !argv[i + 1] || argv[i + 1]!.startsWith("--")) throw new Error("Invalid subscription Desktop arguments.");
     values.set(name, argv[++i]!);
   }
   if (controllerPool && !workerPool) throw new Error("The controller pool requires --worker-pool.");
@@ -53,6 +57,8 @@ export function parseSubscriptionDesktop(argv: string[]) {
   if (!runtimePath || !stateRoot || !isAbsolute(runtimePath) || !isAbsolute(stateRoot)) throw new Error("Absolute shared runtime and state paths are required.");
   const worktree = validateDesktopJobBinding({ sessionId: "subscription-desktop-preflight", cwd: project,
     subscriptionProfile: profile as SubscriptionProfile, workspacePolicy: hostTools ? "controller-host" : "controller-readonly" }).cwd;
+  const maxSessions = Number(values.get("--max-sessions") ?? DEFAULT_CONTROLLER_MAX_SESSIONS);
+  if (!Number.isSafeInteger(maxSessions) || maxSessions < 1 || maxSessions > MAX_CONTROLLER_MAX_SESSIONS) throw new Error(`Max sessions must be an integer from 1 to ${MAX_CONTROLLER_MAX_SESSIONS}.`);
   const port = Number(values.get("--port") ?? 18790);
   if (!Number.isInteger(port) || port < 1024 || port > 65535 || port === 18787) throw new Error("Use a separate local validation port.");
   const workerControlFile = values.get("--worker-control"), workerMcpPrefix = values.get("--worker-mcp-prefix");
@@ -63,7 +69,7 @@ export function parseSubscriptionDesktop(argv: string[]) {
     throw new Error(workerPool ? "The pooled controller requires the exact supervised pool worker namespace."
       : "The read-only controller must use its own fixed seat's worker namespace.");
   }
-  return { check, workerPool, controllerPool, hostTools, spawnAgents, factoryNative, approvalPolicy: approvalPolicy as "ask" | "bypass", profile: profile as SubscriptionProfile, project: worktree, dataDir: resolve(dataDir), runtimePath: resolve(runtimePath), stateRoot: resolve(stateRoot), port, workerControlFile: resolve(workerControlFile), workerMcpPrefix };
+  return { check, workerPool, controllerPool, hostTools, spawnAgents, factoryNative, approvalPolicy: approvalPolicy as "ask" | "bypass", profile: profile as SubscriptionProfile, project: worktree, dataDir: resolve(dataDir), runtimePath: resolve(runtimePath), stateRoot: resolve(stateRoot), port, maxSessions, workerControlFile: resolve(workerControlFile), workerMcpPrefix };
 }
 
 function privateFile(path: string): string {
@@ -115,7 +121,7 @@ export async function runSubscriptionDesktop(argv = process.argv.slice(2)): Prom
   if (args.check) {
     console.log(JSON.stringify({ profile: args.profile, workerPool: args.workerPool, controllerPool: args.controllerPool, hostTools: args.hostTools, spawnAgents: args.spawnAgents, factoryNative: args.factoryNative, approvalPolicy: args.approvalPolicy,
       ...(subscriptionAccounts ? { controllerProfiles: subscriptionAccounts.map(account => account.profile) } : {}),
-      authentication: "subscription", apiCredentialsUsed: false, preflightVerified: true, desktopJobs: true, port: args.port, modelRequestsMade: false }));
+      authentication: "subscription", apiCredentialsUsed: false, preflightVerified: true, desktopJobs: true, port: args.port, maxSessions: args.maxSessions, modelRequestsMade: false }));
     return;
   }
   // Ambient process environment starts on the configured initial subscription.
@@ -125,7 +131,7 @@ export async function runSubscriptionDesktop(argv = process.argv.slice(2)): Prom
   const config = loadConfig({ mode: "sdk", authMode: "subscription", desktopProfile: true, desktopLifecycle: true, desktopJobs: true,
     controllerReadOnly: true, workerPool: args.workerPool, controllerPool: args.controllerPool, controllerHostTools: args.hostTools, controllerSpawnAgents: args.spawnAgents, factoryNative: args.factoryNative, controllerApprovalPolicy: args.approvalPolicy, subscriptionAccounts,
     desktopRuntimePath: args.runtimePath, desktopStateRoot: args.stateRoot,
-    host: "127.0.0.1", port: args.port, dataDir: args.dataDir, sdkCwd: args.project, permissionMode: "ask", maxSessions: 16,
+    host: "127.0.0.1", port: args.port, dataDir: args.dataDir, sdkCwd: args.project, permissionMode: "ask", maxSessions: args.maxSessions,
     clientToken: credentials.client ?? randomBytes(32).toString("hex"), adminToken: credentials.admin ?? randomBytes(32).toString("hex"), hookToken: credentials.hook ?? randomBytes(32).toString("hex"),
     subscriptionExpectedEmail: prepared.expectedIdentity.email, subscriptionProfile: args.profile, workerControlFile: args.workerControlFile, workerMcpPrefix: args.workerMcpPrefix,
     models: [{ id: "claude-opus-5-5", model: "claude-opus-5-5", displayName: `${args.profile} Opus 5.5 subscription` }] });

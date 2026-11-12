@@ -116,6 +116,21 @@ describe("Factory-native compacted tool continuation", () => {
     expect(f.broker.prepareRequest(happy()).continuationSessionId).toBeUndefined();
   });
 
+  it("does not infer rewritten IDs for indistinguishable pending calls", async () => {
+    const f = fixture();
+    const first = call("one");
+    const second = { ...first, toolUseId: "two" };
+    const batch = [first, second];
+    const session = await f.park("host", batch);
+    const tickets = await Promise.all(batch.map(async item => note(String((await session.complete(item)).additionalContext))));
+    const exact = f.request(batch, returns(batch.map(item => item.toolUseId)), ...tickets);
+    expect(f.broker.prepareRequest(exact).continuationSessionId).toBe(session.id);
+
+    const aliases = ["call_aaaaaaaaaaaaaaaaaa", "call_bbbbbbbbbbbbbbbbbb"];
+    const aliased = f.request(batch.map((item, index) => ({ ...item, toolUseId: aliases[index]! })), returns(aliases), ...tickets);
+    expect(f.broker.prepareRequest(aliased).continuationSessionId).toBeUndefined();
+  });
+
   it("never grants a ticket on terminal, unmatched, rejected or non-native hooks", async () => {
     const f = fixture(), first = call("one"), terminal = call("terminal", "EndFeatureRun");
     const a = await f.park("first", [first, terminal]);

@@ -110,6 +110,8 @@ export interface BridgeRuntime {
    */
   interrupt?(sessionId: string, reason: string): Promise<boolean>;
   pendingHostCalls?(sessionId: string): RuntimeHostCall[];
+  /** Exact SDK name of the pending callback, including its registered catalog revision. */
+  pendingNativeToolName?(sessionId: string, toolUseId: string): string | undefined;
   /** Validate an authenticated host receipt without resuming native execution. */
   validateHostToolCompletion?(sessionId: string, completion: RuntimeHostCompletion): void;
   /** Record a durable host receipt. Delivery waits for the next admitted phase. */

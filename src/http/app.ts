@@ -10,7 +10,8 @@ import type { BridgeConfig } from "../config.js";
 import { appendLogLine, type Logger } from "../logging.js";
 import { parseMessagesRequest } from "../protocol/validate.js";
 import { apiError } from "../protocol/messages.js";
-import { explicitSessionId, historyMessageHashes, historyPrefixHash, resolveSession, roleFromHeaders, sessionContextHash, sessionProvider } from "../sessions/correlate.js";
+import { collectToolResults } from "../protocol/content.js";
+import { explicitSessionId, historyMessageHashes, historyPrefixHash, resolveSession, retainedCompactedResultRange, roleFromHeaders, sessionContextHash, sessionProvider } from "../sessions/correlate.js";
 import { droidReasoningLevel } from "../runtime/reasoning.js";
 import { isEnded, nativePurpose, type SessionRecord } from "../sessions/state.js";
 import { droidEndedTools } from "../sessions/droid-turn-outcomes.js";
@@ -603,6 +604,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     const cwd = resolveRequestCwd(headers, prepared.request, config, process.env, factorySession?.cwd);
     if (config.desktopJobs && !factorySession?.desktopLifecycle) throw new BridgeError(409, "desktop_binding_required", "Start this session with the configured Factory Desktop lifecycle hooks before using the supervised model.");
     const request = prepared.request;
+    let nativeRequest = prepared.continuationRequest ?? request;
     const listed = configuredModels(config).find((model) => model.id === request.model);
     const provider: ModelProvider = listed?.provider ?? providerFromModelId(request.model);
     const permitsTools = hostAllowsAnyTools(request);
@@ -649,7 +651,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     const retry = retries[0] && { match: retries[0], reason: retries[0].retryableRequestKind === "admission" ? "admission-retry"
       : retries[0].retryableRequestKind === "native-upstream" ? "native-upstream-retry" : "upstream-retry" };
     const resolved = selectedReconciliation ? { match: selectedOwner, reason: "selected-lineage-reconciliation" }
-      : retry && !implicitAuxiliary && !historicalReconciliation ? retry : resolveSession(routingRecords, headers, request, {
+      : retry && !implicitAuxiliary && !historicalReconciliation ? retry : resolveSession(routingRecords, headers, nativeRequest, {
         cwd, hostSessionId: factorySession?.sessionId, allowModelSwitch: config.models !== undefined, provider, claudeProfile: listed?.claudeProfile,
         // Droid desktop has no conversation ID header or hooks to disambiguate.
         continueIdenticalTranscripts: config.desktopProfile, auxiliaryRetry: retry,
@@ -694,10 +696,18 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
     }
     const healthyTailVerified = resolved.reason === "authenticated-healthy-checkpoint-tail" || resolved.reason === "selected-lineage-reconciliation";
     let retainedCheckpointVerified = false;
+    let retainedCompactedResultsVerified = false;
     if (config.controllerPool && resolved.match?.retryableRequestKind === "native-upstream") {
       const retained = resolved.match.retainedCheckpoint;
       if (!retained || retained.sdkSessionId !== resolved.match.sdkSessionId || retained.account !== resolved.match.claudeAccount) {
         throw new BridgeError(409, "native_checkpoint_proof_changed", "The retained checkpoint changed before retry. No native prompt was sent.");
+      }
+      const compactedResults = retained.factoryCompactedToolTail && retainedCompactedResultRange(request.messages, retained);
+      if (retained.factoryCompactedToolTail && (!compactedResults || !config.factoryNative || !permitsTools || !factorySession?.desktopLifecycle
+          || resolved.match.factorySessionId !== factorySession.sessionId || resolved.match.factoryCwd !== cwd
+          || resolved.match.contextHash !== contextHash || resolved.match.model !== request.model)) {
+        throw new BridgeError(409, "native_checkpoint_selection_required", "Send a fresh message with the exact compacted results to resume the existing Factory checkpoint.",
+          { checkpoint_retained: true, retry_mode: "existing_checkpoint" });
       }
       const settledIds = [...new Set([...(retained.settledToolIds ?? []), ...(retained.settledToolResults ?? []).map(result => result.toolUseId)])];
       const inspected = inspectConsumedHostCheckpoint(config.subscriptionAccounts ?? [], resolved.match, [], settledIds);
@@ -709,10 +719,16 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
       // hashes from the same verified immutable checkpoint before resuming.
       if (settledIds.length && !retained.settledToolResults) store.update(resolved.match.bridgeSessionId,
         { retainedCheckpoint: { ...retained, settledToolResults: inspected.settledToolResults } });
+      if (compactedResults) {
+        // The native transcript already contains these authenticated results.
+        // Keep the wire history for correlation and send only the new turn.
+        nativeRequest = { ...request, messages: [...request.messages.slice(0, compactedResults.start), ...request.messages.slice(compactedResults.end)] };
+        retainedCompactedResultsVerified = true;
+      }
       retainedCheckpointVerified = true;
     }
     // Release a replaced slot only after proof checks. Bound tool-free requests leave it parked.
-    if (!prepared.continuationSessionId && (permitsTools || !factorySession)) releaseCompacted(request);
+    if (!prepared.continuationSessionId && !retainedCompactedResultsVerified && (permitsTools || !factorySession)) releaseCompacted(request);
     if (claudeAccount) logger.info("claude_account_assigned", { model: request.model, account: claudeAccount });
     const session = resolved.match
       ?? withSlot(() => store.create({
@@ -894,7 +910,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
 
       const turn: RuntimeTurn = await Promise.race([
         interrupted,
-        runtime.handle({ request, role, session, headers, ...(factorySession ? { factorySession } : {}),
+        runtime.handle({ request: nativeRequest, role, session, headers, ...(factorySession ? { factorySession } : {}),
           ...(resolved.reason === "upstream-retry" && !session.sdkSessionId || workspaceMigrated ? { recovery: "cold-import" as const } : {}) }, sink),
       ]);
       if (cancellationRequested || store.get(sessionId)?.cancelRequested) {
@@ -997,6 +1013,7 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
         const owningAccount = current.claudeAccount;
         const priorSettled = current.retainedCheckpoint?.settledToolResults ?? [];
         const priorSettledIds = current.retainedCheckpoint?.settledToolIds ?? [];
+        let factoryCompactedToolTail = current.retainedCheckpoint?.factoryCompactedToolTail;
         store.update(sessionId, { retainedCheckpoint: undefined });
         try {
           if (!runtime.prepareCheckpointRetry || sourceGeneration === undefined || sourceGeneration >= 1_000_000 || !owningAccount) {
@@ -1007,9 +1024,22 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
               || current.sdkSessionId !== sdkSessionId || current.claudeAccount !== owningAccount || current.nativeGeneration !== sourceGeneration
               || !["GENERATING", "RESUMING"].includes(current.state)) throw new Error("The session changed during checkpoint retirement");
           const settledToolIds = [...new Set([...priorSettledIds, ...priorSettled.map(result => result.toolUseId), ...current.pendingToolIds, ...(current.hostCompletionReceipts ?? []).map(receipt => receipt.toolUseId)])];
-          const { checkpointSha256, settledToolResults } = inspectConsumedHostCheckpoint(config.subscriptionAccounts ?? [], current, [], settledToolIds);
+          const compactedRequest = prepared.continuationSessionId === sessionId ? prepared.continuationRequest : undefined;
+          const resultStart = compactedRequest ? request.messages.map(message => message.role).lastIndexOf("assistant") + 1 : undefined;
+          const compactedReceipts = compactedRequest && resultStart !== undefined
+            ? collectToolResults(compactedRequest.messages.slice(resultStart)).map(result => {
+              const receipt = current.hostCompletionReceipts?.find(item => item.toolUseId === result.tool_use_id);
+              if (!receipt) throw new Error("The authenticated Factory receipt is missing");
+              return receipt;
+            }) : [];
+          if (compactedRequest && compactedReceipts.length !== current.pendingToolIds.length) throw new Error("The Factory receipt set changed");
+          const { checkpointSha256, settledToolResults } = inspectConsumedHostCheckpoint(config.subscriptionAccounts ?? [], current,
+            compactedReceipts, settledToolIds, { allowFailedReceipts: Boolean(compactedRequest), nativeToolNames: prepared.continuationNativeToolNames });
           if (priorSettled.some(prior => !settledToolResults.some(result => result.toolUseId === prior.toolUseId && result.resultSha256 === prior.resultSha256))) {
             throw new Error("Previously settled native results changed");
+          }
+          if (resultStart !== undefined) {
+            factoryCompactedToolTail = { messageHashes: incomingHashes.slice(resultStart - 2), nativeToolIds: compactedReceipts.map(receipt => receipt.toolUseId) };
           }
           const coolingUntil = claudePool?.status().find(account => account.id === owningAccount)?.coolingUntil;
           store.update(sessionId, { state: "IDLE", nativeGeneration: sourceGeneration + 1,
@@ -1017,7 +1047,8 @@ export function createBridgeApp(config: BridgeConfig, logger: Logger, canaryPath
             pendingToolIds: [], hostCompletionReceipts: [],
             retryableRequestHash: requestFingerprint, retryableRequestKind: "native-upstream",
             retainedCheckpoint: { sdkSessionId, account: owningAccount, checkpointSha256, sourceGeneration,
-              preparedAt: new Date().toISOString(), coolingUntil, origin: "clean-upstream", settledToolIds, settledToolResults } });
+              preparedAt: new Date().toISOString(), coolingUntil, origin: "clean-upstream", settledToolIds, settledToolResults,
+              ...(factoryCompactedToolTail ? { factoryCompactedToolTail } : {}) } });
           const needsFreshFactoryBinding = prepared.continuationSessionId === sessionId;
           error = new BridgeError((error as BridgeError).status, (error as BridgeError).code,
             needsFreshFactoryBinding
